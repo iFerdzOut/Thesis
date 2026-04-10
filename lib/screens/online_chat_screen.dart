@@ -1,0 +1,1432 @@
+import 'dart:async';
+import 'dart:collection';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/material.dart';
+
+import '../models/conversation_preview_model.dart';
+import '../services/chat_encryption_repository.dart';
+import '../services/contact_chat_service.dart';
+import '../services/online_chat_service.dart';
+import '../services/user_profile_service.dart';
+import '../widgets/user_avatar.dart';
+import 'chat_screen.dart';
+import 'contacts_screen.dart';
+
+class OnlineChatScreen extends StatefulWidget {
+  const OnlineChatScreen({super.key});
+
+  @override
+  State<OnlineChatScreen> createState() => _OnlineChatScreenState();
+}
+
+class _OnlineChatScreenState extends State<OnlineChatScreen> {
+  final TextEditingController searchController = TextEditingController();
+  final OnlineChatService onlineChatService = OnlineChatService();
+  final ContactChatService contactChatService = ContactChatService();
+  final ChatEncryptionRepository _chatEncryptionRepository =
+      ChatEncryptionRepository();
+  final Map<String, String> _previewRefreshKeys = <String, String>{};
+  final LinkedHashMap<String, StreamSubscription<DocumentSnapshot>>
+      _presenceSubscriptions =
+      LinkedHashMap<String, StreamSubscription<DocumentSnapshot>>();
+  final Map<String, ValueNotifier<Map<String, dynamic>?>> _presenceNotifiers =
+      <String, ValueNotifier<Map<String, dynamic>?>>{};
+
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _chatSubscription;
+  StreamSubscription<QuerySnapshot>? _friendsSubscription;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
+      _settingsSubscription;
+  QuerySnapshot<Map<String, dynamic>>? _chatSnapshot;
+  QuerySnapshot? _friendsSnapshot;
+  QuerySnapshot<Map<String, dynamic>>? _settingsSnapshot;
+  Object? _chatLoadError;
+  Object? _friendsLoadError;
+  int _chatVersion = 0;
+  int _friendsVersion = 0;
+  int _settingsVersion = 0;
+  String? _mergedEntriesCacheKey;
+  List<_ConversationEntry> _mergedEntriesCache = const <_ConversationEntry>[];
+  Timer? _searchDebounceTimer;
+
+  String searchText = '';
+  static const Duration _searchDebounceDuration =
+      Duration(milliseconds: 120);
+  static const int _maxInboxPresenceSubscriptions = 12;
+  static const Color _bgColor = Color(0xFF0B1622);
+  static const Color _surfaceColor = Color(0xFF101C2B);
+  static const Color _surfaceElevatedColor = Color(0xFF162334);
+  static const Color _inputFillColor = Color(0xFF1A2737);
+  static const Color _accentColor = Color(0xFF25D366);
+  static const Color _headerColor = Color(0xFF0E1A28);
+  static const Color _textPrimary = Color(0xFFF5FAFF);
+  static const Color _textMuted = Color(0xFF93A4B5);
+
+  @override
+  void initState() {
+    super.initState();
+    searchController.addListener(_handleSearchChanged);
+    unawaited(onlineChatService.scheduleConversationActivityBackfillIfNeeded());
+    _startInboxSubscriptions();
+  }
+
+  Color _presenceColor(String mode, bool isOnline) {
+    switch (OnlineChatService.normalizePresenceMode(mode)) {
+      case 'dnd':
+        return Colors.redAccent;
+      case 'idle':
+        return Colors.amber;
+      case 'invisible':
+        return Colors.grey;
+      case 'online':
+      default:
+        return isOnline ? const Color(0xFF25D366) : Colors.grey;
+    }
+  }
+
+  @override
+  void dispose() {
+    searchController.removeListener(_handleSearchChanged);
+    _searchDebounceTimer?.cancel();
+    _chatSubscription?.cancel();
+    _friendsSubscription?.cancel();
+    _settingsSubscription?.cancel();
+    for (final subscription in _presenceSubscriptions.values) {
+      subscription.cancel();
+    }
+    for (final notifier in _presenceNotifiers.values) {
+      notifier.dispose();
+    }
+    searchController.dispose();
+    super.dispose();
+  }
+
+  void _handleSearchChanged() {
+    final nextValue = searchController.text;
+    if (nextValue == searchText) {
+      return;
+    }
+    _searchDebounceTimer?.cancel();
+    _searchDebounceTimer = Timer(_searchDebounceDuration, () {
+      if (!mounted) return;
+      setState(() {
+        searchText = nextValue;
+      });
+    });
+  }
+
+  void _startInboxSubscriptions() {
+    _chatSubscription = onlineChatService.getUserChats().listen(
+      (snapshot) {
+        if (!mounted) return;
+        setState(() {
+          _chatSnapshot = snapshot;
+          _chatLoadError = null;
+          _chatVersion++;
+        });
+      },
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() {
+          _chatLoadError = error;
+        });
+      },
+    );
+
+    _friendsSubscription = contactChatService.getMyContacts().listen(
+      (snapshot) {
+        if (!mounted) return;
+        setState(() {
+          _friendsSnapshot = snapshot;
+          _friendsLoadError = null;
+          _friendsVersion++;
+        });
+      },
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() {
+          _friendsLoadError = error;
+        });
+      },
+    );
+
+    _settingsSubscription = onlineChatService.getChatSettings().listen(
+      (snapshot) {
+        if (!mounted) return;
+        setState(() {
+          _settingsSnapshot = snapshot;
+          _settingsVersion++;
+        });
+      },
+      onError: (_) {},
+    );
+  }
+
+  ValueNotifier<Map<String, dynamic>?> _presenceNotifierFor(String uid) {
+    return _presenceNotifiers.putIfAbsent(
+      uid,
+      () => ValueNotifier<Map<String, dynamic>?>(null),
+    );
+  }
+
+  void _trackPresence(String uid) {
+    final trimmedUid = uid.trim();
+    if (trimmedUid.isEmpty) return;
+
+    final existing = _presenceSubscriptions.remove(trimmedUid);
+    if (existing != null) {
+      _presenceSubscriptions[trimmedUid] = existing;
+      return;
+    }
+
+    if (_presenceSubscriptions.length >= _maxInboxPresenceSubscriptions) {
+      final evictedUid = _presenceSubscriptions.keys.first;
+      _presenceSubscriptions.remove(evictedUid)?.cancel();
+    }
+
+    final notifier = _presenceNotifierFor(trimmedUid);
+    final subscription = onlineChatService.getUserStatus(trimmedUid).listen(
+      (doc) {
+        notifier.value = doc.exists
+            ? doc.data() as Map<String, dynamic>?
+            : null;
+      },
+      onError: (_) {},
+    );
+    _presenceSubscriptions[trimmedUid] = subscription;
+  }
+
+  void _openChat({
+    required String uid,
+    required String name,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          contactName: name,
+          phone: '',
+          chatType: 'online',
+          receiverId: uid,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _deleteConversation({
+    required String uid,
+    required String name,
+  }) async {
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Delete Conversation?'),
+            content: Text('Hide your chat with $name from this device?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!confirmed) return;
+
+    await onlineChatService.hideConversation(uid);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Conversation with $name hidden')),
+    );
+  }
+
+  Future<void> _toggleConversationMute({
+    required _ConversationEntry entry,
+    required bool muted,
+  }) async {
+    await onlineChatService.setConversationMuted(
+      otherUserId: entry.uid,
+      muted: muted,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          muted
+              ? 'Notifications muted for ${entry.name}'
+              : 'Notifications unmuted for ${entry.name}',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleConversationBlock({
+    required _ConversationEntry entry,
+    required bool blocked,
+  }) async {
+    if (blocked) {
+      final confirmed = await showDialog<bool>(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: Text('Block ${entry.name}?'),
+              content: const Text(
+                'Messages, calls, and notifications from this user will be blocked until you unblock them.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Block'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+      if (!confirmed) return;
+    }
+
+    await onlineChatService.setConversationBlocked(
+      otherUserId: entry.uid,
+      blocked: blocked,
+      otherName: entry.name,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          blocked ? '${entry.name} blocked' : '${entry.name} unblocked',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleConversationReadState({
+    required _ConversationEntry entry,
+    required bool unread,
+  }) async {
+    if (unread) {
+      await onlineChatService.markConversationUnread(entry.uid);
+    } else {
+      await onlineChatService.markMessagesAsRead(entry.uid);
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          unread
+              ? 'Marked ${entry.name} as unread'
+              : 'Marked ${entry.name} as read',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showConversationActions({
+    required _ConversationEntry entry,
+    required bool isMuted,
+    required bool isBlocked,
+    required bool isUnread,
+  }) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _surfaceColor,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Wrap(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.chat_bubble_outline, color: Colors.white),
+                title: const Text('Open chat', style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _openChat(uid: entry.uid, name: entry.name);
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  isUnread
+                      ? Icons.mark_chat_read_outlined
+                      : Icons.mark_chat_unread_outlined,
+                  color: isUnread ? Colors.white70 : _accentColor,
+                ),
+                title: Text(
+                  isUnread ? 'Mark as read' : 'Mark as unread',
+                  style: const TextStyle(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _toggleConversationReadState(
+                    entry: entry,
+                    unread: !isUnread,
+                  );
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  isMuted
+                      ? Icons.notifications_active_outlined
+                      : Icons.notifications_off_outlined,
+                  color: isMuted ? Colors.white70 : Colors.orangeAccent,
+                ),
+                title: Text(
+                  isMuted ? 'Unmute notifications' : 'Mute notifications',
+                  style: const TextStyle(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _toggleConversationMute(entry: entry, muted: !isMuted);
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  isBlocked ? Icons.person_outline : Icons.block,
+                  color: isBlocked ? Colors.white70 : Colors.redAccent,
+                ),
+                title: Text(
+                  isBlocked ? 'Unblock user' : 'Block user',
+                  style: const TextStyle(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _toggleConversationBlock(entry: entry, blocked: !isBlocked);
+                },
+              ),
+              if (entry.hasConversation)
+                ListTile(
+                  leading: const Icon(
+                    Icons.delete_outline,
+                    color: Colors.redAccent,
+                  ),
+                  title: const Text(
+                    'Delete chat',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  subtitle: const Text(
+                    'Remove this conversation from your chat list',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    _deleteConversation(uid: entry.uid, name: entry.name);
+                  },
+                ),
+              ListTile(
+                leading: const Icon(Icons.close, color: Colors.white54),
+                title: const Text('Cancel', style: TextStyle(color: Colors.white70)),
+                onTap: () => Navigator.pop(sheetContext),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ignore: unused_element
+  String _formatUpdatedAt(Timestamp? timestamp) {
+    if (timestamp == null) return '';
+    final dt = timestamp.toDate();
+    final now = DateTime.now();
+    if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
+      return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    }
+    return '${dt.month}/${dt.day}/${dt.year.toString().substring(2)}';
+  }
+
+  DateTime? _parseDateTime(dynamic raw) {
+    if (raw is Timestamp) return raw.toDate();
+    if (raw is DateTime) return raw;
+    if (raw is int) return DateTime.fromMillisecondsSinceEpoch(raw);
+    if (raw is num) return DateTime.fromMillisecondsSinceEpoch(raw.toInt());
+    if (raw is String) {
+      final parsedInt = int.tryParse(raw);
+      if (parsedInt != null) {
+        return DateTime.fromMillisecondsSinceEpoch(parsedInt);
+      }
+      return DateTime.tryParse(raw);
+    }
+    return null;
+  }
+
+  int? _parseInt(dynamic raw) {
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw);
+    return null;
+  }
+
+  int _activitySortMs({
+    required DateTime? lastMessageAt,
+    required int? lastMessageAtClientMs,
+    required DateTime? updatedAt,
+  }) {
+    final lastMessageAtMs = lastMessageAt?.millisecondsSinceEpoch ?? 0;
+    final clientMs = lastMessageAtClientMs ?? 0;
+    final updatedAtMs = updatedAt?.millisecondsSinceEpoch ?? 0;
+    var best = lastMessageAtMs;
+    if (clientMs > best) best = clientMs;
+    if (updatedAtMs > best) best = updatedAtMs;
+    return best;
+  }
+
+  DateTime? _effectiveActivityAt({
+    required DateTime? lastMessageAt,
+    required int? lastMessageAtClientMs,
+    required DateTime? updatedAt,
+  }) {
+    final effectiveMs = _activitySortMs(
+      lastMessageAt: lastMessageAt,
+      lastMessageAtClientMs: lastMessageAtClientMs,
+      updatedAt: updatedAt,
+    );
+    if (effectiveMs <= 0) return null;
+    return DateTime.fromMillisecondsSinceEpoch(effectiveMs);
+  }
+
+  List<String> _readStringList(dynamic raw) {
+    if (raw is Iterable) {
+      return raw
+          .map((item) => item?.toString().trim() ?? '')
+          .where((item) => item.isNotEmpty)
+          .toList(growable: false);
+    }
+    return const <String>[];
+  }
+
+  String _formatUpdatedAtDateTime(DateTime? dt) {
+    if (dt == null) return '';
+    final now = DateTime.now();
+    if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
+      return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    }
+    return '${dt.month}/${dt.day}/${dt.year.toString().substring(2)}';
+  }
+
+  List<_ConversationEntry> _resolveMergedEntries({
+    required QuerySnapshot<Map<String, dynamic>> chatSnapshot,
+    required QuerySnapshot friendSnapshot,
+  }) {
+    final cacheKey =
+        '$_chatVersion|$_friendsVersion|$_settingsVersion|${searchText.trim().toLowerCase()}';
+    if (_mergedEntriesCacheKey == cacheKey) {
+      return _mergedEntriesCache;
+    }
+
+    final entries = _mergeEntries(
+      chatSnapshot: chatSnapshot,
+      friendSnapshot: friendSnapshot,
+    );
+    _mergedEntriesCacheKey = cacheKey;
+    _mergedEntriesCache = entries;
+    return entries;
+  }
+
+  Map<String, Map<String, dynamic>> _settingsByUid() {
+    final settingsByUid = <String, Map<String, dynamic>>{};
+    final snapshot = _settingsSnapshot;
+    if (snapshot == null) {
+      return settingsByUid;
+    }
+    for (final doc in snapshot.docs) {
+      settingsByUid[doc.id] = doc.data();
+    }
+    return settingsByUid;
+  }
+
+  List<_ConversationEntry> _mergeEntries({
+    required QuerySnapshot<Map<String, dynamic>> chatSnapshot,
+    required QuerySnapshot friendSnapshot,
+  }) {
+    final activeEntries = <String, _ConversationEntry>{};
+    final friendOnlyEntries = <String, _ConversationEntry>{};
+    final query = searchText.trim().toLowerCase();
+
+    for (final doc in chatSnapshot.docs) {
+      try {
+        final data = doc.data();
+        final hiddenFor = Map<String, dynamic>.from(
+          data['hiddenFor'] ?? const <String, dynamic>{},
+        );
+        if (hiddenFor[onlineChatService.currentUserId] == true) {
+          continue;
+        }
+
+        final participants = _readStringList(data['participants']);
+        final otherUserId = participants.firstWhere(
+          (uid) => uid != onlineChatService.currentUserId,
+          orElse: () => '',
+        );
+        if (otherUserId.isEmpty) continue;
+
+        final names = Map<String, dynamic>.from(
+          data['participantNames'] ?? const <String, dynamic>{},
+        );
+        final otherName =
+            (names[otherUserId]?.toString().trim().isNotEmpty == true)
+                ? names[otherUserId].toString().trim()
+                : 'Unknown User';
+        final lastMessage = data['lastMessage']?.toString() ?? '';
+
+        if (query.isNotEmpty &&
+            !otherName.toLowerCase().contains(query) &&
+            !lastMessage.toLowerCase().contains(query)) {
+          continue;
+        }
+
+        final lastMessageSenderId = data['lastMessageSenderId']?.toString() ?? '';
+        final lastMessageIsRead = data['lastMessageIsRead'] == true;
+        final lastMessageType = data['lastMessageType']?.toString() ?? 'text';
+        final lastMessageE2ee = data['lastMessageE2ee'] == true;
+        final updatedAt = _parseDateTime(data['updatedAt']);
+        final lastMessageAt = _effectiveActivityAt(
+          lastMessageAt: _parseDateTime(data['lastMessageAt']),
+          lastMessageAtClientMs: _parseInt(data['lastMessageAtClientMs']),
+          updatedAt: updatedAt,
+        );
+        final lastMessageAtClientMs = _parseInt(data['lastMessageAtClientMs']);
+
+        String statusLabel = '';
+        if (lastMessage.isNotEmpty &&
+            lastMessageSenderId == onlineChatService.currentUserId &&
+            lastMessageIsRead) {
+          statusLabel = 'Seen';
+        } else if (lastMessage.isNotEmpty &&
+            lastMessageSenderId != onlineChatService.currentUserId &&
+            !lastMessageIsRead) {
+          statusLabel = 'Unread';
+        }
+
+        activeEntries[otherUserId] = _ConversationEntry(
+          chatId: doc.id,
+          uid: otherUserId,
+          name: otherName,
+          lastMessage: lastMessage,
+          lastMessageType: lastMessageType,
+          lastMessageE2ee: lastMessageE2ee,
+          lastMessageCipherText: data['lastMessageCipherText']?.toString(),
+          lastMessageDeviceEnvelopes:
+              data['lastMessageDeviceEnvelopes'] is Map
+                  ? Map<String, dynamic>.from(
+                      data['lastMessageDeviceEnvelopes'] as Map,
+                    )
+                  : null,
+          lastMessageCacheKey: data['lastMessageCacheKey']?.toString(),
+          lastMessageAlgorithm: data['lastMessageAlgorithm']?.toString(),
+          lastMessageE2eeMessageType:
+              _parseInt(data['lastMessageE2eeMessageType']),
+          lastMessageNonce: data['lastMessageNonce']?.toString(),
+          lastMessageMac: data['lastMessageMac']?.toString(),
+          lastMessageClientMessageId:
+              data['lastMessageClientMessageId']?.toString(),
+          lastMessageSenderId: lastMessageSenderId,
+          lastMessageSenderPublicKey:
+              data['lastMessageSenderPublicKey']?.toString(),
+          lastMessageReceiverPublicKey:
+              data['lastMessageReceiverPublicKey']?.toString(),
+          lastMessageSessionId: data['lastMessageSessionId']?.toString(),
+          lastMessageSessionVersion: _parseInt(data['lastMessageSessionVersion']),
+          lastMessageSessionPeerId: data['lastMessageSessionPeerId']?.toString(),
+          lastMessageSessionAlgorithm:
+              data['lastMessageSessionAlgorithm']?.toString(),
+          lastMessageSessionLocalPublicKey:
+              data['lastMessageSessionLocalPublicKey']?.toString(),
+          lastMessageSessionPeerPublicKey:
+              data['lastMessageSessionPeerPublicKey']?.toString(),
+          lastMessageAt: lastMessageAt,
+          lastMessageAtClientMs: lastMessageAtClientMs,
+          updatedAt: updatedAt,
+          statusLabel: statusLabel,
+          hasConversation: true,
+        );
+      } catch (_) {
+        continue;
+      }
+    }
+
+    for (final doc in friendSnapshot.docs) {
+      final data = doc.data() as Map<String, dynamic>;
+      final uid = data['uid']?.toString() ?? '';
+      if (uid.isEmpty) continue;
+      if (activeEntries.containsKey(uid)) continue;
+
+      final name = (data['name']?.toString().trim().isNotEmpty == true)
+          ? data['name'].toString().trim()
+          : 'Unknown User';
+
+      if (query.isNotEmpty && !name.toLowerCase().contains(query)) {
+        continue;
+      }
+
+      friendOnlyEntries[uid] = _ConversationEntry(
+        chatId: onlineChatService.getChatId(uid),
+        uid: uid,
+        name: name,
+        lastMessage: '',
+        lastMessageType: 'text',
+        lastMessageE2ee: false,
+        lastMessageCipherText: null,
+        lastMessageDeviceEnvelopes: null,
+        lastMessageCacheKey: null,
+        lastMessageAlgorithm: null,
+        lastMessageE2eeMessageType: null,
+        lastMessageNonce: null,
+        lastMessageMac: null,
+        lastMessageClientMessageId: null,
+        lastMessageSenderId: '',
+        lastMessageSenderPublicKey: null,
+        lastMessageReceiverPublicKey: null,
+        lastMessageSessionId: null,
+        lastMessageSessionVersion: null,
+        lastMessageSessionPeerId: null,
+        lastMessageSessionAlgorithm: null,
+        lastMessageSessionLocalPublicKey: null,
+        lastMessageSessionPeerPublicKey: null,
+        lastMessageAt: null,
+        lastMessageAtClientMs: null,
+        updatedAt: null,
+        statusLabel: '',
+        hasConversation: false,
+      );
+    }
+
+      final active = activeEntries.values.toList()
+        ..sort((a, b) {
+          final byActivity = _activitySortMs(
+            lastMessageAt: b.lastMessageAt,
+            lastMessageAtClientMs: b.lastMessageAtClientMs,
+            updatedAt: b.updatedAt,
+          ).compareTo(
+            _activitySortMs(
+              lastMessageAt: a.lastMessageAt,
+              lastMessageAtClientMs: a.lastMessageAtClientMs,
+              updatedAt: a.updatedAt,
+            ),
+          );
+          if (byActivity != 0) return byActivity;
+
+          final byUpdatedAt =
+              (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+          a.updatedAt?.millisecondsSinceEpoch ?? 0,
+        );
+        if (byUpdatedAt != 0) return byUpdatedAt;
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
+
+    final friendOnly = friendOnlyEntries.values.toList()
+      ..sort(
+        (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+      );
+
+    return <_ConversationEntry>[
+      ...active,
+      ...friendOnly,
+    ];
+  }
+
+  Widget _buildPreviewWidget(_ConversationEntry entry, {required bool unread}) {
+    final conversationId = entry.chatId;
+    final refreshKey = [
+      conversationId,
+      entry.lastMessageClientMessageId ?? '',
+      entry.lastMessageAt?.millisecondsSinceEpoch ?? 0,
+      entry.lastMessageAtClientMs ?? 0,
+      entry.updatedAt?.millisecondsSinceEpoch ?? 0,
+    ].join('|');
+    if (_previewRefreshKeys[conversationId] != refreshKey) {
+      _previewRefreshKeys[conversationId] = refreshKey;
+      unawaited(
+        _chatEncryptionRepository.primeConversationPreview(
+          conversationId: conversationId,
+        ),
+      );
+      unawaited(
+        _chatEncryptionRepository.refreshConversationPreview(
+          conversationId: conversationId,
+          chatData: <String, dynamic>{
+            'participants': <String>[
+              onlineChatService.currentUserId,
+              entry.uid,
+            ],
+            'lastMessage': entry.lastMessage,
+            'lastMessageType': entry.lastMessageType,
+            'lastMessageE2ee': entry.lastMessageE2ee,
+            'lastMessageCipherText': entry.lastMessageCipherText,
+            'lastMessageDeviceEnvelopes': entry.lastMessageDeviceEnvelopes,
+            'lastMessageCacheKey': entry.lastMessageCacheKey,
+            'lastMessageAlgorithm': entry.lastMessageAlgorithm,
+            'lastMessageE2eeMessageType': entry.lastMessageE2eeMessageType,
+            'lastMessageNonce': entry.lastMessageNonce,
+            'lastMessageMac': entry.lastMessageMac,
+            'lastMessageClientMessageId': entry.lastMessageClientMessageId,
+            'lastMessageSenderId': entry.lastMessageSenderId,
+            'lastMessageReceiverId': entry.lastMessageSenderId ==
+                    onlineChatService.currentUserId
+                ? entry.uid
+                : onlineChatService.currentUserId,
+            'lastMessageSenderPublicKey': entry.lastMessageSenderPublicKey,
+            'lastMessageReceiverPublicKey': entry.lastMessageReceiverPublicKey,
+            'lastMessageSessionId': entry.lastMessageSessionId,
+            'lastMessageSessionVersion': entry.lastMessageSessionVersion,
+            'lastMessageSessionPeerId': entry.lastMessageSessionPeerId,
+            'lastMessageSessionAlgorithm': entry.lastMessageSessionAlgorithm,
+            'lastMessageSessionLocalPublicKey':
+                entry.lastMessageSessionLocalPublicKey,
+            'lastMessageSessionPeerPublicKey':
+                entry.lastMessageSessionPeerPublicKey,
+            'lastMessageAt': entry.lastMessageAt,
+            'updatedAt': entry.updatedAt,
+            'lastMessageIsSuspicious': false,
+          },
+        ),
+      );
+    }
+
+    return StreamBuilder<ConversationPreviewModel?>(
+      stream: _chatEncryptionRepository.watchConversationPreview(
+        conversationId: conversationId,
+      ),
+      builder: (context, snapshot) {
+        final expectedLastMessageId =
+            entry.lastMessageClientMessageId?.trim() ?? '';
+        final cachedPreviewModel = snapshot.data;
+        final cachedLastMessageId =
+            cachedPreviewModel?.lastMessageId?.trim() ?? '';
+        final cachedPreview = cachedPreviewModel?.previewText.trim() ?? '';
+        final preview = cachedPreview.isNotEmpty &&
+                (expectedLastMessageId.isEmpty ||
+                    cachedLastMessageId.isEmpty ||
+                    cachedLastMessageId == expectedLastMessageId)
+            ? cachedPreview
+            : _fallbackPreviewText(entry);
+        return Text(
+          preview,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: unread ? _textPrimary : _textMuted,
+            fontSize: 13,
+            fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
+          ),
+        );
+      },
+    );
+  }
+
+  String _fallbackPreviewText(_ConversationEntry entry) {
+    switch (entry.lastMessageType) {
+      case 'image':
+        return 'Photo';
+      case 'gif':
+        return 'GIF';
+      case 'file':
+        return 'File';
+      case 'call_summary':
+        return entry.lastMessage.isNotEmpty ? entry.lastMessage : 'Call';
+      default:
+        if (entry.lastMessageE2ee &&
+            entry.lastMessageType == 'encrypted_text') {
+          return 'Encrypted message';
+        }
+        if (entry.lastMessage.isNotEmpty) {
+          return entry.lastMessage;
+        }
+        return 'Tap to start chatting';
+    }
+  }
+
+  Widget _buildHeader() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            _headerColor,
+            _surfaceColor,
+          ],
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Online',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 27,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -0.5,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      'Encrypted chats and synced conversations.',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                decoration: BoxDecoration(
+                  color: _surfaceElevatedColor,
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.lock_outline, color: Colors.white70, size: 14),
+                    SizedBox(width: 6),
+                    Text(
+                      'Encrypted',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Container(
+            decoration: BoxDecoration(
+              color: _inputFillColor,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: TextField(
+              controller: searchController,
+              style: const TextStyle(color: Colors.white),
+              cursorColor: _accentColor,
+              decoration: InputDecoration(
+                hintText: 'Search conversations',
+                hintStyle: const TextStyle(color: Colors.white54),
+                prefixIcon: const Icon(Icons.search, color: Colors.white70),
+                suffixIcon: searchText.trim().isNotEmpty
+                    ? IconButton(
+                        onPressed: () {
+                          _searchDebounceTimer?.cancel();
+                          searchController.clear();
+                          setState(() => searchText = '');
+                        },
+                        icon: const Icon(
+                          Icons.close,
+                          color: Colors.white54,
+                          size: 18,
+                        ),
+                      )
+                    : null,
+                filled: true,
+                fillColor: Colors.transparent,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(18),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(vertical: 0),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Row(
+            children: [
+              Text(
+                'Recent conversations',
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              Spacer(),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.touch_app_outlined, color: Colors.white38, size: 13),
+                  SizedBox(width: 4),
+                  Text(
+                    'Hold for actions',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusChip(String text, {required bool unread}) {
+    final bg = unread
+        ? _accentColor.withValues(alpha: 0.16)
+        : _surfaceElevatedColor;
+    final fg = unread ? _accentColor : Colors.white;
+    return Container(
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+            color:
+                unread ? _accentColor.withValues(alpha: 0.28) : Colors.white10),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: fg,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 92,
+            height: 92,
+            decoration: BoxDecoration(
+              color: _surfaceColor,
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white10),
+            ),
+            child: const Icon(
+              Icons.forum_outlined,
+              size: 40,
+              color: _accentColor,
+            ),
+          ),
+          const SizedBox(height: 18),
+          const Text(
+            'No conversations yet',
+            style: TextStyle(
+              color: _textPrimary,
+              fontWeight: FontWeight.w700,
+              fontSize: 18,
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 28),
+            child: Text(
+              'Add a friend or open a contact to start your first online conversation.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: _textMuted),
+            ),
+          ),
+          const SizedBox(height: 14),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _accentColor,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const ContactsScreen(),
+                ),
+              );
+            },
+            icon: const Icon(
+              Icons.person_add_alt_1,
+              color: Colors.white,
+            ),
+            label: const Text(
+              'Open Contacts',
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConversationListBody() {
+    if (_chatLoadError != null || _friendsLoadError != null) {
+      return const Center(
+        child: Text('Failed to load conversations'),
+      );
+    }
+
+    if (_chatSnapshot == null || _friendsSnapshot == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final entries = _resolveMergedEntries(
+      chatSnapshot: _chatSnapshot!,
+      friendSnapshot: _friendsSnapshot!,
+    );
+    if (entries.isEmpty) {
+      return _buildEmptyState();
+    }
+
+    final settingsByUid = _settingsByUid();
+
+    return ListView.separated(
+      key: const PageStorageKey<String>('online_conversation_list'),
+      physics: const BouncingScrollPhysics(
+        parent: AlwaysScrollableScrollPhysics(),
+      ),
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+      cacheExtent: 900,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 96),
+      itemCount: entries.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 10),
+      itemBuilder: (context, index) {
+        final entry = entries[index];
+        final updatedAt = _formatUpdatedAtDateTime(
+          entry.lastMessageAt ?? entry.updatedAt,
+        );
+        final settings = settingsByUid[entry.uid] ?? const <String, dynamic>{};
+        final isMuted = settings['mutedNotifications'] == true;
+        final isBlocked = settings['blocked'] == true;
+        final isUnread =
+            settings['manualUnread'] == true || entry.statusLabel == 'Unread';
+
+        _trackPresence(entry.uid);
+        final presenceNotifier = _presenceNotifierFor(entry.uid);
+
+        return RepaintBoundary(
+          child: ValueListenableBuilder<Map<String, dynamic>?>(
+            valueListenable: presenceNotifier,
+            builder: (context, statusData, _) {
+              final isOnline =
+                  OnlineChatService.computeEffectiveOnline(statusData);
+              final presenceMode = OnlineChatService.normalizePresenceMode(
+                statusData?['presenceMode']?.toString(),
+              );
+              final photoUrl = statusData?['photoUrl']?.toString();
+              final resolvedName = UserProfileService.resolveDisplayName(
+                data: statusData,
+                fallback: entry.name,
+              );
+
+              return Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(24),
+                  onLongPress: () => _showConversationActions(
+                    entry: _ConversationEntry(
+                      chatId: entry.chatId,
+                      uid: entry.uid,
+                      name: resolvedName,
+                      lastMessage: entry.lastMessage,
+                      lastMessageType: entry.lastMessageType,
+                      lastMessageE2ee: entry.lastMessageE2ee,
+                      lastMessageCipherText: entry.lastMessageCipherText,
+                      lastMessageDeviceEnvelopes:
+                          entry.lastMessageDeviceEnvelopes,
+                      lastMessageCacheKey: entry.lastMessageCacheKey,
+                      lastMessageAlgorithm: entry.lastMessageAlgorithm,
+                      lastMessageE2eeMessageType:
+                          entry.lastMessageE2eeMessageType,
+                      lastMessageNonce: entry.lastMessageNonce,
+                      lastMessageMac: entry.lastMessageMac,
+                      lastMessageClientMessageId:
+                          entry.lastMessageClientMessageId,
+                      lastMessageSenderId: entry.lastMessageSenderId,
+                      lastMessageSenderPublicKey:
+                          entry.lastMessageSenderPublicKey,
+                      lastMessageReceiverPublicKey:
+                          entry.lastMessageReceiverPublicKey,
+                      lastMessageSessionId: entry.lastMessageSessionId,
+                      lastMessageSessionVersion:
+                          entry.lastMessageSessionVersion,
+                      lastMessageSessionPeerId: entry.lastMessageSessionPeerId,
+                      lastMessageSessionAlgorithm:
+                          entry.lastMessageSessionAlgorithm,
+                      lastMessageSessionLocalPublicKey:
+                          entry.lastMessageSessionLocalPublicKey,
+                      lastMessageSessionPeerPublicKey:
+                          entry.lastMessageSessionPeerPublicKey,
+                      lastMessageAt: entry.lastMessageAt,
+                      lastMessageAtClientMs: entry.lastMessageAtClientMs,
+                      updatedAt: entry.updatedAt,
+                      statusLabel: entry.statusLabel,
+                      hasConversation: entry.hasConversation,
+                    ),
+                    isMuted: isMuted,
+                    isBlocked: isBlocked,
+                    isUnread: isUnread,
+                  ),
+                  onTap: () => _openChat(
+                    uid: entry.uid,
+                    name: resolvedName,
+                  ),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 14,
+                    ),
+                    decoration: BoxDecoration(
+                      color: _surfaceColor,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: isBlocked
+                            ? Colors.redAccent.withValues(alpha: 0.24)
+                            : Colors.white10,
+                      ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x26000000),
+                          blurRadius: 18,
+                          offset: Offset(0, 10),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        Stack(
+                          children: [
+                            UserAvatar(
+                              name: resolvedName,
+                              imageUrl: photoUrl,
+                              radius: 28,
+                              backgroundColor: Colors.white12,
+                              foregroundColor: Colors.white,
+                            ),
+                            if (isOnline ||
+                                presenceMode == 'dnd' ||
+                                presenceMode == 'idle')
+                              Positioned(
+                                right: 0,
+                                bottom: 0,
+                                child: Container(
+                                  width: 14,
+                                  height: 14,
+                                  decoration: BoxDecoration(
+                                    color: _presenceColor(
+                                      presenceMode,
+                                      isOnline,
+                                    ),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: _surfaceColor,
+                                      width: 2,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                resolvedName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: _textPrimary,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 18,
+                                ),
+                              ),
+                              const SizedBox(height: 5),
+                              _buildPreviewWidget(
+                                entry,
+                                unread: isUnread,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (isMuted)
+                                  const Padding(
+                                    padding: EdgeInsets.only(right: 6),
+                                    child: Icon(
+                                      Icons.notifications_off_outlined,
+                                      color: Colors.white38,
+                                      size: 14,
+                                    ),
+                                  ),
+                                if (updatedAt.isNotEmpty)
+                                  Text(
+                                    updatedAt,
+                                    style: const TextStyle(
+                                      color: _textMuted,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            if (isBlocked)
+                              _buildStatusChip(
+                                'Blocked',
+                                unread: false,
+                              )
+                            else if (isUnread)
+                              _buildStatusChip(
+                                'Unread',
+                                unread: true,
+                              )
+                            else if (entry.statusLabel == 'Seen')
+                              _buildStatusChip(
+                                'Seen',
+                                unread: false,
+                              )
+                            else if (!entry.hasConversation)
+                              _buildStatusChip(
+                                'Friend',
+                                unread: false,
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _bgColor,
+      appBar: AppBar(
+        backgroundColor: _headerColor,
+        toolbarHeight: 0,
+        elevation: 0,
+      ),
+      floatingActionButton: FloatingActionButton(
+        backgroundColor: _accentColor,
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => const ContactsScreen(),
+            ),
+          );
+        },
+        child: const Icon(Icons.chat, color: Colors.white),
+      ),
+      body: Column(
+        children: [
+          _buildHeader(),
+          Expanded(
+            child: _buildConversationListBody(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ConversationEntry {
+  final String chatId;
+  final String uid;
+  final String name;
+  final String lastMessage;
+  final String lastMessageType;
+  final bool lastMessageE2ee;
+  final String? lastMessageCipherText;
+  final Map<String, dynamic>? lastMessageDeviceEnvelopes;
+  final String? lastMessageCacheKey;
+  final String? lastMessageAlgorithm;
+  final int? lastMessageE2eeMessageType;
+  final String? lastMessageNonce;
+  final String? lastMessageMac;
+  final String? lastMessageClientMessageId;
+  final String lastMessageSenderId;
+  final String? lastMessageSenderPublicKey;
+  final String? lastMessageReceiverPublicKey;
+  final String? lastMessageSessionId;
+  final int? lastMessageSessionVersion;
+  final String? lastMessageSessionPeerId;
+  final String? lastMessageSessionAlgorithm;
+  final String? lastMessageSessionLocalPublicKey;
+  final String? lastMessageSessionPeerPublicKey;
+  final DateTime? lastMessageAt;
+  final int? lastMessageAtClientMs;
+  final DateTime? updatedAt;
+  final String statusLabel;
+  final bool hasConversation;
+
+  const _ConversationEntry({
+    required this.chatId,
+    required this.uid,
+    required this.name,
+    required this.lastMessage,
+    required this.lastMessageType,
+    required this.lastMessageE2ee,
+    required this.lastMessageCipherText,
+    required this.lastMessageDeviceEnvelopes,
+    required this.lastMessageCacheKey,
+    required this.lastMessageAlgorithm,
+    required this.lastMessageE2eeMessageType,
+    required this.lastMessageNonce,
+    required this.lastMessageMac,
+    this.lastMessageClientMessageId,
+    this.lastMessageSenderId = '',
+    this.lastMessageSenderPublicKey,
+    this.lastMessageReceiverPublicKey,
+    this.lastMessageSessionId,
+    this.lastMessageSessionVersion,
+    this.lastMessageSessionPeerId,
+    this.lastMessageSessionAlgorithm,
+    this.lastMessageSessionLocalPublicKey,
+    this.lastMessageSessionPeerPublicKey,
+    required this.lastMessageAt,
+    required this.lastMessageAtClientMs,
+    required this.updatedAt,
+    required this.statusLabel,
+    required this.hasConversation,
+  });
+}

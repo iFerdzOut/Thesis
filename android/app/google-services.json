@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "556089083014",
+    "project_id": "distilbert-based-smishing",
+    "storage_bucket": "distilbert-based-smishing.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:556089083014:android:66bf334129e24750093d07",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_1"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCGEImJsmPKDulKbFhpnVZIQHWF4r6cMOs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
