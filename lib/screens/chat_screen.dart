@@ -29,6 +29,7 @@ import '../services/sms_storage_service.dart';
 import '../services/trusted_domain_service.dart';
 import '../services/url_extraction_service.dart';
 import '../services/user_profile_service.dart';
+import '../widgets/feedback_upload_consent_dialog.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/user_avatar.dart';
 import 'call_screen.dart';
@@ -40,6 +41,7 @@ enum _ChatMenuAction {
   unblockUser,
   markUnread,
   markRead,
+  resetSecureSession,
 }
 
 class ChatScreen extends StatefulWidget {
@@ -93,6 +95,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   static const int _maxConcurrentTextDecrypts = 2;
   static const int _maxConcurrentMediaDecrypts = 1;
   static const Duration _decryptFailureCooldown = Duration(seconds: 5);
+  static const Duration _externalLinkCountdown = Duration(seconds: 4);
 
   Timer? _typingTimer;
   bool _isUploading = false;
@@ -542,21 +545,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _confirmOpenExternalUrl(String url) async {
     final shouldOpen = await showDialog<bool>(
           context: context,
-          builder: (_) => AlertDialog(
-            title: const Text('Open Link?'),
-            content: Text(
-              'This link will open outside the app.\n\n$url',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              ElevatedButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('Open'),
-              ),
-            ],
+          barrierDismissible: false,
+          builder: (_) => _RiskyLinkDialog(
+            defangedUrl: _urlExtractionService.defangUrl(url),
+            countdown: _externalLinkCountdown,
           ),
         ) ??
         false;
@@ -721,6 +713,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _manuallyUnread ? 'Mark as read' : 'Mark as unread',
                     ),
                   ),
+                  const PopupMenuItem<_ChatMenuAction>(
+                    value: _ChatMenuAction.resetSecureSession,
+                    child: Text('Reset secure session'),
+                  ),
                 ],
               ),
             ],
@@ -814,6 +810,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           setState(() => _manuallyUnread = false);
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Marked $_displayName as read')),
+          );
+          return;
+        case _ChatMenuAction.resetSecureSession:
+          await _chatEncryptionRepository.resetPeerSession(otherUserId);
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Secure session reset. Send a message to reconnect.',
+              ),
+            ),
           );
           return;
       }
@@ -1490,7 +1497,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     final rawName = file.path.split(Platform.pathSeparator).last;
     final activityClientMs = DateTime.now().millisecondsSinceEpoch;
-    final clientMessageId = FirebaseFirestore.instance.collection('chats').doc().id;
+    final clientMessageId =
+        FirebaseFirestore.instance.collection('chats').doc().id;
     final uploadResult = await _cloudinaryService.uploadFile(
       file,
       onProgress: _updateUploadProgress,
@@ -1777,6 +1785,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> reportLocalMessage(MessageModel msg) async {
     try {
+      await ensureFeedbackUploadPreference(context);
       await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
@@ -1797,6 +1806,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         : '[${msg['type'] ?? 'message'}]';
     final docPath = msg['docPath'] ?? '';
     try {
+      await ensureFeedbackUploadPreference(context);
       await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
@@ -1815,6 +1825,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> reportFalseNegativeLocal(MessageModel msg) async {
     try {
+      await ensureFeedbackUploadPreference(context);
       await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
@@ -1838,6 +1849,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         : '[${msg['type'] ?? 'message'}]';
     final docPath = msg['docPath'] ?? '';
     try {
+      await ensureFeedbackUploadPreference(context);
       await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
@@ -1891,7 +1903,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               title: Text(
                 _trustedDomainService.isUrlTrustedCached(urls.first)
                     ? 'Open Link'
-                    : 'Review Link Before Opening',
+                    : 'Security Check Before Opening',
               ),
               subtitle: Text(urls.first,
                   maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -1987,7 +1999,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               title: Text(
                 _trustedDomainService.isUrlTrustedCached(urls.first)
                     ? 'Open Link'
-                    : 'Review Link Before Opening',
+                    : 'Security Check Before Opening',
               ),
               subtitle: Text(urls.first,
                   maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -2227,7 +2239,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           SizedBox(width: 8),
           Expanded(
             child: Text(
-              'This message was flagged as suspicious. Be careful with links, OTPs, and urgent requests.',
+              'Suspicious message detected. Avoid links, OTPs, urgent requests, and sender impersonation.\nKahina-hinala ang mensaheng ito. Iwasan ang link, OTP, pagmamadali, at panggagaya ng sender.',
               style: TextStyle(fontSize: 12, color: Color(0xFFFFD49A)),
             ),
           ),
@@ -2432,12 +2444,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 Icon(Icons.sms_outlined, size: 64, color: Colors.grey.shade300),
                 const SizedBox(height: 16),
                 const Text('No messages yet',
-                    style:
-                        TextStyle(color: Colors.white54, fontSize: 16)),
+                    style: TextStyle(color: Colors.white54, fontSize: 16)),
                 const SizedBox(height: 8),
                 const Text('Send a message to start the conversation',
-                    style:
-                        TextStyle(color: Colors.white38, fontSize: 13)),
+                    style: TextStyle(color: Colors.white38, fontSize: 13)),
                 const SizedBox(height: 8),
                 const Text(
                   'If a suspicious SMS was blocked, review it in Quarantine Vault.',
@@ -2494,23 +2504,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 messageKey: data['messageKey']?.toString(),
                 riskScore: (data['riskScore'] as num?)?.toDouble(),
                 riskLevel: data['riskLevel']?.toString(),
-                detectionReasons:
-                    (data['detectionReasons'] as List<dynamic>? ??
-                            const <dynamic>[])
-                        .map((item) => item.toString())
-                        .where((item) => item.trim().isNotEmpty)
-                        .toList(),
+                detectionReasons: (data['detectionReasons'] as List<dynamic>? ??
+                        const <dynamic>[])
+                    .map((item) => item.toString())
+                    .where((item) => item.trim().isNotEmpty)
+                    .toList(),
                 modelScore: (data['modelScore'] as num?)?.toDouble(),
                 heuristicScore: (data['heuristicScore'] as num?)?.toDouble(),
                 detectionSource: data['detectionSource']?.toString(),
                 pipelineStage: data['pipelineStage']?.toString(),
                 detectionDecision: data['detectionDecision']?.toString(),
-                extractedUrls:
-                    (data['extractedUrls'] as List<dynamic>? ??
-                            const <dynamic>[])
-                        .map((item) => item.toString())
-                        .where((item) => item.trim().isNotEmpty)
-                        .toList(),
+                extractedUrls: (data['extractedUrls'] as List<dynamic>? ??
+                        const <dynamic>[])
+                    .map((item) => item.toString())
+                    .where((item) => item.trim().isNotEmpty)
+                    .toList(),
                 primaryUrl: data['primaryUrl']?.toString(),
                 primaryDomain: data['primaryDomain']?.toString(),
                 needsRescan: data['needsRescan'] == true,
@@ -2863,7 +2871,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             fileName: fileName,
           );
         } catch (error) {
-          debugPrint('[ChatScreen] Failed to persist incoming encrypted media: $error');
+          debugPrint(
+              '[ChatScreen] Failed to persist incoming encrypted media: $error');
         }
         _encryptedMediaFailureAt.remove(cacheKey);
         return decryptedBytes;
@@ -2988,7 +2997,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return null;
   }
 
-  String _resolvedEncryptedThreadText(
+  String? _resolvedEncryptedThreadText(
     Map<String, dynamic> data,
     DecryptedConversationMessage? projection,
   ) {
@@ -3005,7 +3014,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ? projection.failureReason!.trim()
               : 'Unable to decrypt message';
         case ConversationDecryptionStatus.pending:
-          return 'Decrypting...';
+          return null;
       }
     }
 
@@ -3014,7 +3023,42 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return seededText;
     }
 
-    return 'Decrypting...';
+    return null;
+  }
+
+  Widget _buildDecryptingBubble({
+    required bool isMe,
+    required DateTime time,
+  }) {
+    return Column(
+      crossAxisAlignment:
+          isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: _surfaceElevatedColor,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: _outlineColor),
+          ),
+          child: const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 1.5,
+              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF25D366)),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
+          child: Text(
+            formatTime(time),
+            style: const TextStyle(fontSize: 11, color: Colors.white38),
+          ),
+        ),
+      ],
+    );
   }
 
   Future<void> _openEncryptedImagePreviewBytes(Uint8List bytes) async {
@@ -3255,6 +3299,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   final resolvedText = isEncryptedText
                       ? _resolvedEncryptedThreadText(data, projection)
                       : text;
+                  final isDecrypting = isEncryptedText && resolvedText == null;
+
+                  if (isDecrypting) {
+                    return RepaintBoundary(
+                      child: _buildDecryptingBubble(isMe: isMe, time: time),
+                    );
+                  }
 
                   if (isEncryptedMedia) {
                     return RepaintBoundary(
@@ -3262,7 +3313,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         data: data,
                         doc: doc,
                         isMe: isMe,
-                        resolvedText: resolvedText,
+                        resolvedText: resolvedText ?? '',
                         suspicious: suspicious,
                         type: type,
                         isCallSummary: isCallSummary,
@@ -3288,7 +3339,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       data: data,
                       doc: doc,
                       isMe: isMe,
-                      resolvedText: resolvedText,
+                      resolvedText: resolvedText ?? '',
                       suspicious: suspicious,
                       type: type,
                       isCallSummary: isCallSummary,
@@ -3709,4 +3760,123 @@ class _ConversationProjectionLookups {
       : byMessageId = const <String, DecryptedConversationMessage>{},
         byClientMessageId = const <String, DecryptedConversationMessage>{},
         byCacheKey = const <String, DecryptedConversationMessage>{};
+}
+
+class _RiskyLinkDialog extends StatefulWidget {
+  final String defangedUrl;
+  final Duration countdown;
+
+  const _RiskyLinkDialog({
+    required this.defangedUrl,
+    required this.countdown,
+  });
+
+  @override
+  State<_RiskyLinkDialog> createState() => _RiskyLinkDialogState();
+}
+
+class _RiskyLinkDialogState extends State<_RiskyLinkDialog> {
+  Timer? _countdownTimer;
+  late int _secondsLeft;
+
+  @override
+  void initState() {
+    super.initState();
+    _secondsLeft = widget.countdown.inSeconds;
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_secondsLeft <= 1) {
+        timer.cancel();
+        if (mounted) {
+          setState(() => _secondsLeft = 0);
+        }
+        return;
+      }
+      if (mounted) {
+        setState(() => _secondsLeft -= 1);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _countdownTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canOpen = _secondsLeft == 0;
+
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      title: const Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.shield_outlined, color: Colors.orange),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text('Security Check Required'),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'This link will open outside Smishing Shield PH. Open it only if you trust the sender and the website.',
+              style: TextStyle(fontSize: 14, height: 1.35),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Magbubukas ang link sa labas ng app. Buksan lang ito kung pinagkakatiwalaan mo ang sender at website.',
+              style: TextStyle(fontSize: 13, height: 1.35),
+            ),
+            const SizedBox(height: 14),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF3E0),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFFFCC80)),
+              ),
+              child: SelectableText(
+                widget.defangedUrl,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Watch for fake verification, urgent requests, OTP theft, and impersonation.',
+              style: TextStyle(fontSize: 12.5, color: Colors.black87),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            backgroundColor:
+                canOpen ? const Color(0xFF075E54) : Colors.grey.shade300,
+          ),
+          onPressed: canOpen ? () => Navigator.pop(context, true) : null,
+          child: Text(
+            canOpen ? 'Open Link' : 'Open in ${_secondsLeft}s',
+            style: TextStyle(
+              color: canOpen ? Colors.white : Colors.grey.shade600,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }

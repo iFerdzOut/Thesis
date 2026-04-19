@@ -332,6 +332,7 @@ class SmsService {
     }
 
     final sender = args['sender']?.toString() ?? 'Unknown';
+    final senderDisplay = args['senderDisplay']?.toString() ?? '';
     final body = args['body']?.toString() ?? '';
     final simSlot = (args['simSlot'] as num?)?.toInt() ?? 0;
     final timestampMs = (args['timestamp'] as num?)?.toInt() ??
@@ -420,6 +421,10 @@ class SmsService {
           timestampMs: timestampMs,
         );
       }
+    }
+
+    if (senderDisplay.isNotEmpty && senderDisplay != sender) {
+      await _storage.updateThreadSenderDisplay(sender, senderDisplay);
     }
 
     if (_routingService.shouldRequestRescan(decision)) {

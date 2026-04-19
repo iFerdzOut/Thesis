@@ -151,12 +151,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
         }),
       ]);
 
-      await E2eeService().bootstrapIfNeeded(
-        accountPassword: password,
-      );
-
+      // Navigate home immediately — E2EE bootstrap is expensive (PBKDF2 ×3 +
+      // ~100 Firestore prekey writes) and must NOT block the registration UI.
+      // scheduleAutomaticAccountBootstrap runs it in the background; the first
+      // chat open triggers ensureDeviceIdentity which waits for it to finish.
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);
+      E2eeService().scheduleAutomaticAccountBootstrap(accountPassword: password);
     } catch (e) {
       if (!mounted) return;
       final msg = _friendlyError(e);

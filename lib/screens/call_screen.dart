@@ -76,6 +76,7 @@ class _CallScreenState extends State<CallScreen>
   Timer? _callTimer;
   Timer? _ringTimer;
   Timer? _reconnectTimeoutTimer;
+  Timer? _noAnswerTimer;
   int _callSeconds = 0;
 
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
@@ -197,6 +198,7 @@ class _CallScreenState extends State<CallScreen>
     _callTimer?.cancel();
     _ringTimer?.cancel();
     _reconnectTimeoutTimer?.cancel();
+    _noAnswerTimer?.cancel();
     _callDocSubscription?.cancel();
     _runtimeStatusSubscription?.cancel();
     _mediaStateSubscription?.cancel();
@@ -234,16 +236,18 @@ class _CallScreenState extends State<CallScreen>
 
   void _handleMediaStateChange(int _) {
     if (!mounted || _isDisposed) return;
+    // isRemoteCameraOff is Firestore-authoritative — never override it here.
+    // When local camera toggling fires this callback, hasRemoteVideoTrack is
+    // still true (the WebRTC track object exists even when camera is off),
+    // so resetting isRemoteCameraOff here would incorrectly flip the UI back
+    // to showing the remote feed even after the remote turned their camera off.
     final remoteHasVideo = callService.hasRemoteVideoTrack;
-    final nextRemoteCameraOff = remoteHasVideo ? false : isRemoteCameraOff;
     final nextVideoEnabled = remoteHasVideo ? true : isVideoEnabled;
-    if (nextRemoteCameraOff == isRemoteCameraOff &&
-        nextVideoEnabled == isVideoEnabled) {
+    if (nextVideoEnabled == isVideoEnabled) {
       setState(() {});
       return;
     }
     setState(() {
-      isRemoteCameraOff = nextRemoteCameraOff;
       isVideoEnabled = nextVideoEnabled;
     });
   }
@@ -359,8 +363,7 @@ class _CallScreenState extends State<CallScreen>
           data['isVideo'] == true;
       final remoteMuted = data['${remotePrefix}_micMuted'] == true;
       final remoteCameraIsOff =
-          data['${remotePrefix}_cameraOff'] == true &&
-          !callService.hasRemoteVideoTrack;
+          data['${remotePrefix}_cameraOff'] == true;
       final localCameraIsOff = data['${localPrefix}_cameraOff'] == true;
 
       if (mounted) {
@@ -395,6 +398,7 @@ class _CallScreenState extends State<CallScreen>
             statusText = 'Connected';
           });
           _stopRinging();
+          unawaited(_stopOutgoingRingtone());
           _startCallTimer();
           unawaited(_syncNativePictureInPictureEligibility());
         } else if (mounted) {
@@ -418,8 +422,15 @@ class _CallScreenState extends State<CallScreen>
             isLoading = false;
             statusText = 'Calling $_displayName...';
           });
+          unawaited(_startOutgoingRingtone());
+          _noAnswerTimer ??= Timer(const Duration(seconds: 60), () {
+            if (!callAnswered && mounted && !_isDisposed && !_callEnded) {
+              unawaited(_endCall());
+            }
+          });
         }
       } else if (status == 'busy') {
+        unawaited(_stopOutgoingRingtone());
         if (mounted && !_isDisposed) {
           setState(() {
             _callEnded = true;
@@ -431,6 +442,7 @@ class _CallScreenState extends State<CallScreen>
           status == 'declined' ||
           status == 'missed' ||
           status == 'cancelled') {
+        unawaited(_stopOutgoingRingtone());
         await _showCallEndedScreen(endedByMe: false);
         _releaseOutgoingLock();
       }
@@ -538,6 +550,20 @@ class _CallScreenState extends State<CallScreen>
         _endedBy = endedByMe ? 'me' : 'them';
       });
     }
+  }
+
+  Future<void> _startOutgoingRingtone() async {
+    try {
+      await _channel.invokeMethod('startOutgoingRingtone');
+    } catch (_) {}
+  }
+
+  Future<void> _stopOutgoingRingtone() async {
+    _noAnswerTimer?.cancel();
+    _noAnswerTimer = null;
+    try {
+      await _channel.invokeMethod('stopOutgoingRingtone');
+    } catch (_) {}
   }
 
   Future<void> _startRinging() async {
@@ -871,6 +897,7 @@ class _CallScreenState extends State<CallScreen>
 
   Future<void> _endCall() async {
     _releaseOutgoingLock();
+    await _stopOutgoingRingtone();
     await _setNativePictureInPictureEnabled(false);
 
     _shouldDisposeWebRtcOnDispose = true;
@@ -1464,8 +1491,8 @@ class _CallScreenState extends State<CallScreen>
   }
 
   bool get _showRemoteVideo =>
-      callService.hasRemoteVideoTrack ||
-      (!isRemoteCameraOff && isVideoEnabled);
+      !isRemoteCameraOff &&
+      (callService.hasRemoteVideoTrack || isVideoEnabled);
 
   Widget _buildVideoCallUI() {
     if (_isInPictureInPictureMode) {
@@ -1528,7 +1555,9 @@ class _CallScreenState extends State<CallScreen>
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    '$_displayName turned off their camera',
+                    isCameraOff
+                        ? 'Both cameras are off'
+                        : '$_displayName turned off their camera',
                     style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 14,

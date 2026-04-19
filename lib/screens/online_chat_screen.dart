@@ -46,12 +46,12 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   int _friendsVersion = 0;
   int _settingsVersion = 0;
   String? _mergedEntriesCacheKey;
+  String? _legacyConversationRepairKey;
   List<_ConversationEntry> _mergedEntriesCache = const <_ConversationEntry>[];
   Timer? _searchDebounceTimer;
 
   String searchText = '';
-  static const Duration _searchDebounceDuration =
-      Duration(milliseconds: 120);
+  static const Duration _searchDebounceDuration = Duration(milliseconds: 120);
   static const int _maxInboxPresenceSubscriptions = 12;
   static const Color _bgColor = Color(0xFF0B1622);
   static const Color _surfaceColor = Color(0xFF101C2B);
@@ -126,6 +126,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
         });
       },
       onError: (Object error) {
+        debugPrint('[OnlineChatScreen] chat stream error: $error');
         if (!mounted) return;
         setState(() {
           _chatLoadError = error;
@@ -141,8 +142,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           _friendsLoadError = null;
           _friendsVersion++;
         });
+        unawaited(_repairLegacyConversationSummaries(snapshot));
       },
       onError: (Object error) {
+        debugPrint('[OnlineChatScreen] contacts stream error: $error');
         if (!mounted) return;
         setState(() {
           _friendsLoadError = error;
@@ -160,6 +163,51 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
       },
       onError: (_) {},
     );
+  }
+
+  String _docUid(QueryDocumentSnapshot doc) {
+    final rawData = doc.data();
+    if (rawData is Map) {
+      final uid = rawData['uid']?.toString().trim() ?? '';
+      if (uid.isNotEmpty) {
+        return uid;
+      }
+    }
+    return doc.id.trim();
+  }
+
+  Future<void> _repairLegacyConversationSummaries(
+    QuerySnapshot snapshot,
+  ) async {
+    final friendIds = snapshot.docs
+        .map(_docUid)
+        .where(
+          (uid) => uid.isNotEmpty && uid != onlineChatService.currentUserId,
+        )
+        .toList(growable: false)
+      ..sort();
+
+    if (friendIds.isEmpty) {
+      _legacyConversationRepairKey = null;
+      return;
+    }
+
+    final repairKey = friendIds.join('|');
+    if (_legacyConversationRepairKey == repairKey) {
+      return;
+    }
+    _legacyConversationRepairKey = repairKey;
+
+    try {
+      await onlineChatService.repairLegacyConversationSummariesForUsers(
+        friendIds,
+      );
+    } catch (error) {
+      _legacyConversationRepairKey = null;
+      debugPrint(
+        '[OnlineChatScreen] legacy conversation repair error: $error',
+      );
+    }
   }
 
   ValueNotifier<Map<String, dynamic>?> _presenceNotifierFor(String uid) {
@@ -187,9 +235,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     final notifier = _presenceNotifierFor(trimmedUid);
     final subscription = onlineChatService.getUserStatus(trimmedUid).listen(
       (doc) {
-        notifier.value = doc.exists
-            ? doc.data() as Map<String, dynamic>?
-            : null;
+        notifier.value =
+            doc.exists ? doc.data() as Map<String, dynamic>? : null;
       },
       onError: (_) {},
     );
@@ -348,8 +395,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           child: Wrap(
             children: [
               ListTile(
-                leading: const Icon(Icons.chat_bubble_outline, color: Colors.white),
-                title: const Text('Open chat', style: TextStyle(color: Colors.white)),
+                leading:
+                    const Icon(Icons.chat_bubble_outline, color: Colors.white),
+                title: const Text('Open chat',
+                    style: TextStyle(color: Colors.white)),
                 onTap: () {
                   Navigator.pop(sheetContext);
                   _openChat(uid: entry.uid, name: entry.name);
@@ -425,7 +474,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                 ),
               ListTile(
                 leading: const Icon(Icons.close, color: Colors.white54),
-                title: const Text('Cancel', style: TextStyle(color: Colors.white70)),
+                title: const Text('Cancel',
+                    style: TextStyle(color: Colors.white70)),
                 onTap: () => Navigator.pop(sheetContext),
               ),
             ],
@@ -517,10 +567,12 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
 
   List<_ConversationEntry> _resolveMergedEntries({
     required QuerySnapshot<Map<String, dynamic>> chatSnapshot,
-    required QuerySnapshot friendSnapshot,
+    QuerySnapshot? friendSnapshot,
+    required bool includeFriendOnlyEntries,
   }) {
-    final cacheKey =
-        '$_chatVersion|$_friendsVersion|$_settingsVersion|${searchText.trim().toLowerCase()}';
+    final cacheKey = '$_chatVersion|$_friendsVersion|$_settingsVersion|'
+        '${includeFriendOnlyEntries ? 'friends:on' : 'friends:off'}|'
+        '${searchText.trim().toLowerCase()}';
     if (_mergedEntriesCacheKey == cacheKey) {
       return _mergedEntriesCache;
     }
@@ -528,6 +580,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     final entries = _mergeEntries(
       chatSnapshot: chatSnapshot,
       friendSnapshot: friendSnapshot,
+      includeFriendOnlyEntries: includeFriendOnlyEntries,
     );
     _mergedEntriesCacheKey = cacheKey;
     _mergedEntriesCache = entries;
@@ -548,7 +601,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
 
   List<_ConversationEntry> _mergeEntries({
     required QuerySnapshot<Map<String, dynamic>> chatSnapshot,
-    required QuerySnapshot friendSnapshot,
+    QuerySnapshot? friendSnapshot,
+    required bool includeFriendOnlyEntries,
   }) {
     final activeEntries = <String, _ConversationEntry>{};
     final friendOnlyEntries = <String, _ConversationEntry>{};
@@ -586,7 +640,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           continue;
         }
 
-        final lastMessageSenderId = data['lastMessageSenderId']?.toString() ?? '';
+        final lastMessageSenderId =
+            data['lastMessageSenderId']?.toString() ?? '';
         final lastMessageIsRead = data['lastMessageIsRead'] == true;
         final lastMessageType = data['lastMessageType']?.toString() ?? 'text';
         final lastMessageE2ee = data['lastMessageE2ee'] == true;
@@ -617,12 +672,11 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           lastMessageType: lastMessageType,
           lastMessageE2ee: lastMessageE2ee,
           lastMessageCipherText: data['lastMessageCipherText']?.toString(),
-          lastMessageDeviceEnvelopes:
-              data['lastMessageDeviceEnvelopes'] is Map
-                  ? Map<String, dynamic>.from(
-                      data['lastMessageDeviceEnvelopes'] as Map,
-                    )
-                  : null,
+          lastMessageDeviceEnvelopes: data['lastMessageDeviceEnvelopes'] is Map
+              ? Map<String, dynamic>.from(
+                  data['lastMessageDeviceEnvelopes'] as Map,
+                )
+              : null,
           lastMessageCacheKey: data['lastMessageCacheKey']?.toString(),
           lastMessageAlgorithm: data['lastMessageAlgorithm']?.toString(),
           lastMessageE2eeMessageType:
@@ -637,8 +691,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           lastMessageReceiverPublicKey:
               data['lastMessageReceiverPublicKey']?.toString(),
           lastMessageSessionId: data['lastMessageSessionId']?.toString(),
-          lastMessageSessionVersion: _parseInt(data['lastMessageSessionVersion']),
-          lastMessageSessionPeerId: data['lastMessageSessionPeerId']?.toString(),
+          lastMessageSessionVersion:
+              _parseInt(data['lastMessageSessionVersion']),
+          lastMessageSessionPeerId:
+              data['lastMessageSessionPeerId']?.toString(),
           lastMessageSessionAlgorithm:
               data['lastMessageSessionAlgorithm']?.toString(),
           lastMessageSessionLocalPublicKey:
@@ -656,69 +712,71 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
       }
     }
 
-    for (final doc in friendSnapshot.docs) {
-      final data = doc.data() as Map<String, dynamic>;
-      final uid = data['uid']?.toString() ?? '';
-      if (uid.isEmpty) continue;
-      if (activeEntries.containsKey(uid)) continue;
+    if (includeFriendOnlyEntries && friendSnapshot != null) {
+      for (final doc in friendSnapshot.docs) {
+        final data = doc.data() as Map<String, dynamic>;
+        final uid = _docUid(doc);
+        if (uid.isEmpty) continue;
+        if (activeEntries.containsKey(uid)) continue;
 
-      final name = (data['name']?.toString().trim().isNotEmpty == true)
-          ? data['name'].toString().trim()
-          : 'Unknown User';
+        final name = (data['name']?.toString().trim().isNotEmpty == true)
+            ? data['name'].toString().trim()
+            : 'Unknown User';
 
-      if (query.isNotEmpty && !name.toLowerCase().contains(query)) {
-        continue;
+        if (query.isNotEmpty && !name.toLowerCase().contains(query)) {
+          continue;
+        }
+
+        friendOnlyEntries[uid] = _ConversationEntry(
+          chatId: onlineChatService.getChatId(uid),
+          uid: uid,
+          name: name,
+          lastMessage: '',
+          lastMessageType: 'text',
+          lastMessageE2ee: false,
+          lastMessageCipherText: null,
+          lastMessageDeviceEnvelopes: null,
+          lastMessageCacheKey: null,
+          lastMessageAlgorithm: null,
+          lastMessageE2eeMessageType: null,
+          lastMessageNonce: null,
+          lastMessageMac: null,
+          lastMessageClientMessageId: null,
+          lastMessageSenderId: '',
+          lastMessageSenderPublicKey: null,
+          lastMessageReceiverPublicKey: null,
+          lastMessageSessionId: null,
+          lastMessageSessionVersion: null,
+          lastMessageSessionPeerId: null,
+          lastMessageSessionAlgorithm: null,
+          lastMessageSessionLocalPublicKey: null,
+          lastMessageSessionPeerPublicKey: null,
+          lastMessageAt: null,
+          lastMessageAtClientMs: null,
+          updatedAt: null,
+          statusLabel: '',
+          hasConversation: false,
+        );
       }
-
-      friendOnlyEntries[uid] = _ConversationEntry(
-        chatId: onlineChatService.getChatId(uid),
-        uid: uid,
-        name: name,
-        lastMessage: '',
-        lastMessageType: 'text',
-        lastMessageE2ee: false,
-        lastMessageCipherText: null,
-        lastMessageDeviceEnvelopes: null,
-        lastMessageCacheKey: null,
-        lastMessageAlgorithm: null,
-        lastMessageE2eeMessageType: null,
-        lastMessageNonce: null,
-        lastMessageMac: null,
-        lastMessageClientMessageId: null,
-        lastMessageSenderId: '',
-        lastMessageSenderPublicKey: null,
-        lastMessageReceiverPublicKey: null,
-        lastMessageSessionId: null,
-        lastMessageSessionVersion: null,
-        lastMessageSessionPeerId: null,
-        lastMessageSessionAlgorithm: null,
-        lastMessageSessionLocalPublicKey: null,
-        lastMessageSessionPeerPublicKey: null,
-        lastMessageAt: null,
-        lastMessageAtClientMs: null,
-        updatedAt: null,
-        statusLabel: '',
-        hasConversation: false,
-      );
     }
 
-      final active = activeEntries.values.toList()
-        ..sort((a, b) {
-          final byActivity = _activitySortMs(
-            lastMessageAt: b.lastMessageAt,
-            lastMessageAtClientMs: b.lastMessageAtClientMs,
-            updatedAt: b.updatedAt,
-          ).compareTo(
-            _activitySortMs(
-              lastMessageAt: a.lastMessageAt,
-              lastMessageAtClientMs: a.lastMessageAtClientMs,
-              updatedAt: a.updatedAt,
-            ),
-          );
-          if (byActivity != 0) return byActivity;
+    final active = activeEntries.values.toList()
+      ..sort((a, b) {
+        final byActivity = _activitySortMs(
+          lastMessageAt: b.lastMessageAt,
+          lastMessageAtClientMs: b.lastMessageAtClientMs,
+          updatedAt: b.updatedAt,
+        ).compareTo(
+          _activitySortMs(
+            lastMessageAt: a.lastMessageAt,
+            lastMessageAtClientMs: a.lastMessageAtClientMs,
+            updatedAt: a.updatedAt,
+          ),
+        );
+        if (byActivity != 0) return byActivity;
 
-          final byUpdatedAt =
-              (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+        final byUpdatedAt =
+            (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
           a.updatedAt?.millisecondsSinceEpoch ?? 0,
         );
         if (byUpdatedAt != 0) return byUpdatedAt;
@@ -772,10 +830,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
             'lastMessageMac': entry.lastMessageMac,
             'lastMessageClientMessageId': entry.lastMessageClientMessageId,
             'lastMessageSenderId': entry.lastMessageSenderId,
-            'lastMessageReceiverId': entry.lastMessageSenderId ==
-                    onlineChatService.currentUserId
-                ? entry.uid
-                : onlineChatService.currentUserId,
+            'lastMessageReceiverId':
+                entry.lastMessageSenderId == onlineChatService.currentUserId
+                    ? entry.uid
+                    : onlineChatService.currentUserId,
             'lastMessageSenderPublicKey': entry.lastMessageSenderPublicKey,
             'lastMessageReceiverPublicKey': entry.lastMessageReceiverPublicKey,
             'lastMessageSessionId': entry.lastMessageSessionId,
@@ -972,7 +1030,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.touch_app_outlined, color: Colors.white38, size: 13),
+                  Icon(Icons.touch_app_outlined,
+                      color: Colors.white38, size: 13),
                   SizedBox(width: 4),
                   Text(
                     'Hold for actions',
@@ -992,9 +1051,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   }
 
   Widget _buildStatusChip(String text, {required bool unread}) {
-    final bg = unread
-        ? _accentColor.withValues(alpha: 0.16)
-        : _surfaceElevatedColor;
+    final bg =
+        unread ? _accentColor.withValues(alpha: 0.16) : _surfaceElevatedColor;
     final fg = unread ? _accentColor : Colors.white;
     return Container(
       margin: const EdgeInsets.only(top: 6),
@@ -1084,27 +1142,139 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     );
   }
 
-  Widget _buildConversationListBody() {
-    if (_chatLoadError != null || _friendsLoadError != null) {
-      return const Center(
-        child: Text('Failed to load conversations'),
-      );
-    }
-
-    if (_chatSnapshot == null || _friendsSnapshot == null) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    final entries = _resolveMergedEntries(
-      chatSnapshot: _chatSnapshot!,
-      friendSnapshot: _friendsSnapshot!,
+  Widget _buildWarningBanner(String message) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.amber.withValues(alpha: 0.24)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(
+              Icons.info_outline,
+              color: Colors.amberAccent,
+              size: 18,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
-    if (entries.isEmpty) {
-      return _buildEmptyState();
-    }
+  }
 
-    final settingsByUid = _settingsByUid();
+  Widget _buildConversationLoadErrorState(String message) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 92,
+              height: 92,
+              decoration: BoxDecoration(
+                color: _surfaceColor,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white10),
+              ),
+              child: const Icon(
+                Icons.cloud_off_outlined,
+                size: 40,
+                color: Colors.orangeAccent,
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'Conversations unavailable right now',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: _textPrimary,
+                fontWeight: FontWeight.w700,
+                fontSize: 18,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: _textMuted,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
+  Widget _buildContactsFallbackState(String message) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 92,
+              height: 92,
+              decoration: BoxDecoration(
+                color: _surfaceColor,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white10),
+              ),
+              child: const Icon(
+                Icons.forum_outlined,
+                size: 40,
+                color: _accentColor,
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'No recent conversations yet',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: _textPrimary,
+                fontWeight: FontWeight.w700,
+                fontSize: 18,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: _textMuted,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConversationList(
+    List<_ConversationEntry> entries, {
+    required Map<String, Map<String, dynamic>> settingsByUid,
+  }) {
     return ListView.separated(
       key: const PageStorageKey<String>('online_conversation_list'),
       physics: const BouncingScrollPhysics(
@@ -1336,6 +1506,66 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     );
   }
 
+  Widget _buildConversationListBody() {
+    if (_chatLoadError != null) {
+      return _buildConversationLoadErrorState(
+        _friendlyInboxError(_chatLoadError!, contacts: false),
+      );
+    }
+
+    if (_chatSnapshot == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final contactsFailed = _friendsLoadError != null;
+    final contactsLoaded = _friendsSnapshot != null && !contactsFailed;
+    final contactsStillLoading = _friendsSnapshot == null && !contactsFailed;
+    final contactsWarningMessage = contactsFailed
+        ? '${_friendlyInboxError(_friendsLoadError!, contacts: true)} Existing conversations still work.'
+        : null;
+
+    final entries = _resolveMergedEntries(
+      chatSnapshot: _chatSnapshot!,
+      friendSnapshot: contactsLoaded ? _friendsSnapshot : null,
+      includeFriendOnlyEntries: contactsLoaded,
+    );
+
+    if (entries.isEmpty) {
+      if (contactsFailed) {
+        return Column(
+          children: [
+            _buildWarningBanner(contactsWarningMessage!),
+            Expanded(
+              child: _buildContactsFallbackState(
+                'Contacts could not be loaded, so only existing conversations can be shown right now.',
+              ),
+            ),
+          ],
+        );
+      }
+      if (contactsStillLoading) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      return _buildEmptyState();
+    }
+
+    final settingsByUid = _settingsByUid();
+    final list = _buildConversationList(
+      entries,
+      settingsByUid: settingsByUid,
+    );
+    if (!contactsFailed) {
+      return list;
+    }
+
+    return Column(
+      children: [
+        _buildWarningBanner(contactsWarningMessage!),
+        Expanded(child: list),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1429,4 +1659,24 @@ class _ConversationEntry {
     required this.statusLabel,
     required this.hasConversation,
   });
+}
+
+String _friendlyInboxError(
+  Object error, {
+  required bool contacts,
+}) {
+  final subject = contacts ? 'Contacts' : 'Conversations';
+  if (error is FirebaseException) {
+    switch (error.code) {
+      case 'permission-denied':
+        return '$subject are unavailable for this account right now.';
+      case 'unavailable':
+        return '$subject are temporarily unavailable. Check your connection and try again.';
+      case 'failed-precondition':
+        return '$subject are unavailable right now. Please try again later.';
+      default:
+        return '$subject are unavailable right now.';
+    }
+  }
+  return '$subject are unavailable right now.';
 }

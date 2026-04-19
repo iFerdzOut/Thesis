@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_print
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -94,6 +95,20 @@ class FcmChatService {
         }
         final decrypted = await _e2eeService.decryptTextMessage(data);
         if (!decrypted.startsWith('[') || !decrypted.endsWith(']')) {
+          // Persist a full projection row so that when the Firestore stream
+          // fires it finds the message already decrypted — eliminating the
+          // "Decrypting…" flash on the receiver's screen.
+          final senderId = data['senderId']?.toString().trim() ?? '';
+          if (senderId.isNotEmpty) {
+            unawaited(_chatEncryptionRepository.mapRemoteMessage(
+              conversationId: chatId,
+              messageId: messageId,
+              data: Map<String, dynamic>.from(data)
+                ..putIfAbsent('messageId', () => messageId),
+              otherUserId: senderId,
+              ensureInitialized: false,
+            ));
+          }
           return decrypted;
         }
       }

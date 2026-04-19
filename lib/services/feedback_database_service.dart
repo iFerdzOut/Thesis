@@ -3,6 +3,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
+import 'feedback_consent_service.dart';
+
 /// FeedbackDatabaseService
 ///
 /// Collects false positives and false negatives for future
@@ -35,7 +37,7 @@ class FeedbackDatabaseService {
     required String source, // 'sms' or 'online'
     String? sender,
   }) async {
-    if (_uid.isEmpty) return;
+    if (!await _canUploadFeedback()) return;
 
     final data = _buildFeedbackData(
       message: message,
@@ -57,7 +59,7 @@ class FeedbackDatabaseService {
     required String source,
     String? sender,
   }) async {
-    if (_uid.isEmpty) return;
+    if (!await _canUploadFeedback()) return;
 
     final data = _buildFeedbackData(
       message: message,
@@ -79,7 +81,7 @@ class FeedbackDatabaseService {
     required String source,
     String? sender,
   }) async {
-    if (_uid.isEmpty) return;
+    if (!await _canUploadFeedback()) return;
 
     final data = _buildFeedbackData(
       message: message,
@@ -136,10 +138,7 @@ class FeedbackDatabaseService {
   /// Delete a feedback entry
   Future<void> deleteFeedback(String docId) async {
     if (_uid.isEmpty) return;
-    await _firestore
-        .collection('model_feedback')
-        .doc(docId)
-        .delete();
+    await _firestore.collection('model_feedback').doc(docId).delete();
   }
 
   /// Get global feedback count (for dashboard)
@@ -209,6 +208,11 @@ class FeedbackDatabaseService {
     } catch (e) {
       print('[FeedbackDB] Global save error: $e');
     }
+  }
+
+  Future<bool> _canUploadFeedback() async {
+    if (_uid.isEmpty) return false;
+    return FeedbackConsentService.isUploadEnabled();
   }
 
   String _sanitizeMessage(String message) {

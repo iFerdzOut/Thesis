@@ -168,6 +168,35 @@ class ContactChatService {
     await batch.commit();
   }
 
+  /// Cancel a friend request that the current user previously sent to [targetUid].
+  Future<void> cancelFriendRequest({
+    required String targetUid,
+  }) async {
+    if (targetUid.isEmpty || targetUid == currentUserId) return;
+
+    final batch = _firestore.batch();
+
+    // Remove from the target's incoming inbox (sender is allowed to delete).
+    batch.delete(
+      _firestore
+          .collection('users')
+          .doc(targetUid)
+          .collection('friend_requests')
+          .doc(currentUserId),
+    );
+
+    // Remove from our own sent list.
+    batch.delete(
+      _firestore
+          .collection('users')
+          .doc(currentUserId)
+          .collection('sent_friend_requests')
+          .doc(targetUid),
+    );
+
+    await batch.commit();
+  }
+
   Future<void> unfriend(String otherUid) async {
     if (otherUid.isEmpty || otherUid == currentUserId) return;
 

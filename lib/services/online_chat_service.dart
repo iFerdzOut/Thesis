@@ -4,6 +4,7 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 
 import 'ai_detection_service.dart';
 import 'e2ee_service.dart';
@@ -24,9 +25,11 @@ class OnlineChatService {
   final SmsStorageService _smsStorageService = SmsStorageService();
   final E2eeService _e2eeService = E2eeService();
   final UserProfileService _userProfileService = UserProfileService();
+  final Set<String> _legacySummaryRepairCache = <String>{};
   Future<void>? _conversationActivityBackfillFuture;
   String? _conversationActivityBackfillUserId;
   DateTime? _lastConversationActivityBackfillAt;
+  String? _legacySummaryRepairUserId;
 
   static String normalizePresenceMode(String? raw) {
     switch ((raw ?? '').trim().toLowerCase()) {
@@ -115,7 +118,10 @@ class OnlineChatService {
   CollectionReference<Map<String, dynamic>> _chatSettingsCollection(
     String userId,
   ) {
-    return _firestore.collection('users').doc(userId).collection('chat_settings');
+    return _firestore
+        .collection('users')
+        .doc(userId)
+        .collection('chat_settings');
   }
 
   DocumentReference<Map<String, dynamic>> _chatSettingsRef(String otherUserId) {
@@ -278,15 +284,39 @@ class OnlineChatService {
     }
   }
 
-  bool _summaryNeedsReconcile(Map<String, dynamic> data) {
-    final lastMessageId = data['lastMessageClientMessageId']?.toString().trim() ?? '';
-    final lastMessageSenderId = data['lastMessageSenderId']?.toString().trim() ?? '';
+  bool _summaryNeedsReconcile(
+    Map<String, dynamic> data, {
+    String? otherUserId,
+  }) {
+    final lastMessageId =
+        data['lastMessageClientMessageId']?.toString().trim() ?? '';
+    final lastMessageSenderId =
+        data['lastMessageSenderId']?.toString().trim() ?? '';
     final lastMessageType = data['lastMessageType']?.toString().trim() ?? '';
+    final resolvedOtherUserId = otherUserId?.trim() ?? '';
+    final participants = (data['participants'] is Iterable)
+        ? (data['participants'] as Iterable)
+            .map((value) => value?.toString().trim() ?? '')
+            .where((value) => value.isNotEmpty)
+            .toList(growable: false)
+        : const <String>[];
+    final participantNames = data['participantNames'] is Map
+        ? Map<String, dynamic>.from(data['participantNames'] as Map)
+        : const <String, dynamic>{};
+    final missingParticipants = resolvedOtherUserId.isNotEmpty &&
+        (!participants.contains(currentUserId) ||
+            !participants.contains(resolvedOtherUserId));
+    final missingParticipantNames = resolvedOtherUserId.isNotEmpty &&
+        ((participantNames[currentUserId]?.toString().trim().isEmpty ?? true) ||
+            (participantNames[resolvedOtherUserId]?.toString().trim().isEmpty ??
+                true));
     return data['lastMessageAt'] == null ||
         data['lastMessageAtClientMs'] == null ||
         lastMessageId.isEmpty ||
         lastMessageSenderId.isEmpty ||
-        lastMessageType.isEmpty;
+        lastMessageType.isEmpty ||
+        missingParticipants ||
+        missingParticipantNames;
   }
 
   int _conversationActivitySortMs(Map<String, dynamic> data) {
@@ -300,6 +330,36 @@ class OnlineChatService {
     return [lastMessageAtMs, lastMessageAtClientMs, updatedAtMs].reduce(
       (value, element) => value > element ? value : element,
     );
+  }
+
+  Future<Map<String, dynamic>> _encryptSecureTextOrThrow({
+    required String receiverId,
+    required String plaintext,
+  }) async {
+    try {
+      // ensureReady() is called here (inside the try-catch) so any failure
+      // during bootstrap or device-identity setup is converted to a friendly
+      // user-visible message instead of a raw exception string.
+      await _e2eeService.ensureReady(syncRemote: false);
+      return await _e2eeService.encryptTextEnvelope(
+        receiverId: receiverId,
+        plaintext: plaintext,
+      );
+    } catch (error, stack) {
+      debugPrint('[OnlineChatService] E2EE encrypt failed for '
+          'receiver=$receiverId: $error\n$stack');
+
+      final message = error.toString().toLowerCase();
+      if (message.contains('recipient has not enabled secure messaging yet') ||
+          message.contains('has not enabled encrypted chat yet')) {
+        throw const _UserVisibleMessagingException(
+          'Secure messaging is not ready for this chat yet. Ask the other user to open the app, then try again.',
+        );
+      }
+      throw const _UserVisibleMessagingException(
+        'Secure messaging is temporarily unavailable. Please try again in a moment.',
+      );
+    }
   }
 
   String _resolveOtherUserIdFromParticipants(
@@ -346,17 +406,15 @@ class OnlineChatService {
         currentUserDisplayName?.trim().isNotEmpty == true
             ? currentUserDisplayName!.trim()
             : await getCurrentUserDisplayName();
-    final resolvedOtherName =
-        otherUserDisplayName?.trim().isNotEmpty == true
-            ? otherUserDisplayName!.trim()
-            : (senderId == otherUserId &&
-                    messageData['senderName']?.toString().trim().isNotEmpty ==
-                        true)
-                ? messageData['senderName'].toString().trim()
-                : await _userProfileService.fetchDisplayName(
-                    otherUserId,
-                    fallback: otherUserId,
-                  );
+    final resolvedOtherName = otherUserDisplayName?.trim().isNotEmpty == true
+        ? otherUserDisplayName!.trim()
+        : (senderId == otherUserId &&
+                messageData['senderName']?.toString().trim().isNotEmpty == true)
+            ? messageData['senderName'].toString().trim()
+            : await _userProfileService.fetchDisplayName(
+                otherUserId,
+                fallback: otherUserId,
+              );
     final resolvedActivityClientMs = activityClientMs ??
         _resolveMessageActivityTime(messageData).millisecondsSinceEpoch;
     final summary = <String, dynamic>{
@@ -423,10 +481,9 @@ class OnlineChatService {
         ? chatId!.trim()
         : getChatId(otherUserId);
     final chatRef = _firestore.collection('chats').doc(resolvedChatId);
-    final chatDoc =
-        existingChatData == null ? await chatRef.get() : null;
-    final chatData = existingChatData ??
-        (chatDoc?.data() ?? const <String, dynamic>{});
+    final chatDoc = existingChatData == null ? await chatRef.get() : null;
+    final chatData =
+        existingChatData ?? (chatDoc?.data() ?? const <String, dynamic>{});
     final latestMessageDoc = await _fetchLatestMessageCandidate(chatRef) ??
         await _fetchLatestMessageFallback(chatRef);
     if (latestMessageDoc == null) {
@@ -438,14 +495,16 @@ class OnlineChatService {
             ? latestData['clientMessageId'].toString().trim()
             : latestMessageDoc.id;
     final latestActivity = _resolveMessageActivityTime(latestData);
-    final latestActivityMs =
-        latestActivity.millisecondsSinceEpoch > 0
-            ? latestActivity.millisecondsSinceEpoch
-            : DateTime.now().millisecondsSinceEpoch;
+    final latestActivityMs = latestActivity.millisecondsSinceEpoch > 0
+        ? latestActivity.millisecondsSinceEpoch
+        : DateTime.now().millisecondsSinceEpoch;
     final summaryActivityMs = _conversationActivitySortMs(chatData);
     final currentLastMessageId =
         chatData['lastMessageClientMessageId']?.toString().trim() ?? '';
-    final needsUpdate = _summaryNeedsReconcile(chatData) ||
+    final needsUpdate = _summaryNeedsReconcile(
+          chatData,
+          otherUserId: otherUserId,
+        ) ||
         currentLastMessageId != latestMessageId ||
         summaryActivityMs <= 0 ||
         latestActivityMs > summaryActivityMs;
@@ -476,6 +535,72 @@ class OnlineChatService {
     );
   }
 
+  Future<void> repairLegacyConversationSummariesForUsers(
+    Iterable<String> otherUserIds,
+  ) async {
+    final uid = currentUserId;
+    if (uid.isEmpty) return;
+
+    if (_legacySummaryRepairUserId != uid) {
+      _legacySummaryRepairUserId = uid;
+      _legacySummaryRepairCache.clear();
+    }
+
+    final pendingUserIds = otherUserIds
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty && value != uid)
+        .where((value) => !_legacySummaryRepairCache.contains(value))
+        .toSet()
+        .toList(growable: false);
+
+    if (pendingUserIds.isEmpty) {
+      return;
+    }
+
+    final currentDisplayName = await getCurrentUserDisplayName();
+    for (final otherUserId in pendingUserIds) {
+      _legacySummaryRepairCache.add(otherUserId);
+      try {
+        final chatId = getChatId(otherUserId);
+        final chatRef = _firestore.collection('chats').doc(chatId);
+        final chatDoc = await chatRef.get();
+        final chatData = chatDoc.data();
+        final shouldRepairMetadata = chatDoc.exists &&
+            _summaryNeedsReconcile(
+              chatData ?? const <String, dynamic>{},
+              otherUserId: otherUserId,
+            );
+
+        if (shouldRepairMetadata) {
+          final otherDisplayName = await _userProfileService.fetchDisplayName(
+            otherUserId,
+            fallback: otherUserId,
+          );
+          await chatRef.set({
+            'participants': <String>[uid, otherUserId],
+            'participantNames': <String, String>{
+              uid: currentDisplayName,
+              otherUserId: otherDisplayName,
+            },
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+        }
+
+        await reconcileConversationSummaryFromLatestMessage(
+          otherUserId: otherUserId,
+          chatId: chatId,
+          existingChatData: chatData,
+        );
+      } catch (error) {
+        _legacySummaryRepairCache.remove(otherUserId);
+        print(
+          '[OnlineChatService] legacy conversation repair failed for '
+          '$otherUserId: $error',
+        );
+      }
+    }
+  }
+
   Future<void> _backfillConversationActivityFields() async {
     final uid = currentUserId;
     if (uid.isEmpty) return;
@@ -502,7 +627,8 @@ class OnlineChatService {
     }
   }
 
-  Future<QueryDocumentSnapshot<Map<String, dynamic>>?> _fetchLatestMessageCandidate(
+  Future<QueryDocumentSnapshot<Map<String, dynamic>>?>
+      _fetchLatestMessageCandidate(
     DocumentReference<Map<String, dynamic>> chatRef,
   ) async {
     QueryDocumentSnapshot<Map<String, dynamic>>? best;
@@ -536,7 +662,8 @@ class OnlineChatService {
     return best;
   }
 
-  Future<QueryDocumentSnapshot<Map<String, dynamic>>?> _fetchLatestMessageFallback(
+  Future<QueryDocumentSnapshot<Map<String, dynamic>>?>
+      _fetchLatestMessageFallback(
     DocumentReference<Map<String, dynamic>> chatRef,
   ) async {
     final messageSnapshot = await chatRef.collection('messages').get();
@@ -589,12 +716,17 @@ class OnlineChatService {
           ? receiverName!.trim()
           : receiverId,
     );
-    await _e2eeService.ensureIdentityForCurrentUser();
-    final isSuspicious = await _aiDetectionService.detectSmishing(
-      trimmedText,
-      sender: currentUserId,
-    );
-    final encryptedEnvelope = await _e2eeService.encryptTextEnvelope(
+    // Detection failure is non-fatal — a model crash must never block sending.
+    bool isSuspicious = false;
+    try {
+      isSuspicious = await _aiDetectionService.detectSmishing(
+        trimmedText,
+        sender: currentUserId,
+      );
+    } catch (e) {
+      debugPrint('[OnlineChatService] Outgoing detection failed (non-fatal): $e');
+    }
+    final encryptedEnvelope = await _encryptSecureTextOrThrow(
       receiverId: receiverId,
       plaintext: trimmedText,
     );
@@ -758,10 +890,16 @@ class OnlineChatService {
     }
 
     final chatId = getChatId(otherUserId);
-    final isSuspicious = await _aiDetectionService.detectSmishing(
-      newText.trim(),
-      sender: currentUserId,
-    );
+    // Detection failure is non-fatal — a model crash must never block editing.
+    bool isSuspicious = false;
+    try {
+      isSuspicious = await _aiDetectionService.detectSmishing(
+        newText.trim(),
+        sender: currentUserId,
+      );
+    } catch (e) {
+      debugPrint('[OnlineChatService] Outgoing detection failed on edit (non-fatal): $e');
+    }
     final messageRef = _firestore
         .collection('chats')
         .doc(chatId)
@@ -771,8 +909,7 @@ class OnlineChatService {
     final existingData = messageDoc.data() ?? <String, dynamic>{};
 
     if (existingData['e2ee'] == true) {
-      await _e2eeService.ensureIdentityForCurrentUser();
-      final encryptedEnvelope = await _e2eeService.encryptTextEnvelope(
+      final encryptedEnvelope = await _encryptSecureTextOrThrow(
         receiverId: otherUserId,
         plaintext: newText.trim(),
       );
@@ -840,10 +977,9 @@ class OnlineChatService {
                 refreshedClientMessageId.trim().isNotEmpty)
               'clientMessageId': refreshedClientMessageId.trim(),
           },
-          lastMessageId:
-              refreshedClientMessageId?.trim().isNotEmpty == true
-                  ? refreshedClientMessageId!.trim()
-                  : messageId,
+          lastMessageId: refreshedClientMessageId?.trim().isNotEmpty == true
+              ? refreshedClientMessageId!.trim()
+              : messageId,
           activityClientMs: activityClientMs,
         );
       }
@@ -1149,8 +1285,7 @@ class OnlineChatService {
 
   static bool computeEffectiveOnline(Map<String, dynamic>? data) {
     final raw = data ?? const <String, dynamic>{};
-    final presenceMode =
-        normalizePresenceMode(raw['presenceMode']?.toString());
+    final presenceMode = normalizePresenceMode(raw['presenceMode']?.toString());
     if (presenceMode == 'invisible') {
       return false;
     }
@@ -1175,4 +1310,13 @@ class OnlineChatService {
         .orderBy('reportedAt', descending: true)
         .snapshots();
   }
+}
+
+class _UserVisibleMessagingException implements Exception {
+  const _UserVisibleMessagingException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }

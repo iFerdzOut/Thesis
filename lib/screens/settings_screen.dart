@@ -7,6 +7,8 @@ import '../services/call_notification_service.dart';
 import '../services/chat_notification_service.dart';
 import '../services/cloudinary_service.dart';
 import '../services/e2ee_service.dart';
+import '../services/auth_service.dart';
+import '../services/feedback_consent_service.dart';
 import '../services/local_message_cache_service.dart';
 import '../services/media_service.dart';
 import '../services/online_chat_service.dart';
@@ -34,7 +36,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
       LocalMessageCacheService();
 
   bool _updatingProfilePhoto = false;
+  bool _feedbackUploadEnabled = false;
+  bool _feedbackUploadLoaded = false;
   String? _lastProfileSyncedUid;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFeedbackUploadPreference();
+  }
+
+  Future<void> _loadFeedbackUploadPreference() async {
+    final enabled = await FeedbackConsentService.isUploadEnabled();
+    if (!mounted) return;
+    setState(() {
+      _feedbackUploadEnabled = enabled;
+      _feedbackUploadLoaded = true;
+    });
+  }
+
+  Future<void> _setFeedbackUploadEnabled(bool enabled) async {
+    await FeedbackConsentService.setUploadEnabled(enabled);
+    if (!mounted) return;
+    setState(() {
+      _feedbackUploadEnabled = enabled;
+      _feedbackUploadLoaded = true;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          enabled
+              ? 'Sanitized feedback upload enabled.'
+              : 'Sanitized feedback upload disabled.',
+        ),
+      ),
+    );
+  }
 
   Future<void> _logout(BuildContext context) async {
     final uid = _auth.currentUser?.uid;
@@ -71,10 +108,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       } catch (_) {}
 
       try {
+        await E2eeService().deactivateCurrentDevice(uid);
+      } catch (_) {}
+
+      try {
         await E2eeService().clearAutomaticAccountBackupSecret(uid);
       } catch (_) {}
     }
 
+    await AuthService.clearPersistedSessionMarker();
     await _auth.signOut();
   }
 
@@ -592,214 +634,224 @@ class _SettingsScreenState extends State<SettingsScreen> {
               .doc(user.uid)
               .snapshots(),
           builder: (context, snapshot) {
-        final userData = snapshot.data?.data() ?? <String, dynamic>{};
-        final phone = userData['phone']?.toString() ?? '';
-        final displayName = _displayLabelForUser(user, userData);
-        final presenceMode = OnlineChatService.normalizePresenceMode(
-          userData['presenceMode']?.toString(),
-        );
-        final photoUrl =
-            (userData['photoUrl']?.toString().trim().isNotEmpty == true)
-                ? userData['photoUrl'].toString().trim()
-                : user.photoURL;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _ensureSettingsProfileSynced(user, userData);
-        });
+            final userData = snapshot.data?.data() ?? <String, dynamic>{};
+            final phone = userData['phone']?.toString() ?? '';
+            final displayName = _displayLabelForUser(user, userData);
+            final presenceMode = OnlineChatService.normalizePresenceMode(
+              userData['presenceMode']?.toString(),
+            );
+            final photoUrl =
+                (userData['photoUrl']?.toString().trim().isNotEmpty == true)
+                    ? userData['photoUrl'].toString().trim()
+                    : user.photoURL;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _ensureSettingsProfileSynced(user, userData);
+            });
 
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text('Settings'),
-            backgroundColor: const Color(0xFF075E54),
-          ),
-          body: ListView(
-            children: [
-              Container(
-                color: const Color(0xFF075E54),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Column(
+            return Scaffold(
+              appBar: AppBar(
+                title: const Text('Settings'),
+                backgroundColor: const Color(0xFF075E54),
+              ),
+              body: ListView(
+                children: [
+                  Container(
+                    color: const Color(0xFF075E54),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 24),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Stack(
+                        Column(
                           children: [
-                            Container(
-                              padding: const EdgeInsets.all(3),
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: _presenceColor(presenceMode),
-                                  width: 3,
+                            Stack(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(3),
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: _presenceColor(presenceMode),
+                                      width: 3,
+                                    ),
+                                  ),
+                                  child: GestureDetector(
+                                    onTap: () => _showProfilePhotoOptions(
+                                        photoUrl ?? ''),
+                                    child: UserAvatar(
+                                      name: displayName,
+                                      imageUrl: photoUrl,
+                                      radius: 28,
+                                      backgroundColor: Colors.white,
+                                      foregroundColor: const Color(0xFF075E54),
+                                    ),
+                                  ),
                                 ),
-                              ),
-                              child: GestureDetector(
-                                onTap: () =>
-                                    _showProfilePhotoOptions(photoUrl ?? ''),
-                                child: UserAvatar(
-                                  name: displayName,
-                                  imageUrl: photoUrl,
-                                  radius: 28,
-                                  backgroundColor: Colors.white,
-                                  foregroundColor: const Color(0xFF075E54),
+                                Positioned(
+                                  right: -2,
+                                  bottom: -2,
+                                  child: Container(
+                                    padding: const EdgeInsets.all(4),
+                                    decoration: BoxDecoration(
+                                      color: _updatingProfilePhoto
+                                          ? Colors.orange
+                                          : Colors.white,
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: _updatingProfilePhoto
+                                        ? const SizedBox(
+                                            width: 12,
+                                            height: 12,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: Color(0xFF075E54),
+                                            ),
+                                          )
+                                        : const Icon(
+                                            Icons.camera_alt,
+                                            size: 14,
+                                            color: Color(0xFF075E54),
+                                          ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                            Positioned(
-                              right: -2,
-                              bottom: -2,
-                              child: Container(
-                                padding: const EdgeInsets.all(4),
-                                decoration: BoxDecoration(
-                                  color: _updatingProfilePhoto
-                                      ? Colors.orange
-                                      : Colors.white,
-                                  shape: BoxShape.circle,
-                                ),
-                                child: _updatingProfilePhoto
-                                    ? const SizedBox(
-                                        width: 12,
-                                        height: 12,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                          color: Color(0xFF075E54),
-                                        ),
-                                      )
-                                    : const Icon(
-                                        Icons.camera_alt,
-                                        size: 14,
-                                        color: Color(0xFF075E54),
-                                      ),
-                              ),
+                              ],
                             ),
                           ],
                         ),
-                      ],
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            displayName,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 21,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              if ((user.email ?? '').trim().isNotEmpty)
-                                _ProfileInfoChip(
-                                  icon: Icons.alternate_email,
-                                  text: user.email!.trim(),
+                              Text(
+                                displayName,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 21,
+                                  fontWeight: FontWeight.bold,
                                 ),
-                              if (phone.isNotEmpty)
-                                _ProfileInfoChip(
-                                  icon: Icons.phone_outlined,
-                                  text: phone,
-                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  if ((user.email ?? '').trim().isNotEmpty)
+                                    _ProfileInfoChip(
+                                      icon: Icons.alternate_email,
+                                      text: user.email!.trim(),
+                                    ),
+                                  if (phone.isNotEmpty)
+                                    _ProfileInfoChip(
+                                      icon: Icons.phone_outlined,
+                                      text: phone,
+                                    ),
+                                ],
+                              ),
                             ],
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 8),
-              ListTile(
-                leading: const Icon(Icons.person_outline, color: Colors.teal),
-                title: const Text('Display Name'),
-                subtitle: Text(displayName),
-                onTap: () => _editDisplayName(context, displayName),
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading:
-                    Icon(Icons.circle, color: _presenceColor(presenceMode)),
-                title: const Text('Status'),
-                subtitle: Text(_presenceLabel(presenceMode)),
-                onTap: () => _editPresenceStatus(context, presenceMode),
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.phone_outlined, color: Colors.green),
-                title: const Text('Phone Number'),
-                subtitle: Text(
-                  phone.isNotEmpty
-                      ? phone
-                      : 'Add your mobile number for contact matching',
-                ),
-                onTap: () => _editPhoneNumber(context, phone),
-              ),
-              const Divider(height: 1),
-              const ListTile(
-                leading: Icon(Icons.lock_outline, color: Colors.deepPurple),
-                title: Text('Encrypted Chats'),
-                subtitle: Text(
-                  'End-to-end encryption is handled automatically in the background on this device. No manual key setup is needed for normal use.',
-                ),
-              ),
-              const Divider(height: 1),
-              const ListTile(
-                leading: Icon(
-                  Icons.cloud_upload_outlined,
-                  color: Colors.teal,
-                ),
-                title: Text('Model Feedback Upload'),
-                subtitle: Text(
-                  'Reported suspicious messages are uploaded directly to the Firebase model_feedback collection for evaluation and retraining support.',
-                ),
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(
-                  Icons.warning_amber_rounded,
-                  color: Colors.orange,
-                ),
-                title: const Text('Quarantine'),
-                subtitle: const Text('View reported suspicious messages'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const QuarantineScreen(),
+                  ),
+                  const SizedBox(height: 8),
+                  ListTile(
+                    leading:
+                        const Icon(Icons.person_outline, color: Colors.teal),
+                    title: const Text('Display Name'),
+                    subtitle: Text(displayName),
+                    onTap: () => _editDisplayName(context, displayName),
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading:
+                        Icon(Icons.circle, color: _presenceColor(presenceMode)),
+                    title: const Text('Status'),
+                    subtitle: Text(_presenceLabel(presenceMode)),
+                    onTap: () => _editPresenceStatus(context, presenceMode),
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading:
+                        const Icon(Icons.phone_outlined, color: Colors.green),
+                    title: const Text('Phone Number'),
+                    subtitle: Text(
+                      phone.isNotEmpty
+                          ? phone
+                          : 'Add your mobile number for contact matching',
                     ),
-                  );
-                },
+                    onTap: () => _editPhoneNumber(context, phone),
+                  ),
+                  const Divider(height: 1),
+                  const ListTile(
+                    leading: Icon(Icons.lock_outline, color: Colors.deepPurple),
+                    title: Text('Encrypted Chats'),
+                    subtitle: Text(
+                      'End-to-end encryption is handled automatically in the background on this device. No manual key setup is needed for normal use.',
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile.adaptive(
+                    secondary: const Icon(
+                      Icons.cloud_upload_outlined,
+                      color: Colors.teal,
+                    ),
+                    value: _feedbackUploadEnabled,
+                    onChanged: _feedbackUploadLoaded
+                        ? _setFeedbackUploadEnabled
+                        : null,
+                    title: const Text('Sanitized Feedback Upload'),
+                    subtitle: Text(
+                      _feedbackUploadLoaded
+                          ? _feedbackUploadEnabled
+                              ? 'On: sanitized reports can be uploaded to model_feedback for evaluation and future retraining.'
+                              : 'Off: reports stay local unless you enable optional sanitized upload.'
+                          : 'Loading feedback upload preference...',
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(
+                      Icons.warning_amber_rounded,
+                      color: Colors.orange,
+                    ),
+                    title: const Text('Quarantine'),
+                    subtitle: const Text('View reported suspicious messages'),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const QuarantineScreen(),
+                        ),
+                      );
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.info_outline, color: Colors.blue),
+                    title: const Text('About'),
+                    subtitle: const Text(
+                      'Smishing detection messaging application',
+                    ),
+                    onTap: () {
+                      showAboutDialog(
+                        context: context,
+                        applicationName: 'Smishing Shield PH',
+                        applicationVersion: '1.0.0',
+                        applicationLegalese: 'Thesis Application',
+                      );
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.logout, color: Colors.red),
+                    title: const Text('Logout'),
+                    subtitle: const Text('Sign out from this account'),
+                    onTap: () => _logout(context),
+                  ),
+                ],
               ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.info_outline, color: Colors.blue),
-                title: const Text('About'),
-                subtitle: const Text(
-                  'Smishing detection messaging application',
-                ),
-                onTap: () {
-                  showAboutDialog(
-                    context: context,
-                    applicationName: 'Smishing Shield PH',
-                    applicationVersion: '1.0.0',
-                    applicationLegalese: 'Thesis Application',
-                  );
-                },
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.logout, color: Colors.red),
-                title: const Text('Logout'),
-                subtitle: const Text('Sign out from this account'),
-                onTap: () => _logout(context),
-              ),
-            ],
-          ),
-        );
+            );
           },
         );
       },

@@ -126,8 +126,23 @@ class WebRtcCallService {
   Future<void> _createPeerConnection() async {
     const config = {
       'iceServers': [
+        // STUN — discover public IP (works when NAT is traversable)
         {'urls': 'stun:stun.l.google.com:19302'},
         {'urls': 'stun:stun1.l.google.com:19302'},
+        // TURN relay — required for carrier-grade NAT (mobile data / CGNAT).
+        // These are the public OpenRelay servers from metered.ca, suitable for
+        // testing. Replace with dedicated metered.ca credentials for production
+        // to avoid bandwidth limits and reliability constraints.
+        {
+          'urls': [
+            'turn:openrelay.metered.ca:80',
+            'turn:openrelay.metered.ca:80?transport=tcp',
+            'turn:openrelay.metered.ca:443',
+            'turn:openrelay.metered.ca:443?transport=tcp',
+          ],
+          'username': 'openrelayproject',
+          'credential': 'openrelayproject',
+        },
       ],
       'iceCandidatePoolSize': 10,
       'sdpSemantics': 'unified-plan',

@@ -267,10 +267,17 @@ class MessageScreeningService {
           await _pickPrimaryUrlSignal(extractedUrls);
 
       if (modelOutput != null && modelOutput.logits.isNotEmpty) {
-        final double riskScore = await _riskScoringService.scoreFromLogits(
+        final double modelScore = await _riskScoringService.scoreFromLogits(
           modelOutput.logits,
           positiveIndex: modelOutput.positiveIndex,
         );
+        final double hScore = _computeHeuristicScore(
+          message: message,
+          normalized: normalized,
+          extractedUrls: extractedUrls,
+        );
+        final double riskScore =
+            math.max(modelScore, hScore * 0.9).clamp(0.0, 1.0);
         final String decision = await _riskScoringService.decisionFor(
           hasUrl: true,
           trustedMatch: false,
@@ -305,8 +312,8 @@ class MessageScreeningService {
             reason: explanations.first,
             explanations: explanations,
             needsRescan: false,
-            heuristicScore: 0.0,
-            modelScore: riskScore,
+            heuristicScore: hScore,
+            modelScore: modelScore,
             riskLevel: riskLevel,
             detectionSource: 'distilbert_url_pipeline',
             pipelineStage: 'distilbert',
@@ -333,6 +340,63 @@ class MessageScreeningService {
       );
     }
 
+    // No URL — still run DistilBERT so text-only spam/smishing is caught.
+    final SmishingModelOutput? noUrlModelOutput =
+        await _modelService.runInference(normalized);
+    if (noUrlModelOutput != null && noUrlModelOutput.logits.isNotEmpty) {
+      final double modelScore = await _riskScoringService.scoreFromLogits(
+        noUrlModelOutput.logits,
+        positiveIndex: noUrlModelOutput.positiveIndex,
+      );
+      final double hScore = _computeHeuristicScore(
+        message: message,
+        normalized: normalized,
+        extractedUrls: const <String>[],
+      );
+      final double riskScore =
+          math.max(modelScore, hScore * 0.9).clamp(0.0, 1.0);
+      final String decision = await _riskScoringService.decisionFor(
+        hasUrl: false,
+        trustedMatch: false,
+        modelError: false,
+        riskScore: riskScore,
+      );
+      final String riskLevel =
+          await _riskScoringService.levelFromScore(riskScore);
+      final List<String> explanations = _uniqueReasons(<String>[
+        'No URL was found in the message.',
+        'The DistilBERT model scored the message content for smishing patterns.',
+        if (decision == DetectionDecision.quarantineHighRisk)
+          'The smishing probability crossed the quarantine threshold.',
+      ]);
+      return _persistAndReturn(
+        message: message,
+        result: DetectionResultModel(
+          messageKey: message.messageKey,
+          hasUrl: false,
+          extractedUrls: const <String>[],
+          primaryUrl: null,
+          primaryDomain: null,
+          trustedMatch: false,
+          mlInvoked: true,
+          rawLogits: noUrlModelOutput.logits,
+          riskScore: riskScore,
+          warningThreshold: warningThreshold,
+          quarantineThreshold: quarantineThreshold,
+          decision: decision,
+          reason: explanations.first,
+          explanations: explanations,
+          needsRescan: false,
+          heuristicScore: hScore,
+          modelScore: modelScore,
+          riskLevel: riskLevel,
+          detectionSource: 'distilbert_no_url_pipeline',
+          pipelineStage: 'distilbert',
+        ),
+      );
+    }
+
+    // Model unavailable — fall back to heuristics.
     final DetectionResultModel noUrlResult = await _buildHeuristicResult(
       message: message,
       normalized: normalized,
@@ -388,6 +452,71 @@ class MessageScreeningService {
     }
 
     if (extractedUrls.isEmpty) {
+      // Run DistilBERT even without a URL so casino/prize/spam messages
+      // (e.g. "Laro na sa Casino Plus! Libreng P500 bonus!") are flagged.
+      final String noUrlNormalized = _normalizeForScoring(body);
+      final SmishingModelOutput? noUrlModelOutput =
+          await _modelService.runInference(noUrlNormalized);
+      if (noUrlModelOutput != null && noUrlModelOutput.logits.isNotEmpty) {
+        final double modelScore = await _riskScoringService.scoreFromLogits(
+          noUrlModelOutput.logits,
+          positiveIndex: noUrlModelOutput.positiveIndex,
+        );
+        final double hScore = _computeHeuristicScore(
+          message: message,
+          normalized: noUrlNormalized,
+          extractedUrls: const <String>[],
+        );
+        final double riskScore =
+            math.max(modelScore, hScore * 0.9).clamp(0.0, 1.0);
+        final String decision = await _riskScoringService.decisionFor(
+          hasUrl: false,
+          trustedMatch: false,
+          modelError: false,
+          riskScore: riskScore,
+        );
+        final String riskLevel =
+            await _riskScoringService.levelFromScore(riskScore);
+        final List<String> explanations = _uniqueReasons(<String>[
+          'No URL was found in the message.',
+          'The DistilBERT model scored the SMS content for spam and smishing patterns.',
+          if (decision == DetectionDecision.quarantineHighRisk)
+            'The spam/smishing probability crossed the quarantine threshold.',
+        ]);
+        return _persistAndReturn(
+          message: message,
+          result: DetectionResultModel(
+            messageKey: message.messageKey,
+            hasUrl: false,
+            extractedUrls: const <String>[],
+            primaryUrl: null,
+            primaryDomain: null,
+            trustedMatch: false,
+            mlInvoked: true,
+            rawLogits: noUrlModelOutput.logits,
+            riskScore: riskScore,
+            warningThreshold: warningThreshold,
+            quarantineThreshold: quarantineThreshold,
+            decision: decision,
+            reason: explanations.first,
+            explanations: explanations,
+            needsRescan: false,
+            heuristicScore: hScore,
+            modelScore: modelScore,
+            riskLevel: riskLevel,
+            detectionSource: 'distilbert_no_url_pipeline',
+            pipelineStage: 'distilbert',
+          ),
+        );
+      }
+      // Model unavailable — use heuristics so no-URL smishing is still caught.
+      final double hScore = _computeHeuristicScore(
+        message: message,
+        normalized: noUrlNormalized,
+        extractedUrls: const <String>[],
+      );
+      final double riskScore = hScore.clamp(0.0, 1.0);
+      final String riskLevel = await _riskScoringService.levelFromScore(riskScore);
       return _persistAndReturn(
         message: message,
         result: DetectionResultModel(
@@ -399,22 +528,21 @@ class MessageScreeningService {
           trustedMatch: false,
           mlInvoked: false,
           rawLogits: const <double>[],
-          riskScore: 0.04,
+          riskScore: riskScore,
           warningThreshold: warningThreshold,
           quarantineThreshold: quarantineThreshold,
           decision: DetectionDecision.noUrlAllow,
-          reason:
-              'No URL was found, so the SMS was treated as low risk and allowed to the inbox.',
-          explanations: const <String>[
+          reason: 'No URL was found; heuristic rules were applied (model unavailable).',
+          explanations: _uniqueReasons(<String>[
             'No URL was found in the message.',
-            'The strict SMS pipeline only escalates unknown-link messages to the model.',
-          ],
-          needsRescan: false,
-          heuristicScore: 0.0,
+            'The on-device model was unavailable; heuristic rules were used instead.',
+          ]),
+          needsRescan: true,
+          heuristicScore: riskScore,
           modelScore: null,
-          riskLevel: 'safe',
-          detectionSource: 'sms_no_url_allow',
-          pipelineStage: 'buffer',
+          riskLevel: riskLevel,
+          detectionSource: 'heuristic_sms_no_url_fallback',
+          pipelineStage: 'heuristic_fallback',
         ),
       );
     }
@@ -463,9 +591,24 @@ class MessageScreeningService {
       );
     }
 
+    final String smsBodyNormalized = _normalizeForScoring(body);
     final SmishingModelOutput? modelOutput =
-        await _modelService.runInference(_normalizeForScoring(body));
+        await _modelService.runInference(smsBodyNormalized);
     if (modelOutput == null || modelOutput.logits.isEmpty) {
+      // Model unavailable — use heuristics so suspicious URLs are still caught.
+      final double hScore = _computeHeuristicScore(
+        message: message,
+        normalized: smsBodyNormalized,
+        extractedUrls: extractedUrls,
+      );
+      final double riskScore = hScore.clamp(0.0, 1.0);
+      final String decision = await _riskScoringService.decisionFor(
+        hasUrl: true,
+        trustedMatch: false,
+        modelError: true,
+        riskScore: riskScore,
+      );
+      final String riskLevel = await _riskScoringService.levelFromScore(riskScore);
       return _persistAndReturn(
         message: message,
         result: DetectionResultModel(
@@ -477,31 +620,41 @@ class MessageScreeningService {
           trustedMatch: false,
           mlInvoked: false,
           rawLogits: const <double>[],
-          riskScore: 0.12,
+          riskScore: riskScore,
           warningThreshold: warningThreshold,
           quarantineThreshold: quarantineThreshold,
-          decision: DetectionDecision.modelErrorFallback,
-          reason:
-              'A URL was found, but the on-device model was unavailable, so the SMS was allowed and queued for rescan.',
-          explanations: const <String>[
+          decision: decision,
+          reason: 'A URL was found and heuristic rules were applied (model unavailable).',
+          explanations: _uniqueReasons(<String>[
             'A URL was found in the message.',
             'The link is not on the trusted-domain allowlist.',
-            'The on-device DistilBERT model was unavailable, so the message was allowed as a fail-safe fallback.',
-          ],
+            'The on-device model was unavailable; heuristic rules were used instead.',
+          ]),
           needsRescan: true,
-          heuristicScore: 0.0,
+          heuristicScore: riskScore,
           modelScore: null,
-          riskLevel: 'safe',
-          detectionSource: 'distilbert_unavailable',
-          pipelineStage: 'distilbert',
+          riskLevel: riskLevel,
+          detectionSource: 'heuristic_sms_url_fallback',
+          pipelineStage: 'heuristic_fallback',
         ),
       );
     }
 
-    final double riskScore = await _riskScoringService.scoreFromLogits(
+    final double modelScore = await _riskScoringService.scoreFromLogits(
       modelOutput.logits,
       positiveIndex: modelOutput.positiveIndex,
     );
+    final String smsNormalized = _normalizeForScoring(body);
+    final double hScore = _computeHeuristicScore(
+      message: message,
+      normalized: smsNormalized,
+      extractedUrls: extractedUrls,
+    );
+    // Heuristics act as a lower bound: Philippine-specific signals (brand
+    // impersonation, obfuscated URLs, gambling lures) may not score highly
+    // with the English DistilBERT model, so we take the higher of the two.
+    final double riskScore =
+        math.max(modelScore, hScore * 0.9).clamp(0.0, 1.0);
     final String decision = await _riskScoringService.decisionFor(
       hasUrl: true,
       trustedMatch: false,
@@ -538,8 +691,8 @@ class MessageScreeningService {
         reason: explanations.first,
         explanations: explanations,
         needsRescan: false,
-        heuristicScore: 0.0,
-        modelScore: riskScore,
+        heuristicScore: hScore,
+        modelScore: modelScore,
         riskLevel: riskLevel,
         detectionSource: 'distilbert_url_pipeline',
         pipelineStage: 'distilbert',
@@ -631,6 +784,26 @@ class MessageScreeningService {
   }) async {
     await _repository.saveScreeningResult(result: result, message: message);
     return result;
+  }
+
+  /// Computes the pure heuristic risk score without persisting anything.
+  /// Used to provide a lower bound when blending with a DistilBERT score so
+  /// Philippine-specific patterns are caught even when the model gives a low
+  /// probability.
+  double _computeHeuristicScore({
+    required ScreenedMessageModel message,
+    required String normalized,
+    required List<String> extractedUrls,
+  }) {
+    double score = extractedUrls.isNotEmpty ? 0.18 : 0.04;
+    score += _scoreUrlSignals(message.body).scoreDelta;
+    score += _scoreSenderSignals(message.sender).scoreDelta;
+    score += _scoreContentSignals(
+      normalized,
+      hasUrl: extractedUrls.isNotEmpty,
+    ).scoreDelta;
+    score += _scoreCombinationSignals(normalized, message.body).scoreDelta;
+    return score.clamp(0.0, 1.0).toDouble();
   }
 
   Future<Map<String, dynamic>> _pickPrimaryUrlSignal(List<String> urls) async {
@@ -743,6 +916,18 @@ class MessageScreeningService {
       reasons.add('The link looks intentionally obfuscated.');
     }
 
+    // <;domain.tld;> bracket-semicolon encoding: no legitimate sender uses this.
+    final bool hasAngleSemicolonUrl = RegExp(
+      r'<;[^;>]+\.[a-z]{2,24}[^;>]*;>',
+      caseSensitive: false,
+    ).hasMatch(rawText);
+    if (hasAngleSemicolonUrl) {
+      score += 0.22;
+      reasons.add(
+        'The URL uses an unusual delimiter format to hide the destination.',
+      );
+    }
+
     if (trustedCount > 0 && riskyEntries.isNotEmpty) {
       score += 0.05;
       reasons.add('Trusted-looking and untrusted links are mixed together.');
@@ -838,6 +1023,13 @@ class MessageScreeningService {
           'avoid suspension',
           'unauthorized',
           'security alert',
+          // Filipino urgency terms
+          'bilisan',
+          'dali na',
+          'ngayon na',
+          'mabilis',
+          'limitado na',
+          'mag-dalian',
         ],
       ),
       _KeywordGroup(
@@ -852,10 +1044,20 @@ class MessageScreeningService {
           'free spins',
           'bonus',
           'reward',
-          'nanalo',
-          'ayuda',
           'voucher',
           'gift',
+          // Filipino prize/reward terms
+          'nanalo',
+          'ayuda',
+          'premyo',
+          'manalo',
+          'panalo',
+          'swerte',
+          'mapalad',
+          'libreng',
+          'palad ka',
+          'ikaw ang nanalo',
+          'nakatanggap ka',
         ],
       ),
       _KeywordGroup(
@@ -875,8 +1077,14 @@ class MessageScreeningService {
           'poker',
           'betting',
           'sportsbook',
+          // Filipino gambling terms
           'sabong',
           'taya',
+          'sugal',
+          'pusta',
+          'palakasan',
+          'magtaya',
+          'maglaro',
         ],
       ),
       const _KeywordGroup(
@@ -889,6 +1097,57 @@ class MessageScreeningService {
           'pin',
           'verification code',
           'security code',
+          // Filipino credential-request phrasing
+          'otp mo',
+          'password mo',
+          'pin mo',
+          'ibigay ang',
+          'ipadala ang code',
+        ],
+      ),
+      // Filipino/Taglish localized smishing patterns
+      _KeywordGroup(
+        weight: hasUrl ? 0.14 : 0.08,
+        reason: 'The message uses Filipino/Taglish phishing language.',
+        patterns: const <String>[
+          'i-click',
+          'i-verify',
+          'i-claim',
+          'i-download',
+          'i-redeem',
+          'i-update',
+          'mag-login',
+          'mag-update',
+          'mag-verify',
+          'mag-register',
+          'mag-click',
+          'mag-padala',
+          'i-confirm',
+          'libre na',
+          'libre ang',
+          'pera mo',
+          'load mo',
+          'e-load',
+          'padala ng pera',
+          'i-withdraw',
+          'mag-withdraw',
+          'tumanggap ka',
+        ],
+      ),
+      // Social-engineering directive: asking recipient to show the message to
+      // someone (e.g. a store clerk) — a real-world presentation scam vector.
+      const _KeywordGroup(
+        weight: 0.15,
+        reason:
+            'The message asks you to show or present it to someone, a social-engineering tactic.',
+        patterns: <String>[
+          'show this message',
+          'present this message',
+          'show this to',
+          'present this to',
+          'ipakita ang message',
+          'ipresenta ang',
+          'i-show sa',
         ],
       ),
     ];
@@ -914,6 +1173,18 @@ class MessageScreeningService {
       reasons.add('The message uses aggressive punctuation for pressure.');
     }
 
+    // Philippine peso monetary lure: P followed by a large or formatted amount
+    // (e.g. P500, P20, P16M, P3,888). Alone this is weak, but in combination
+    // with prize/brand signals it pushes the score decisively.
+    final bool hasPesoAmount = RegExp(
+      r'\bP\s*\d[\d,]*(?:[kKmMbB])?\b',
+      caseSensitive: true,
+    ).hasMatch(normalized);
+    if (hasPesoAmount) {
+      score += 0.08;
+      reasons.add('The message advertises a specific peso amount as a lure.');
+    }
+
     return _SignalBundle(scoreDelta: score, reasons: reasons);
   }
 
@@ -927,7 +1198,10 @@ class MessageScreeningService {
         lower.contains('otp') ||
             lower.contains('password') ||
             lower.contains('pin') ||
-            lower.contains('verification code');
+            lower.contains('verification code') ||
+            lower.contains('otp mo') ||
+            lower.contains('ibigay ang') ||
+            lower.contains('ipadala ang code');
     if (hasUrl && asksForCredential) {
       score += 0.18;
       reasons.add(
@@ -939,6 +1213,9 @@ class MessageScreeningService {
         lower.contains('urgent') ||
             lower.contains('immediately') ||
             lower.contains('final warning') ||
+            lower.contains('bilisan') ||
+            lower.contains('dali na') ||
+            lower.contains('ngayon na') ||
             lower.contains('expires');
     final bool hasAccountThreat =
         lower.contains('account suspended') ||
@@ -1002,6 +1279,44 @@ class MessageScreeningService {
       reasons.add('Casino or gambling bait is paired with a reward offer.');
     }
 
+    // Brand impersonation: a known financial/telco brand name appears in the
+    // message alongside a prize or reward claim, but the sender is not the
+    // brand's trusted ID. This is the classic "you received a voucher from X"
+    // spoofed notification pattern.
+    final bool hasFinancialBrand =
+        lower.contains('maya') ||
+            lower.contains('gcash') ||
+            lower.contains('bdo') ||
+            lower.contains('bpi') ||
+            lower.contains('unionbank') ||
+            lower.contains('palawan') ||
+            lower.contains('landbank') ||
+            lower.contains('metrobank') ||
+            lower.contains('pnb') ||
+            lower.contains('smart') ||
+            lower.contains('globe') ||
+            lower.contains('dito') ||
+            lower.contains('sun cellular');
+    final bool hasRewardClaim =
+        lower.contains('voucher') ||
+            lower.contains('cashback') ||
+            lower.contains('rebate') ||
+            lower.contains('nakatanggap') ||
+            // "received" alone is too broad; require it alongside a monetary term.
+            (lower.contains('received') &&
+                (lower.contains('reward') ||
+                    lower.contains('voucher') ||
+                    lower.contains('prize') ||
+                    RegExp(r'\bP\s*\d').hasMatch(lower))) ||
+            lower.contains('nanalo') ||
+            lower.contains('panalo');
+    if (hasFinancialBrand && hasRewardClaim) {
+      score += 0.18;
+      reasons.add(
+        'A known financial or telco brand is mentioned alongside a reward claim — a common brand-impersonation pattern.',
+      );
+    }
+
     final bool hasClaimOrTapAction =
         lower.contains('claim') ||
             lower.contains('tap') ||
@@ -1020,6 +1335,12 @@ class MessageScreeningService {
     var normalized = message.replaceAll('\n', ' ');
     normalized = normalized.replaceAllMapped(
       RegExp(r'((https?:\/\/|www\.)\S+)', caseSensitive: false),
+      (_) => ' [LINK] ',
+    );
+    // Replace obfuscated URL delimiters (e.g. <;domain.tld;>) so the model
+    // sees [LINK] rather than raw punctuation soup.
+    normalized = normalized.replaceAllMapped(
+      RegExp(r'<;[^;>]+\.[a-z]{2,24}[^;>]*;>', caseSensitive: false),
       (_) => ' [LINK] ',
     );
     normalized = normalized.replaceAllMapped(

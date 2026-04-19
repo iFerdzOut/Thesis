@@ -10,6 +10,7 @@ import '../services/feedback_service.dart';
 import '../services/quarantine_service.dart';
 import '../services/sms_storage_service.dart';
 import '../services/window_service.dart';
+import '../widgets/feedback_upload_consent_dialog.dart';
 
 class QuarantineScreen extends StatefulWidget {
   const QuarantineScreen({super.key});
@@ -154,6 +155,7 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
   }
 
   Future<void> _restoreEntry(_VaultEntry entry) async {
+    await ensureFeedbackUploadPreference(context);
     if (entry.isLocalSms) {
       await feedbackService.markSmsFalsePositiveAndRestore(entry.id);
     } else {
@@ -181,10 +183,14 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
   }
 
   Future<void> _deleteEntries(List<_VaultEntry> entries) async {
-    final smsIds =
-        entries.where((entry) => entry.isLocalSms).map((entry) => entry.id).toList();
-    final onlineIds =
-        entries.where((entry) => !entry.isLocalSms).map((entry) => entry.id).toList();
+    final smsIds = entries
+        .where((entry) => entry.isLocalSms)
+        .map((entry) => entry.id)
+        .toList();
+    final onlineIds = entries
+        .where((entry) => !entry.isLocalSms)
+        .map((entry) => entry.id)
+        .toList();
 
     if (smsIds.isNotEmpty) {
       await smsStorageService.deleteQuarantineMessages(smsIds);
@@ -295,7 +301,7 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
                     content: Text(
-                      'Copy is disabled in the Quarantine Vault to prevent accidental link access.',
+                      'Copy is disabled in the Quarantine Vault to prevent accidental link opening.\nNaka-disable ang copy para maiwasan ang di-sinasadyang pag-open ng link.',
                     ),
                     backgroundColor: Colors.orange,
                     duration: Duration(seconds: 3),
@@ -432,6 +438,14 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
         final hasLink = entry.message != defanged;
         final selected = _selectedEntryIds.contains(entry.id);
 
+        final rawReasons = entry.raw['detectionReasons'];
+        final detectionReasons = (rawReasons is List)
+            ? rawReasons
+                .map((e) => e.toString().trim())
+                .where((e) => e.isNotEmpty)
+                .toList()
+            : const <String>[];
+
         return _QuarantineCard(
           key: ValueKey(entry.id),
           sender: entry.sender,
@@ -443,6 +457,7 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
           selectionMode: _selectionMode,
           selected: selected,
           holdDuration: _holdToTrustDuration,
+          detectionReasons: detectionReasons,
           onTap: () {
             if (_selectionMode) {
               _toggleEntrySelected(entry.id);
@@ -521,7 +536,8 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
                 Expanded(
                   child: Text(
                     'Screenshots disabled • Links defanged • Copy disabled\n'
-                    'Tap for options. Hold 6 seconds to mark as trusted.',
+                    'Tap for options. Hold 6 seconds only if you are sure the message is safe.\n'
+                    'Na-block ang screenshot at pag-copy para sa kaligtasan mo.',
                     style: TextStyle(
                       fontSize: 12,
                       color: Colors.orange.shade900,
@@ -568,6 +584,7 @@ class _QuarantineCard extends StatefulWidget {
   final bool selectionMode;
   final bool selected;
   final Duration holdDuration;
+  final List<String> detectionReasons;
   final VoidCallback onTap;
   final VoidCallback onHoldTrusted;
 
@@ -582,6 +599,7 @@ class _QuarantineCard extends StatefulWidget {
     required this.selectionMode,
     required this.selected,
     required this.holdDuration,
+    required this.detectionReasons,
     required this.onTap,
     required this.onHoldTrusted,
   });
@@ -706,6 +724,47 @@ class _QuarantineCardState extends State<_QuarantineCard> {
                 ),
               ),
               const SizedBox(height: 8),
+              if (widget.detectionReasons.isNotEmpty) ...[
+                Row(
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 12, color: Colors.orange.shade700),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Why flagged:',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.orange.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 4,
+                  runSpacing: 4,
+                  children: widget.detectionReasons.map((reason) {
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 7, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.shade100,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.orange.shade200),
+                      ),
+                      child: Text(
+                        reason,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.orange.shade900,
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 6),
+              ],
               if (widget.hasDefangedLinks)
                 Row(
                   children: [
@@ -800,7 +859,7 @@ class _FrictionDialogState extends State<_FrictionDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'This message was flagged as suspicious. Are you sure it is safe?',
+              'This message was flagged as suspicious. Mark it as trusted only if you are sure it is safe.\nNa-flag ang mensaheng ito bilang kahina-hinala. I-mark lang ito bilang trusted kung sigurado kang ligtas ito.',
               style: TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 12),
@@ -823,7 +882,7 @@ class _FrictionDialogState extends State<_FrictionDialog> {
                   const SizedBox(width: 8),
                   const Expanded(
                     child: Text(
-                      'If this is actually a scam, marking it as trusted may expose you to fraud. Review carefully.',
+                      'If this is actually a scam, restoring it may expose you to fraud, fake verification, or OTP theft.\nKapag scam ito, maaaring malagay sa panganib ang account o pera mo.',
                       style: TextStyle(fontSize: 12),
                     ),
                   ),
@@ -832,7 +891,7 @@ class _FrictionDialogState extends State<_FrictionDialog> {
             ),
             const SizedBox(height: 16),
             const Text(
-              'Type TRUST below to confirm:',
+              'Type TRUST below to confirm.\nI-type ang TRUST para magpatuloy.',
               style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 8),
@@ -873,8 +932,9 @@ class _FrictionDialogState extends State<_FrictionDialog> {
         ),
         ElevatedButton(
           style: ElevatedButton.styleFrom(
-            backgroundColor:
-                _typedCorrectly ? const Color(0xFF075E54) : Colors.grey.shade300,
+            backgroundColor: _typedCorrectly
+                ? const Color(0xFF075E54)
+                : Colors.grey.shade300,
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           ),

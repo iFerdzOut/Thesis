@@ -273,6 +273,14 @@ class _PhoneScreenState extends State<PhoneScreen>
         _syncedContacts = syncedContacts;
         _syncedContactsVersion++;
       });
+    } on FirebaseException catch (e) {
+      if (!mounted) return;
+      final message = e.code == 'permission-denied'
+          ? 'Cloud contact sync is unavailable right now. Local contacts still work.'
+          : 'Cloud contact sync failed: ${e.message ?? e.code}';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -320,7 +328,10 @@ class _PhoneScreenState extends State<PhoneScreen>
 
     final threads = rawThreads.where((data) {
       final sender = (data['sender'] ?? '').toString();
-      final senderLabel = _smsThreadDisplayName(sender);
+      final senderLabel = _smsThreadDisplayName(
+        sender,
+        storedDisplay: data['senderDisplay']?.toString(),
+      );
       final lastMessage = (data['lastMessage'] ?? '').toString();
       return _matchesQuery([sender, senderLabel, lastMessage]);
     }).toList(growable: false);
@@ -403,7 +414,11 @@ class _PhoneScreenState extends State<PhoneScreen>
     return normalized.isEmpty ? raw.trim() : normalized;
   }
 
-  String _smsThreadDisplayName(String raw) {
+  String _smsThreadDisplayName(String raw, {String? storedDisplay}) {
+    final stored = storedDisplay?.trim() ?? '';
+    if (stored.isNotEmpty) {
+      return stored;
+    }
     final matched = _matchedLabelForNumber(raw)?.trim() ?? '';
     if (matched.isNotEmpty) {
       return matched;
@@ -428,7 +443,8 @@ class _PhoneScreenState extends State<PhoneScreen>
     final phoneKey = DeviceContactSyncService.normalizePhone(raw);
     if (phoneKey.isEmpty) return null;
 
-    final localDisplayName = _localContactNameByPhoneKey[phoneKey]?.trim() ?? '';
+    final localDisplayName =
+        _localContactNameByPhoneKey[phoneKey]?.trim() ?? '';
     if (localDisplayName.isNotEmpty) {
       return localDisplayName;
     }
@@ -849,7 +865,8 @@ class _PhoneScreenState extends State<PhoneScreen>
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Rescanning stored SMS...')),
         );
-        final summary = await SmsService.rescanStoredMessagesWithCurrentPipeline();
+        final summary =
+            await SmsService.rescanStoredMessagesWithCurrentPipeline();
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(_formatSmsRescanSummary(summary))),
@@ -975,8 +992,9 @@ class _PhoneScreenState extends State<PhoneScreen>
     required String threadId,
     required String sender,
     required String lastMessage,
+    String? storedDisplay,
   }) {
-    final senderLabel = _smsThreadDisplayName(sender);
+    final senderLabel = _smsThreadDisplayName(sender, storedDisplay: storedDisplay);
     final senderPhoneLabel = _smsThreadSecondaryLabel(sender);
     final canAddToContacts = _canOfferAddToContacts(sender);
     showModalBottomSheet<void>(
@@ -1361,7 +1379,11 @@ class _PhoneScreenState extends State<PhoneScreen>
                           data['sender']?.toString() ?? '',
                         );
                     final sender = (data['sender'] ?? 'Unknown').toString();
-                    final senderLabel = _smsThreadDisplayName(sender);
+                    final storedDisplay = data['senderDisplay']?.toString();
+                    final senderLabel = _smsThreadDisplayName(
+                      sender,
+                      storedDisplay: storedDisplay,
+                    );
                     final senderPhoneLabel = _smsThreadSecondaryLabel(sender);
                     final lastMessage = (data['lastMessage'] ?? '').toString();
                     final lastTime = data['lastTime'];
@@ -1396,6 +1418,7 @@ class _PhoneScreenState extends State<PhoneScreen>
                             threadId: threadId,
                             sender: sender,
                             lastMessage: lastMessage,
+                            storedDisplay: storedDisplay,
                           );
                         },
                         child: Container(

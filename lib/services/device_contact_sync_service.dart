@@ -29,7 +29,10 @@ class DeviceContactSyncService {
 
     final usersByPhone = <String, Map<String, dynamic>>{};
     for (final doc in usersSnapshot.docs) {
-      final data = doc.data();
+      final data = <String, dynamic>{
+        'uid': doc.id,
+        ...doc.data(),
+      };
       final keys = <String>[
         data['phoneMatchKey']?.toString() ?? '',
         normalizePhone(data['phone']?.toString() ?? ''),

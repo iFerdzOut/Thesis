@@ -35,9 +35,11 @@ class SmsReceivedReceiver : BroadcastReceiver() {
             val body = bodyBuilder.toString()
             if (body.isBlank()) continue
             val timestamp = groupedTimestamps[sender] ?: System.currentTimeMillis()
+            val senderDisplay = ContactNameResolver.resolveDisplayName(context, sender)
             val payload = mapOf(
                 "eventId" to SmsSyncManager.buildIngressKey(sender, body, timestamp, null),
                 "sender" to sender,
+                "senderDisplay" to senderDisplay,
                 "body" to body,
                 "timestamp" to timestamp,
                 "simSlot" to simSlot,

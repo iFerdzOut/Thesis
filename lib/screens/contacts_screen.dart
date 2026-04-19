@@ -56,6 +56,17 @@ class _ContactsScreenState extends State<ContactsScreen>
 
   String _normalize(String value) => value.trim().toLowerCase();
 
+  String _docUid(QueryDocumentSnapshot doc) {
+    final rawData = doc.data();
+    if (rawData is Map) {
+      final uid = rawData['uid']?.toString().trim() ?? '';
+      if (uid.isNotEmpty) {
+        return uid;
+      }
+    }
+    return doc.id.trim();
+  }
+
   bool _matchesQuery(List<String> values) {
     final query = _normalize(searchText);
     if (query.isEmpty) return true;
@@ -106,6 +117,21 @@ class _ContactsScreenState extends State<ContactsScreen>
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Failed to accept request: $e')),
+      );
+    }
+  }
+
+  Future<void> _cancelFriendRequest(String uid) async {
+    try {
+      await contactChatService.cancelFriendRequest(targetUid: uid);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Friend request cancelled')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to cancel request: $e')),
       );
     }
   }
@@ -201,7 +227,7 @@ class _ContactsScreenState extends State<ContactsScreen>
           separatorBuilder: (_, __) => const SizedBox(height: 10),
           itemBuilder: (context, index) {
             final data = friends[index].data() as Map<String, dynamic>;
-            final uid = data['uid']?.toString() ?? '';
+            final uid = _docUid(friends[index]);
             final fallbackName = data['name']?.toString() ?? 'Unknown User';
 
             return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
@@ -326,8 +352,8 @@ class _ContactsScreenState extends State<ContactsScreen>
           builder: (context, friendsSnapshot) {
             final friendIds = friendsSnapshot.hasData
                 ? friendsSnapshot.data!.docs
-                    .map((doc) => (doc.data() as Map<String, dynamic>)['uid'])
-                    .whereType<String>()
+                    .map(_docUid)
+                    .where((uid) => uid.isNotEmpty)
                     .toSet()
                 : <String>{};
 
@@ -351,7 +377,7 @@ class _ContactsScreenState extends State<ContactsScreen>
 
                     final users = usersSnapshot.data!.docs.where((doc) {
                       final data = doc.data() as Map<String, dynamic>;
-                      final uid = data['uid']?.toString() ?? '';
+                      final uid = _docUid(doc);
                       final name = data['name']?.toString() ?? '';
                       final email = data['email']?.toString() ?? '';
 
@@ -382,7 +408,7 @@ class _ContactsScreenState extends State<ContactsScreen>
                       itemBuilder: (context, index) {
                         final data =
                             users[index].data() as Map<String, dynamic>;
-                        final uid = data['uid']?.toString() ?? '';
+                        final uid = _docUid(users[index]);
                         final name = data['name']?.toString() ?? 'Unknown User';
                         final email = data['email']?.toString() ?? '';
 
@@ -423,25 +449,15 @@ class _ContactsScreenState extends State<ContactsScreen>
                             ],
                           );
                         } else if (sentIds.contains(uid)) {
-                          trailing = Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 18,
-                              vertical: 12,
-                            ),
-                            decoration: BoxDecoration(
-                              color: _accentColor.withValues(alpha: 0.16),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: _accentColor.withValues(alpha: 0.45),
+                          trailing = OutlinedButton(
+                            onPressed: () => _cancelFriendRequest(uid),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: _accentColor,
+                              side: BorderSide(
+                                color: _accentColor.withValues(alpha: 0.55),
                               ),
                             ),
-                            child: const Text(
-                              'Requested',
-                              style: TextStyle(
-                                color: Color(0xFFE8FFF1),
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
+                            child: const Text('Requested'),
                           );
                         } else {
                           trailing = ElevatedButton(
@@ -501,7 +517,7 @@ class _ContactsScreenState extends State<ContactsScreen>
                                       incomingRequests.containsKey(uid)
                                           ? 'Wants to connect with you'
                                           : sentIds.contains(uid)
-                                              ? 'Friend request sent'
+                                              ? 'Tap "Requested" to cancel'
                                               : 'Registered app user',
                                       style: TextStyle(
                                         color: sentIds.contains(uid)

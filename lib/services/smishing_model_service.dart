@@ -31,7 +31,7 @@ class SmishingModelService {
   static const String _vocabAssetPath = 'assets/vocab.txt';
   static const int _mobileMaxSequenceLength = 256;
   static const int _lowRamMemoryClassMb = 192;
-  static const int _lowRamTotalMemoryMb = 4096;
+  static const int _lowRamTotalMemoryMb = 1536;
 
   bool _modelLoaded = false;
   bool _loadFailed = false;

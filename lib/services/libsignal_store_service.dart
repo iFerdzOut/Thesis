@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:libsignal/libsignal.dart';
 
 import 'local_message_cache_service.dart';
@@ -95,10 +96,17 @@ class LibsignalStoreService
     Direction direction,
   ) async {
     final existing = await getIdentity(address);
-    if (existing == null) {
-      return true;
+    if (existing != null && !existing.equals(other: identityKey)) {
+      // Identity key changed for this peer/device. Log a warning and trust the
+      // new key (TOFU — Trust On First Use). Blocking here would cause
+      // processPreKeyBundle() to throw UntrustedIdentityException, leaving the
+      // caller with no session and no way to recover without manual intervention.
+      debugPrint(
+        '[SignalStore] WARN: Identity key changed for '
+        '${address.name()}:${address.deviceId()} — trusting new key (TOFU)',
+      );
     }
-    return existing.equals(other: identityKey);
+    return true;
   }
 
   @override

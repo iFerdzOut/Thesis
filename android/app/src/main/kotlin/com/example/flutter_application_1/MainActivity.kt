@@ -11,6 +11,9 @@ import android.media.AudioFocusRequest
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.RingtoneManager
+import android.media.ToneGenerator
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.os.Build
 import android.util.Rational
@@ -51,6 +54,8 @@ class MainActivity : FlutterActivity() {
         private const val PREF_BLOCKED_CHAT_SENDERS = "blocked_chat_senders"
         private val DEFAULT_PIP_RATIO = Rational(9, 16)
         private var ringtonePlayer: MediaPlayer? = null
+        private var outgoingToneGenerator: ToneGenerator? = null
+        private var outgoingToneHandler: Handler? = null
         private val handledIntentKeys = mutableSetOf<String>()
         private var pendingCallIntentArgs: Map<String, Any>? = null
         private var pendingCallIntentKey: String? = null
@@ -177,6 +182,16 @@ class MainActivity : FlutterActivity() {
 
                 "stopRingtone" -> {
                     stopRingtone()
+                    result.success(null)
+                }
+
+                "startOutgoingRingtone" -> {
+                    startOutgoingRingtone()
+                    result.success(null)
+                }
+
+                "stopOutgoingRingtone" -> {
+                    stopOutgoingRingtone()
                     result.success(null)
                 }
 
@@ -1149,6 +1164,36 @@ class MainActivity : FlutterActivity() {
         ringtonePlayer = null
     }
 
+    private fun startOutgoingRingtone() {
+        try {
+            stopOutgoingRingtone()
+            val gen = ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80)
+            outgoingToneGenerator = gen
+            val handler = Handler(Looper.getMainLooper())
+            outgoingToneHandler = handler
+            val runnable = object : Runnable {
+                override fun run() {
+                    if (outgoingToneGenerator == null) return
+                    try {
+                        outgoingToneGenerator?.startTone(ToneGenerator.TONE_SUP_RINGTONE, 1000)
+                    } catch (_: Exception) {}
+                    outgoingToneHandler?.postDelayed(this, 4000)
+                }
+            }
+            handler.post(runnable)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting outgoing ringtone: ${e.message}", e)
+        }
+    }
+
+    private fun stopOutgoingRingtone() {
+        outgoingToneHandler?.removeCallbacksAndMessages(null)
+        outgoingToneHandler = null
+        try { outgoingToneGenerator?.stopTone() } catch (_: Exception) {}
+        try { outgoingToneGenerator?.release() } catch (_: Exception) {}
+        outgoingToneGenerator = null
+    }
+
     private fun prepareIncomingRingtoneAudio() {
         val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
 
@@ -1191,6 +1236,7 @@ class MainActivity : FlutterActivity() {
 
     private fun resetCallAudioState() {
         stopRingtone()
+        stopOutgoingRingtone()
         prepareIncomingRingtoneAudio()
     }
 
@@ -1201,6 +1247,11 @@ class MainActivity : FlutterActivity() {
 
         try {
             stopRingtone()
+        } catch (_: Exception) {
+        }
+
+        try {
+            stopOutgoingRingtone()
         } catch (_: Exception) {
         }
 

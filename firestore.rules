@@ -1,0 +1,187 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // chatId is always sorted(uid1, uid2).join('_')
+    function isChatParticipant(chatId) {
+      return isSignedIn() &&
+        (request.auth.uid == chatId.split('_')[0] ||
+         request.auth.uid == chatId.split('_')[1]);
+    }
+
+    function isChatParticipantByDoc(chatDoc) {
+      return isSignedIn() &&
+        request.auth.uid in chatDoc.data.participants;
+    }
+
+    // ── Users ─────────────────────────────────────────────────────────────────
+    // Any authenticated user can read user profiles (needed for search / E2EE
+    // key discovery). Only the owner can write their own document.
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create, update: if isOwner(uid);
+      allow delete: if false;
+
+      // ── Signal / E2EE device bundles ─────────────────────────────────────
+      // Any authenticated user must be able to READ devices so they can fetch
+      // another user's pre-key bundle for Signal session setup. Only the owner
+      // can write (create / update / delete) their own device documents.
+      match /devices/{deviceId} {
+        allow read: if isSignedIn();
+        allow write: if isOwner(uid);
+
+        // One-time pre-keys stored as a sub-collection of the device document.
+        // Any authenticated peer can READ (to peek at available keys) or DELETE
+        // (to consume a key during X3DH key exchange). Only the owner may write.
+        match /one_time_prekeys/{preKeyId} {
+          allow read, delete: if isSignedIn();
+          allow write: if isOwner(uid);
+        }
+      }
+
+      // Legacy top-level one-time pre-keys path (kept for backward compat).
+      match /one_time_prekeys/{preKeyId} {
+        allow read, delete: if isSignedIn();
+        allow write: if isOwner(uid);
+      }
+
+      // ── Social graph ─────────────────────────────────────────────────────
+      // Contacts: owner manages their list. The referenced contact may also
+      // create their own entry (accepting a friend request adds both sides) or
+      // delete themselves from the list (unfriend removes both sides).
+      match /contacts/{contactId} {
+        allow read, write: if isOwner(uid);
+        allow create, delete: if isOwner(contactId);
+      }
+
+      // Incoming friend requests: any signed-in user can create a request.
+      // Owner can read/delete their own inbox. The original sender (senderId)
+      // can also delete the request to cancel it.
+      match /friend_requests/{senderId} {
+        allow read, delete: if isOwner(uid) || isOwner(senderId);
+        allow create: if isSignedIn();
+        allow update: if isOwner(uid) || isOwner(senderId);
+      }
+
+      // Outgoing / sent requests: owner manages their own list. The receiver
+      // (receiverId) can delete their entry — needed when they accept, decline,
+      // or the sender cancels (clearing the entry from both sides).
+      match /sent_friend_requests/{receiverId} {
+        allow read, write: if isOwner(uid);
+        allow delete: if isOwner(receiverId);
+      }
+
+      // Device contacts (phone-book sync): owner only.
+      match /device_contacts/{contactId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // Quarantine (suspicious-message quarantine): owner only.
+      match /quarantine/{docId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // Per-peer chat settings (mute, block, mark-unread): owner read/write.
+      // The peer referenced by peerId can also READ their own entry so the app
+      // can check whether they have been blocked without exposing all settings.
+      match /chat_settings/{peerId} {
+        allow read: if isOwner(uid) || isOwner(peerId);
+        allow write: if isOwner(uid);
+      }
+    }
+
+    // ── Chats ─────────────────────────────────────────────────────────────────
+    // A chat document lists its participants. Both participants can read / write
+    // the chat and its sub-collections.
+    //
+    // The read rule accepts EITHER:
+    //   (a) chatId-pattern check — for single-document gets (resource may be
+    //       absent, e.g. existence check). Works when the doc doesn't exist yet.
+    //   (b) participants-field check — required for collection queries such as
+    //       getUserChats() (.where('participants', arrayContains: uid)).
+    //       Firestore can statically verify this against the query filter, so
+    //       it won't reject the whole query with permission-denied.
+    match /chats/{chatId} {
+      allow read: if isChatParticipant(chatId) ||
+                     (isSignedIn() && resource != null &&
+                      request.auth.uid in resource.data.participants);
+      allow create: if isChatParticipant(chatId) &&
+                       request.auth.uid in request.resource.data.participants;
+      allow update: if isChatParticipantByDoc(
+                         get(/databases/$(database)/documents/chats/$(chatId)));
+      allow delete: if false;
+
+      // Messages: both participants can read/write.
+      // chatId is fixed in the path so isChatParticipant is statically known.
+      match /messages/{messageId} {
+        allow read, write: if isChatParticipant(chatId);
+      }
+
+      // Per-user chat settings (mute, block, etc.): owner only.
+      match /chat_settings/{settingId} {
+        allow read, write: if isOwner(settingId);
+      }
+    }
+
+    // ── Calls (WebRTC signalling) ─────────────────────────────────────────────
+    // Both caller and callee must access the call document and ICE candidates.
+    match /calls/{callId} {
+      allow read, write: if isSignedIn() &&
+        (request.auth.uid == resource.data.callerId ||
+         request.auth.uid == resource.data.calleeId ||
+         // allow the initial create where resource.data doesn't exist yet
+         (request.resource != null &&
+          (request.auth.uid == request.resource.data.callerId ||
+           request.auth.uid == request.resource.data.calleeId)));
+
+      match /offerCandidates/{candidateId} {
+        allow read, write: if isSignedIn();
+      }
+
+      match /answerCandidates/{candidateId} {
+        allow read, write: if isSignedIn();
+      }
+    }
+
+    // ── ML feedback ───────────────────────────────────────────────────────────
+    // Authenticated users can write their own feedback. Reading is owner-only
+    // (the app only reads its own feedback records to avoid duplicates).
+    match /model_feedback/{docId} {
+      allow create: if isSignedIn();
+      allow read, update, delete: if isSignedIn() &&
+        (resource == null || resource.data.userId == request.auth.uid);
+    }
+
+    // ── E2EE session snapshots ────────────────────────────────────────────────
+    // Lightweight session metadata written by the sender; readable by both
+    // participants. chatId embedded in document ID as prefix.
+    match /e2ee_sessions/{sessionId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // ── Cross-chat message collection-group queries ───────────────────────────
+    // Required for .collectionGroup('messages').where('receiverId', ...) used
+    // by the receiver-side listener. The existing /chats/{chatId}/messages rule
+    // covers single-chat reads; this covers the collection-group query path.
+    match /{path=**}/messages/{messageId} {
+      allow read: if isSignedIn() && resource != null && (
+        resource.data.receiverId == request.auth.uid ||
+        resource.data.senderId == request.auth.uid
+      );
+    }
+
+    // ── Deny everything else ─────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

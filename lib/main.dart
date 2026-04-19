@@ -11,6 +11,7 @@ import 'screens/call_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/contacts_screen.dart';
 import 'screens/home_screen.dart';
+import 'services/auth_service.dart';
 import 'services/call_notification_service.dart';
 import 'services/chat_notification_service.dart';
 import 'services/e2ee_service.dart';
@@ -226,10 +227,21 @@ class AuthGate extends StatefulWidget {
 }
 
 class _AuthGateState extends State<AuthGate> {
+  static const Duration _authRestoreGracePeriod = Duration(seconds: 8);
+
   bool _callServicesStarted = false;
   final Set<String> _activeIncomingRouteKeys = <String>{};
   final Set<String> _activeChatRouteKeys = <String>{};
   bool _deferredBootstrapStarted = false;
+  StreamSubscription<User?>? _authSubscription;
+  User? _currentAuthUser;
+  bool _authStreamReady = false;
+  bool _authMarkerLoaded = false;
+  bool _expectsAuthenticatedRestore = false;
+  bool _authRestoreGraceElapsed = false;
+  Timer? _authRestoreTimer;
+  String? _lastPersistedAuthUid;
+  bool _staleSessionMarkerCleared = false;
 
   @override
   void initState() {
@@ -250,13 +262,128 @@ class _AuthGateState extends State<AuthGate> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_ensureDeferredBootstrapStarted());
     });
+    unawaited(_initializeAuthSessionState());
   }
 
   @override
   void dispose() {
     SmsService.onSmsNotificationTap = null;
     SmsService.onSmsComposeIntentTap = null;
+    _authRestoreTimer?.cancel();
+    _authSubscription?.cancel();
     super.dispose();
+  }
+
+  Future<void> _initializeAuthSessionState() async {
+    final expectedRestore = await AuthService.hasPersistedSessionMarker();
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (!mounted) return;
+
+    setState(() {
+      _authMarkerLoaded = true;
+      _currentAuthUser = currentUser;
+      _authStreamReady = currentUser != null || !expectedRestore;
+      _expectsAuthenticatedRestore = expectedRestore;
+      _authRestoreGraceElapsed = !expectedRestore || currentUser != null;
+      _lastPersistedAuthUid = (currentUser != null && !currentUser.isAnonymous)
+          ? currentUser.uid
+          : null;
+      _staleSessionMarkerCleared = false;
+    });
+
+    if (expectedRestore && currentUser == null) {
+      _startAuthRestoreTimer();
+    }
+
+    _authSubscription ??= FirebaseAuth.instance.idTokenChanges().listen(
+      _handleAuthStateChanged,
+      onError: (Object error) {
+        debugPrint('[AuthGate] auth stream error: $error');
+        if (!mounted) return;
+        setState(() {
+          _authStreamReady = true;
+        });
+      },
+    );
+  }
+
+  void _startAuthRestoreTimer() {
+    _authRestoreTimer?.cancel();
+    _authRestoreTimer = Timer(_authRestoreGracePeriod, () {
+      if (!mounted) return;
+      setState(() {
+        _authRestoreGraceElapsed = true;
+        _authStreamReady = true;
+      });
+      // Do NOT clear the marker here — Firebase may still be finishing its
+      // token refresh on a slow network. _clearStalePersistedSessionMarker()
+      // is only called by _handleAuthStateChanged when Firebase explicitly
+      // confirms user == null (genuine session expiry / revocation).
+    });
+  }
+
+  void _handleAuthStateChanged(User? user) {
+    if (!mounted) return;
+
+    _currentAuthUser = user;
+    _authStreamReady = true;
+
+    if (user != null && !user.isAnonymous) {
+      // Auth restored successfully — cancel the timer and mark ready.
+      _authRestoreTimer?.cancel();
+      _staleSessionMarkerCleared = false;
+      setState(() {
+        _expectsAuthenticatedRestore = true;
+        _authRestoreGraceElapsed = true;
+      });
+      if (_lastPersistedAuthUid != user.uid) {
+        _lastPersistedAuthUid = user.uid;
+        unawaited(AuthService.persistSessionMarker(user));
+      }
+      _startCallServicesOnce();
+      return;
+    }
+
+    _stopCallServices();
+    setState(() {});
+
+    // FIX: Firebase sometimes emits user=null briefly on cold start before
+    // resolving the persisted token. We must NOT clear the session marker
+    // just because we got a null emission — that would log the user out
+    // every time the app is killed and reopened.
+    //
+    // Safe rule: only clear the marker if we were NOT expecting a restore
+    // (i.e. the user genuinely has no session), OR if we are inside the
+    // grace window and waiting (let the timer handle the timeout).
+    // Never clear proactively from a null emission while a restore is expected.
+    if (_expectsAuthenticatedRestore) {
+      if (!_authRestoreGraceElapsed) {
+        // Still inside the grace window — keep waiting.
+        _startAuthRestoreTimer();
+      }
+      // Grace elapsed but restore was expected: hold state, do not clear.
+      // The user may have lost internet briefly. They remain "logged in"
+      // in the UI. If they explicitly log out, AuthService.logout() clears
+      // the marker directly.
+      return;
+    }
+
+    // No restore was expected — this is a genuine signed-out state.
+    _clearStalePersistedSessionMarker();
+  }
+
+  void _clearStalePersistedSessionMarker() {
+    if (_staleSessionMarkerCleared || !_expectsAuthenticatedRestore) {
+      return;
+    }
+    _staleSessionMarkerCleared = true;
+    _lastPersistedAuthUid = null;
+    unawaited(AuthService.clearPersistedSessionMarker());
+    if (!mounted) return;
+    setState(() {
+      _expectsAuthenticatedRestore = false;
+      _authRestoreGraceElapsed = true;
+    });
   }
 
   Future<String> _resolveCallerDisplayName({
@@ -497,6 +624,14 @@ class _AuthGateState extends State<AuthGate> {
         debugPrint('$stackTrace');
       }
 
+      // FIX: This is a background safety-net for app resume (e.g. killed and
+      // reopened without going through login). It intentionally stays
+      // fire-and-forget here because login_screen.dart and
+      // register_screen.dart now both await bootstrapIfNeeded() before
+      // navigating, so by the time the user opens a chat the bootstrap is
+      // already complete. This call only catches edge cases (token refresh,
+      // cold resume) and bootstrapIfNeeded() is idempotent — it will skip
+      // silently if bootstrap already ran this session.
       E2eeService().scheduleAutomaticAccountBootstrapIfPossible();
 
       final friendRequestService = FriendRequestNotificationService();
@@ -557,33 +692,34 @@ class _AuthGateState extends State<AuthGate> {
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
-            backgroundColor: Color(0xFF075E54),
-            body: Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            ),
-          );
-        }
+    final shouldWaitForRestore = !_authMarkerLoaded ||
+        !_authStreamReady ||
+        (_expectsAuthenticatedRestore &&
+            !_authRestoreGraceElapsed &&
+            (_currentAuthUser == null || _currentAuthUser!.isAnonymous));
 
-        final user = snapshot.data;
-        final hasOnlineAccess = user != null && !user.isAnonymous;
-        final hasSession = user != null;
+    if (shouldWaitForRestore) {
+      return const Scaffold(
+        backgroundColor: Color(0xFF075E54),
+        body: Center(
+          child: CircularProgressIndicator(color: Colors.white),
+        ),
+      );
+    }
 
-        if (hasOnlineAccess) {
-          _startCallServicesOnce();
-        } else {
-          _stopCallServices();
-        }
+    final user = _currentAuthUser ?? FirebaseAuth.instance.currentUser;
+    final hasOnlineAccess = user != null && !user.isAnonymous;
+    final hasSession = user != null;
 
-        return HomeScreen(
-          hasSession: hasSession,
-          hasOnlineAccess: hasOnlineAccess,
-        );
-      },
+    if (hasOnlineAccess) {
+      _startCallServicesOnce();
+    } else {
+      _stopCallServices();
+    }
+
+    return HomeScreen(
+      hasSession: hasSession,
+      hasOnlineAccess: hasOnlineAccess,
     );
   }
 }

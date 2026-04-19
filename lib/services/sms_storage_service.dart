@@ -1065,6 +1065,35 @@ class SmsStorageService {
     return _coerceInt(rows.first['latest']) ?? 0;
   }
 
+  Future<void> updateThreadSenderDisplay(String peer, String senderDisplay) async {
+    if (senderDisplay.trim().isEmpty) {
+      return;
+    }
+    await initialize();
+    final threadId = threadIdForPeer(peer);
+    final db = await _maybeOpenDatabase();
+    if (db == null) {
+      final existing = _memoryThreads[threadId];
+      if (existing != null) {
+        existing['senderDisplay'] = senderDisplay;
+        await _emitThreads();
+      }
+      return;
+    }
+    final updated = await db.update(
+      'sms_threads',
+      <String, Object?>{
+        'sender_display': senderDisplay,
+        'updated_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      where: 'thread_id = ? AND (sender_display IS NULL OR sender_display = \'\')',
+      whereArgs: <Object>[threadId],
+    );
+    if (updated > 0) {
+      await _emitThreads();
+    }
+  }
+
   Future<void> reconcileThreadMetadataForSender(String sender) async {
     await initialize();
     final threadId = threadIdForPeer(sender);

@@ -5,6 +5,12 @@ class UserProfileService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
+  // Display names are stable within a session; cache them to avoid a Firestore
+  // read on every outgoing message send.
+  final Map<String, String> _displayNameCache = <String, String>{};
+  final Map<String, DateTime> _displayNameCacheTime = <String, DateTime>{};
+  static const Duration _displayNameCacheTtl = Duration(minutes: 5);
+
   static String resolveDisplayName({
     Map<String, dynamic>? data,
     User? authUser,
@@ -36,13 +42,25 @@ class UserProfileService {
       return resolveDisplayName(authUser: user, fallback: fallback);
     }
 
+    // Return cached value if still fresh.
+    final cached = _displayNameCache[uid];
+    final cachedAt = _displayNameCacheTime[uid];
+    if (cached != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < _displayNameCacheTtl) {
+      return cached;
+    }
+
     try {
       final doc = await _firestore.collection('users').doc(uid).get();
-      return resolveDisplayName(
+      final name = resolveDisplayName(
         data: doc.data(),
         authUser: user,
         fallback: fallback,
       );
+      _displayNameCache[uid] = name;
+      _displayNameCacheTime[uid] = DateTime.now();
+      return name;
     } catch (_) {
       return resolveDisplayName(authUser: user, fallback: fallback);
     }
@@ -54,12 +72,24 @@ class UserProfileService {
   }) async {
     if (uid.trim().isEmpty) return fallback;
 
+    // Return cached value if still fresh.
+    final cached = _displayNameCache[uid];
+    final cachedAt = _displayNameCacheTime[uid];
+    if (cached != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < _displayNameCacheTtl) {
+      return cached;
+    }
+
     try {
       final doc = await _firestore.collection('users').doc(uid).get();
-      return resolveDisplayName(
+      final name = resolveDisplayName(
         data: doc.data(),
         fallback: fallback,
       );
+      _displayNameCache[uid] = name;
+      _displayNameCacheTime[uid] = DateTime.now();
+      return name;
     } catch (_) {
       return fallback;
     }

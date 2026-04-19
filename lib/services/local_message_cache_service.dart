@@ -336,6 +336,29 @@ class LocalMessageCacheService {
     return rows.isEmpty ? null : rows.first;
   }
 
+  Future<void> updateIdentityDeviceBinding({
+    required String userId,
+    required String deviceDocId,
+    required int signalDeviceId,
+    int? registrationId,
+  }) async {
+    final db = await _openDatabase();
+    final updates = <String, Object?>{
+      'device_doc_id': deviceDocId,
+      'signal_device_id': signalDeviceId,
+      'updated_at': DateTime.now().millisecondsSinceEpoch,
+    };
+    if (registrationId != null) {
+      updates['registration_id'] = registrationId;
+    }
+    await db.update(
+      'identities',
+      updates,
+      where: 'user_id = ?',
+      whereArgs: [userId],
+    );
+  }
+
   Future<void> saveRemoteIdentity({
     required String userId,
     required String peerUid,
@@ -697,7 +720,8 @@ class LocalMessageCacheService {
         .toList(growable: false);
   }
 
-  Future<List<Map<String, dynamic>>> getPendingKyberPreKeys(String userId) async {
+  Future<List<Map<String, dynamic>>> getPendingKyberPreKeys(
+      String userId) async {
     final db = await _openDatabase();
     return db.query(
       'kyber_prekeys',

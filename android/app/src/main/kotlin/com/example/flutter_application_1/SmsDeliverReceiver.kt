@@ -104,10 +104,12 @@ class SmsDeliverReceiver : BroadcastReceiver() {
             )
         }
 
+        val senderDisplay = ContactNameResolver.resolveDisplayName(context, sender)
         val payload = mapOf(
             "eventId" to messageKey,
             "messageKey" to messageKey,
             "sender" to sender,
+            "senderDisplay" to senderDisplay,
             "body" to body,
             "timestamp" to timestamp,
             "simSlot" to simSlot,

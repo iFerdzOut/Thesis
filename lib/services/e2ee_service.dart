@@ -6,6 +6,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'chat_encryption_repository.dart';
@@ -164,7 +165,8 @@ class E2eeService {
       <String, Future<SimplePublicKey?>>{};
   final Map<String, List<SimplePublicKey>> _previousPublicKeysCache =
       <String, List<SimplePublicKey>>{};
-  final Map<String, Future<List<SimplePublicKey>>> _previousPublicKeysFutureCache =
+  final Map<String, Future<List<SimplePublicKey>>>
+      _previousPublicKeysFutureCache =
       <String, Future<List<SimplePublicKey>>>{};
   final Map<String, SecretKey> _conversationKeyCache = <String, SecretKey>{};
   final Map<String, String> _decryptedTextCache = <String, String>{};
@@ -257,57 +259,16 @@ class E2eeService {
     required String receiverId,
     required String plaintext,
   }) async {
-    try {
-      await _keyManagementService.ensureDeviceIdentity(
-        userId: currentUserId,
-        forceRepublish: false,
-      );
-      final envelope = await _signalRepository.encryptTextEnvelope(
-        receiverId: receiverId,
-        plaintext: plaintext,
-      );
-      unawaited(syncAutomaticAccountBackupIfAvailable());
-      return envelope;
-    } catch (error) {
-      debugPrint('[E2eeService] Signal text encrypt fallback: $error');
-    }
-
-    final envelope = await _encryptTextEnvelopeLegacy(
+    await _keyManagementService.ensureDeviceIdentity(
+      userId: currentUserId,
+      forceRepublish: false,
+    );
+    final envelope = await _signalRepository.encryptTextEnvelope(
       receiverId: receiverId,
       plaintext: plaintext,
     );
     unawaited(syncAutomaticAccountBackupIfAvailable());
     return envelope;
-  }
-
-  Future<Map<String, dynamic>> _encryptTextEnvelopeLegacy({
-    required String receiverId,
-    required String plaintext,
-  }) async {
-    await ensureIdentityForCurrentUser(syncRemote: true);
-    final session = await ensureSessionForPeer(peerId: receiverId);
-    final conversationKey = await _deriveConversationKey(
-      keyPair: session.localKeyPair,
-      peerPublicKey: session.peerPublicKey,
-      otherUserId: receiverId,
-    );
-    final nonce = _randomBytes(12);
-    final secretBox = await _cipher.encrypt(
-      utf8.encode(plaintext),
-      secretKey: conversationKey,
-      nonce: nonce,
-    );
-
-    return {
-      ...EncryptedTextPayload(
-        cipherText: base64Encode(secretBox.cipherText),
-        nonce: base64Encode(secretBox.nonce),
-        mac: base64Encode(secretBox.mac.bytes),
-        version: session.sessionVersion,
-        algorithm: session.algorithm,
-      ).toMap(),
-      ...session.toMetadataMap(),
-    };
   }
 
   Future<Map<String, dynamic>> encryptBinaryEnvelope({
@@ -399,7 +360,8 @@ class E2eeService {
 
     final privateKeyB64 =
         await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-    final publicKeyB64 = await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+    final publicKeyB64 =
+        await _secureStorage.read(key: '$_publicKeyPrefix$uid');
 
     if (privateKeyB64 == null ||
         privateKeyB64.isEmpty ||
@@ -495,7 +457,8 @@ class E2eeService {
         secretBox,
         secretKey: recoveryKey,
       );
-      final payload = jsonDecode(utf8.decode(clearBytes)) as Map<String, dynamic>;
+      final payload =
+          jsonDecode(utf8.decode(clearBytes)) as Map<String, dynamic>;
       privateKeyB64 = payload['privateKey']?.toString() ?? '';
       publicKeyB64 = payload['publicKey']?.toString() ?? '';
       final rawSignalBackup = payload['signalBackup'];
@@ -514,7 +477,8 @@ class E2eeService {
       throw Exception('Recovery backup is incomplete.');
     }
 
-    final existingRemotePublicKey = data['e2eePublicKey']?.toString().trim() ?? '';
+    final existingRemotePublicKey =
+        data['e2eePublicKey']?.toString().trim() ?? '';
     final previousPublicKeys =
         (data['e2eePreviousPublicKeys'] as List<dynamic>? ?? const <dynamic>[])
             .map((entry) => entry.toString())
@@ -618,9 +582,23 @@ class E2eeService {
       return false;
     }
 
-    final passphrase = await _secureStorage.read(
-      key: '$_accountBackupPassphrasePrefix$uid',
-    );
+    String? passphrase;
+    try {
+      passphrase = await _secureStorage.read(
+        key: '$_accountBackupPassphrasePrefix$uid',
+      );
+    } catch (error) {
+      if (_isKeystoreCorruptionError(error)) {
+        // Keystore invalidated — passphrase is unreadable. Return false so
+        // bootstrapIfNeeded's outer catch can wipe and regenerate cleanly.
+        debugPrint(
+          '[E2eeService] Keystore error reading backup passphrase '
+          '(will be handled by bootstrapIfNeeded): $error',
+        );
+        rethrow;
+      }
+      return false;
+    }
     if (passphrase == null || passphrase.isEmpty) {
       return false;
     }
@@ -645,6 +623,52 @@ class E2eeService {
     }
   }
 
+  // ── Keystore repair helpers ──────────────────────────────────────────────
+
+  /// Returns true when the exception is a Flutter Secure Storage
+  /// BadPaddingException / BAD_DECRYPT — which means the Android Keystore
+  /// encryption key has been invalidated (fingerprint change, device restore,
+  /// app reinstall with different signing key, etc.).
+  bool _isKeystoreCorruptionError(Object error) {
+    if (error is PlatformException) {
+      final msg = (error.message ?? '').toLowerCase();
+      final code = (error.code).toLowerCase();
+      return msg.contains('bad_decrypt') ||
+          msg.contains('badpaddingexception') ||
+          msg.contains('bad padding') ||
+          code == 'read' ||
+          code == 'exception encountered';
+    }
+    return false;
+  }
+
+  /// Wipes every secure-storage key owned by this service for [uid].
+  /// Called when the Android Keystore has been invalidated so a fresh
+  /// identity can be generated without the corrupted data blocking startup.
+  Future<void> _deleteAllSecureStorageKeysForUser(String uid) async {
+    final keys = [
+      '$_privateKeyPrefix$uid',
+      '$_publicKeyPrefix$uid',
+      '$_localKeyHistoryPrefix$uid',
+      '$_accountBackupPassphrasePrefix$uid',
+      '$_bootstrappedMarkerPrefix$uid',
+    ];
+    for (final key in keys) {
+      try {
+        await _secureStorage.delete(key: key);
+      } catch (_) {}
+    }
+    // Also reset all in-memory caches so the next read starts clean.
+    _cachedKeyPairUserId = null;
+    _cachedCurrentUserKeyPair = null;
+    _keyPairFuture = null;
+    _ensuredUserId = null;
+    _ensureIdentityFuture = null;
+    _cachedLocalKeyHistory = null;
+    _cachedLocalKeyHistoryUserId = null;
+    debugPrint('[E2eeService] Wiped corrupted Keystore entries for $uid');
+  }
+
   Future<void> bootstrapIfNeeded({
     String? accountPassword,
     bool syncRemote = true,
@@ -654,6 +678,50 @@ class E2eeService {
       return;
     }
 
+    try {
+      await _bootstrapIfNeededInternal(
+        uid: uid,
+        accountPassword: accountPassword,
+        syncRemote: syncRemote,
+      );
+    } catch (error) {
+      if (_isKeystoreCorruptionError(error)) {
+        // The Android Keystore encryption key was invalidated (e.g. the user
+        // changed their fingerprint or PIN, the device was restored, or the
+        // app was reinstalled with a different signing key). The encrypted
+        // values in FlutterSecureStorage are permanently unreadable.
+        // Solution: wipe them and regenerate a fresh identity so the user
+        // can keep using the app without being stuck in a crash loop.
+        debugPrint(
+          '[E2eeService] Keystore corruption detected — wiping secure '
+          'storage and regenerating identity. Error: $error',
+        );
+        await _deleteAllSecureStorageKeysForUser(uid);
+        // Retry once with a clean slate — this time there are no corrupted
+        // entries so _ensureLocalIdentityForCurrentUser will generate new keys.
+        try {
+          await _bootstrapIfNeededInternal(
+            uid: uid,
+            accountPassword: accountPassword,
+            syncRemote: syncRemote,
+          );
+        } catch (retryError) {
+          debugPrint(
+            '[E2eeService] Bootstrap retry after Keystore wipe failed '
+            '(non-fatal, will retry on next launch): $retryError',
+          );
+        }
+      } else {
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> _bootstrapIfNeededInternal({
+    required String uid,
+    String? accountPassword,
+    bool syncRemote = true,
+  }) async {
     final trimmedPassword = accountPassword?.trim() ?? '';
     if (trimmedPassword.isNotEmpty) {
       await cacheAutomaticAccountBackupSecret(accountPassword: trimmedPassword);
@@ -689,20 +757,37 @@ class E2eeService {
       return;
     }
     unawaited(() async {
-      try {
-        await bootstrapIfNeeded(accountPassword: accountPassword);
-      } catch (error) {
-        debugPrint('[E2eeService] Deferred automatic bootstrap failed: $error');
+      for (var attempt = 0; attempt < 3; attempt++) {
+        try {
+          await bootstrapIfNeeded(accountPassword: accountPassword);
+          return;
+        } catch (error) {
+          debugPrint(
+            '[E2eeService] Bootstrap attempt ${attempt + 1}/3 failed: $error',
+          );
+          if (attempt < 2) {
+            // Exponential backoff: 5s then 10s before the final attempt.
+            await Future.delayed(Duration(seconds: 5 * (1 << attempt)));
+          }
+        }
       }
     }());
   }
 
   void scheduleAutomaticAccountBootstrapIfPossible() {
     unawaited(() async {
-      try {
-        await bootstrapIfNeeded();
-      } catch (error) {
-        debugPrint('[E2eeService] Deferred stored-secret bootstrap failed: $error');
+      for (var attempt = 0; attempt < 3; attempt++) {
+        try {
+          await bootstrapIfNeeded();
+          return;
+        } catch (error) {
+          debugPrint(
+            '[E2eeService] Bootstrap (no-pw) attempt ${attempt + 1}/3 failed: $error',
+          );
+          if (attempt < 2) {
+            await Future.delayed(Duration(seconds: 5 * (1 << attempt)));
+          }
+        }
       }
     }());
   }
@@ -714,6 +799,13 @@ class E2eeService {
     final hasLocalIdentity = await _hasLocalIdentity(uid);
     final hasRemoteBackup = await _hasRemoteRecoveryBackup(uid);
     if (!hasLocalIdentity && hasRemoteBackup) {
+      final hasActiveDeviceDocs =
+          await _keyManagementService.hasActiveDeviceDocuments(uid);
+      if (hasActiveDeviceDocs) {
+        await ensureIdentityForCurrentUser(forceRepublish: true);
+        await syncAutomaticAccountBackupIfAvailable();
+        return true;
+      }
       try {
         await restoreIdentityFromRecoveryKey(passphrase: passphrase);
         await syncAutomaticAccountBackupIfAvailable();
@@ -776,6 +868,10 @@ class E2eeService {
     }
     await _secureStorage.delete(key: '$_accountBackupPassphrasePrefix$uid');
     await _secureStorage.delete(key: '$_bootstrappedMarkerPrefix$uid');
+  }
+
+  Future<void> deactivateCurrentDevice([String? userId]) async {
+    await _keyManagementService.deactivateCurrentDevice(userId: userId);
   }
 
   Future<void> ensureReady({
@@ -931,9 +1027,7 @@ class E2eeService {
     required String messageType,
     String? fileName,
   }) async {
-    if (senderId.trim().isEmpty ||
-        receiverId.trim().isEmpty ||
-        bytes.isEmpty) {
+    if (senderId.trim().isEmpty || receiverId.trim().isEmpty || bytes.isEmpty) {
       return;
     }
 
@@ -960,9 +1054,7 @@ class E2eeService {
     required String messageType,
     String? fileName,
   }) async {
-    if (senderId.trim().isEmpty ||
-        receiverId.trim().isEmpty ||
-        bytes.isEmpty) {
+    if (senderId.trim().isEmpty || receiverId.trim().isEmpty || bytes.isEmpty) {
       return;
     }
 
@@ -996,7 +1088,8 @@ class E2eeService {
   String? getSeededDecryptedText(Map<String, dynamic> data) {
     final signalCacheKey = data['e2eeCacheKey']?.toString().trim() ?? '';
     if (signalCacheKey.isNotEmpty) {
-      final signalCached = _signalRepository.peekCachedPlaintext(signalCacheKey);
+      final signalCached =
+          _signalRepository.peekCachedPlaintext(signalCacheKey);
       if (signalCached != null && signalCached.trim().isNotEmpty) {
         return signalCached;
       }
@@ -1010,7 +1103,10 @@ class E2eeService {
     final receiverId = data['receiverId']?.toString().trim() ?? '';
     final nonce = data['e2eeNonce']?.toString().trim() ?? '';
     final mac = data['e2eeMac']?.toString().trim() ?? '';
-    if (senderId.isEmpty || receiverId.isEmpty || nonce.isEmpty || mac.isEmpty) {
+    if (senderId.isEmpty ||
+        receiverId.isEmpty ||
+        nonce.isEmpty ||
+        mac.isEmpty) {
       return null;
     }
 
@@ -1149,8 +1245,8 @@ class E2eeService {
               .map((entry) => entry.toString())
               .where((value) => value.trim().isNotEmpty)
               .toList();
-      final alreadyPublished =
-          existingRemotePublicKey == publicKeyB64 && data['e2eeEnabled'] == true;
+      final alreadyPublished = existingRemotePublicKey == publicKeyB64 &&
+          data['e2eeEnabled'] == true;
 
       if (forceRepublish || !alreadyPublished) {
         await _publishIdentityDocument(
@@ -1261,8 +1357,7 @@ class E2eeService {
     }
 
     final clearText = data['text']?.toString() ?? '';
-    final looksEncrypted =
-        data['e2ee'] == true ||
+    final looksEncrypted = data['e2ee'] == true ||
         (data['cipherText']?.toString().isNotEmpty ?? false);
     if (looksEncrypted && clearText.trim().isEmpty) {
       return '[Encrypted message unavailable]';
@@ -1274,7 +1369,6 @@ class E2eeService {
     Map<String, dynamic> data, {
     bool allowRepair = false,
   }) async {
-
     final legacyText = data['text']?.toString() ?? '';
     if (!isEncryptedTextMessage(data)) {
       return legacyText;
@@ -1694,7 +1788,6 @@ class E2eeService {
     required List<int> cipherBytes,
     bool allowRepair = false,
   }) async {
-
     final uid = currentUserId;
     if (uid.isEmpty) {
       throw Exception('No logged-in user found.');
@@ -1840,7 +1933,9 @@ class E2eeService {
       if (entry is! Map) continue;
       final privateKey = entry['privateKey']?.toString() ?? '';
       final publicKey = entry['publicKey']?.toString() ?? '';
-      if (privateKey.isEmpty || publicKey.isEmpty || publicKey == publicKeyB64) {
+      if (privateKey.isEmpty ||
+          publicKey.isEmpty ||
+          publicKey == publicKeyB64) {
         continue;
       }
       entries.add(<String, String>{
@@ -2155,10 +2250,8 @@ class E2eeService {
   }
 
   String _shortKeyFingerprint(String base64Key) {
-    final normalized = base64Key
-        .replaceAll('=', '')
-        .replaceAll('+', '-')
-        .replaceAll('/', '_');
+    final normalized =
+        base64Key.replaceAll('=', '').replaceAll('+', '-').replaceAll('/', '_');
     final safe = normalized.isEmpty ? 'unknown' : normalized;
     return safe.substring(0, min(16, safe.length));
   }
@@ -2212,10 +2305,24 @@ class E2eeService {
   }
 
   Future<bool> _hasLocalIdentity(String uid) async {
-    final privateKeyB64 =
-        await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-    final publicKeyB64 =
-        await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+    String? privateKeyB64;
+    String? publicKeyB64;
+    try {
+      privateKeyB64 =
+          await _secureStorage.read(key: '$_privateKeyPrefix$uid');
+      publicKeyB64 =
+          await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+    } catch (error) {
+      if (_isKeystoreCorruptionError(error)) {
+        // Keystore is corrupted — treat as no local identity so bootstrap
+        // regenerates keys after wiping the corrupted entries.
+        debugPrint(
+          '[E2eeService] Keystore error in _hasLocalIdentity — '
+          'treating as no identity: $error',
+        );
+        return false;
+      }
+    }
     final hasLegacyIdentity = privateKeyB64 != null &&
         privateKeyB64.isNotEmpty &&
         publicKeyB64 != null &&

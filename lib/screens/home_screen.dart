@@ -60,6 +60,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.didUpdateWidget(oldWidget);
 
     if (oldWidget.hasOnlineAccess != widget.hasOnlineAccess) {
+      if (!oldWidget.hasOnlineAccess && widget.hasOnlineAccess) {
+        currentIndex = 0;
+      }
       _resetPageCache();
       _applyOnlineServiceState(enabled: widget.hasOnlineAccess);
     }
@@ -300,8 +303,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         index: currentIndex,
         children: List<Widget>.generate(
           _pageCache.length,
-          (index) =>
-              _initializedPageIndexes.contains(index) && _pageCache[index] != null
+          (index) => _initializedPageIndexes.contains(index) &&
+                  _pageCache[index] != null
               ? _pageCache[index]!
               : const SizedBox.shrink(),
         ),
