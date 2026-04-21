@@ -1,0 +1,19 @@
+# Anonymous insertion mutation for the feedback loop
+# @auth(level: PUBLIC) allows insertion without a logged-in Firebase Auth user.
+mutation InsertModelFeedback(
+  $label: String!,
+  $aiPrediction: String!,
+  $userCorrection: String!,
+  $source: String!,
+  $senderType: String!,
+  $messageSanitized: String!,
+  $messageLength: Int!,
+  $hasUrl: Boolean!,
+  $appVersion: String!
+) @auth(level: PUBLIC) {
+  modelFeedback_insert(data: {
+    label: $label, aiPrediction: $aiPrediction, userCorrection: $userCorrection,
+    source: $source, senderType: $senderType, messageSanitized: $messageSanitized,
+    messageLength: $messageLength, hasUrl: $hasUrl, appVersion: $appVersion
+  })
+}

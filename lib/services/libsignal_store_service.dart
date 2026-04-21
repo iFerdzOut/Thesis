@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:libsignal/libsignal.dart';
@@ -75,6 +74,24 @@ class LibsignalStoreService
       signalDeviceId: _deviceId(address),
       identityKey: identityKey.serialize(),
     );
+    // When the peer's identity key changes (not just first-time TOFU), delete
+    // all local sessions for that peer. The stale sessions used the old ratchet
+    // root — the peer's new device can't decrypt them. Clearing them forces a
+    // fresh X3DH exchange on the next outgoing message.
+    if (changed && existing != null) {
+      debugPrint(
+        '[SignalStore] Identity changed for ${address.name()}:${address.deviceId()} '
+        '— deleting all local sessions to force re-establishment.',
+      );
+      try {
+        await _cacheService.deleteAllSessions(
+          userId: userId,
+          peerUid: _peerName(address),
+        );
+      } catch (e) {
+        debugPrint('[SignalStore] Failed to delete sessions after identity change: $e');
+      }
+    }
     return changed;
   }
 

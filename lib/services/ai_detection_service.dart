@@ -1,3 +1,4 @@
+import 'package:firebase_auth/firebase_auth.dart';
 import '../models/screened_message_model.dart';
 import 'message_screening_service.dart';
 
@@ -53,6 +54,24 @@ class AIDetectionService {
     String message, {
     String sender = '',
   }) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    // Bypass ML detection entirely for outgoing messages. 
+    // The receiver must decrypt and verify it locally!
+    if (sender.isEmpty || sender == 'Me' || sender == uid) {
+      return const HybridRiskResult(
+        riskScore: 0.0,
+        heuristicScore: 0.0,
+        modelScore: null,
+        riskLevel: 'safe',
+        isSuspicious: false,
+        shouldQuarantine: false,
+        usedModel: false,
+        detectionSource: 'bypassed',
+        pipelineStage: 'bypassed',
+        reasons: [],
+      );
+    }
+
     final int timestampMs = DateTime.now().millisecondsSinceEpoch;
     final String body = message.trim();
     final String messageKey =

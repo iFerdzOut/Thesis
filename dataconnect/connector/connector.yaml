@@ -1,0 +1,7 @@
+specVersion: 'v1'
+connectorId: "smishing-shield-connector"
+generate:
+  dartSdk:
+    outputDir: "../../lib/generated/dataconnect"
+    package: "smishing_shield_dataconnect"
+authMode: "PUBLIC"

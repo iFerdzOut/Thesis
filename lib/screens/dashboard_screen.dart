@@ -3,6 +3,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../services/local_detection_repository.dart';
 import '../services/sms_storage_service.dart';
+import '../services/sms_background_worker.dart';
+import 'contribution_hub_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -28,6 +30,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() {
       _feedbackStatsFuture = _localDetectionRepository.getFeedbackStats();
     });
+
+    // TEMPORARY TEST: Force background worker to scan immediately
+    SmsBackgroundWorker.triggerImmediateScanTest();
   }
 
   @override
@@ -169,6 +174,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
                     const SizedBox(height: 24),
                   ],
+
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.cloud_upload_outlined),
+                      label: const Text(
+                        'Open Contribution Hub',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF25D366),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        elevation: 0,
+                      ),
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const ContributionHubScreen(),
+                          ),
+                        ).then((_) => _refreshFeedbackStats());
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 24),
 
                   const Text('Recent Alerts',
                       style: TextStyle(

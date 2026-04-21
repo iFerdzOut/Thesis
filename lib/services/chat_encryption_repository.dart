@@ -1,17 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:libsignal/libsignal.dart';
 import 'package:uuid/uuid.dart';
-
 import '../models/conversation_preview_model.dart';
 import '../models/decrypted_conversation_message.dart';
 import '../models/prekey_bundle_model.dart';
-import 'ai_detection_service.dart';
+import '../smishing_detector.dart';
 import 'key_management_service.dart';
 import 'libsignal_store_service.dart';
 import 'local_message_cache_service.dart';
@@ -44,21 +42,40 @@ class ChatEncryptionRepository {
       <String, StreamController<ConversationPreviewModel?>>{};
   final Map<String, Future<void>> _conversationSyncFutures =
       <String, Future<void>>{};
-  final Map<String, Future<void>> _conversationPrewarmFutures =
-      <String, Future<void>>{};
-  final Map<String, int> _conversationHydrationGenerations = <String, int>{};
+  final Map<String, Future<void>> _peerSessionLocks = <String, Future<void>>{};
   final Map<String, String> _latestPreviewMessageIds = <String, String>{};
   final Map<String, String> _lastConversationEmitSignatures =
       <String, String>{};
   final Map<String, String?> _lastPreviewEmitSignatures = <String, String?>{};
-  final AIDetectionService _aiDetectionService = AIDetectionService();
+  final SmishingDetector _smishingDetector = SmishingDetector();
   final Map<String, bool> _detectionCache = <String, bool>{};
+  final Map<String, Future<void>> _conversationPrewarmFutures = <String, Future<void>>{};
+  final Map<String, int> _conversationHydrationGenerations = <String, int>{};
   Future<String> Function(
     Map<String, dynamic> data, {
     bool allowRepair,
   })? _legacyTextDecryptor;
 
-  String get currentUserId => _auth.currentUser?.uid ?? '';
+  // Allows the background Isolate to maintain context without needing Auth state resolution
+  String? _isolateUid;
+  String get currentUserId => _isolateUid ?? _auth.currentUser?.uid ?? '';
+
+  // Forces Signal encryption/decryption for a specific peer to run sequentially.
+  // This prevents the Double Ratchet state from branching/corrupting during rapid sends.
+  Future<T> _withSessionLock<T>(String peerId, Future<T> Function() action) async {
+    final previousLock = _peerSessionLocks[peerId] ?? Future<void>.value();
+    final completer = Completer<void>();
+    _peerSessionLocks[peerId] = completer.future;
+    try {
+      await previousLock;
+      return await action();
+    } finally {
+      completer.complete();
+      if (identical(_peerSessionLocks[peerId], completer.future)) {
+        _peerSessionLocks.remove(peerId);
+      }
+    }
+  }
 
   Future<void> initialize() async {
     await _keyManagementService.initialize();
@@ -121,6 +138,9 @@ class ChatEncryptionRepository {
       conversationId,
       () => StreamController<List<DecryptedConversationMessage>>.broadcast(),
     );
+    // Clear the dedup signature so the next emit always delivers cached messages
+    // to the new StreamBuilder subscriber (e.g. after back + re-open).
+    _lastConversationEmitSignatures.remove(conversationId);
     await _emitConversationFromCache(conversationId);
   }
 
@@ -324,6 +344,22 @@ class ChatEncryptionRepository {
   Future<Map<String, dynamic>> encryptTextEnvelope({
     required String receiverId,
     required String plaintext,
+    String? clientMessageId,
+  }) async {
+    // The lock remains on the main thread so rapid sends execute sequentially
+    return _withSessionLock(receiverId, () async {
+      return await _encryptTextEnvelopeInternal(
+        receiverId: receiverId,
+        plaintext: plaintext,
+        clientMessageId: clientMessageId,
+      );
+    });
+  }
+
+  Future<Map<String, dynamic>> _encryptTextEnvelopeInternal({
+    required String receiverId,
+    required String plaintext,
+    String? clientMessageId,
   }) async {
     await ensureReady();
     final store = await _keyManagementService.getStore(currentUserId);
@@ -344,7 +380,7 @@ class ChatEncryptionRepository {
       ...receiverContexts,
       ...senderSiblingContexts,
     ]);
-    final clientMessageId = _uuid.v4();
+    final resolvedClientMessageId = clientMessageId ?? _uuid.v4();
     final cacheKey = _uuid.v4();
     final clearBytes = Uint8List.fromList(utf8.encode(plaintext));
     final deviceEnvelopes = <String, Map<String, dynamic>>{};
@@ -372,12 +408,15 @@ class ChatEncryptionRepository {
     }
 
     if (primaryEnvelope == null) {
+      if (receiverId == currentUserId && contexts.isEmpty) {
+        throw Exception('Cannot send an encrypted message to yourself on the same device.');
+      }
       throw Exception('Recipient has not enabled secure messaging yet.');
     }
 
     await _cacheOutgoingPlaintext(
       cacheKey: cacheKey,
-      clientMessageId: clientMessageId,
+      clientMessageId: resolvedClientMessageId,
       senderId: currentUserId,
       receiverId: receiverId,
       plaintext: plaintext,
@@ -386,7 +425,7 @@ class ChatEncryptionRepository {
 
     debugPrint(
       '[SignalRepo] Encryption success peer=$receiverId '
-      'devices=${deviceEnvelopes.length} clientMessageId=$clientMessageId',
+      'devices=${deviceEnvelopes.length} clientMessageId=$resolvedClientMessageId',
     );
 
     return {
@@ -396,13 +435,25 @@ class ChatEncryptionRepository {
       'e2eeAlgorithm': signalAlgorithm,
       'e2eeProtocol': 'signal',
       'e2eeCacheKey': cacheKey,
-      'clientMessageId': clientMessageId,
+      'clientMessageId': resolvedClientMessageId,
       ...primaryEnvelope,
       'e2eeDeviceEnvelopes': deviceEnvelopes,
     };
   }
 
   Future<Map<String, dynamic>> encryptBinaryEnvelope({
+    required String receiverId,
+    required List<int> bytes,
+  }) async {
+    return _withSessionLock(receiverId, () async {
+      return await _encryptBinaryEnvelopeInternal(
+        receiverId: receiverId,
+        bytes: bytes,
+      );
+    });
+  }
+
+  Future<Map<String, dynamic>> _encryptBinaryEnvelopeInternal({
     required String receiverId,
     required List<int> bytes,
   }) async {
@@ -443,6 +494,19 @@ class ChatEncryptionRepository {
     Map<String, dynamic> data, {
     bool allowRepair = false,
   }) async {
+    final peerLockId = data['senderId']?.toString() ?? '';
+    return _withSessionLock(peerLockId, () async {
+      return await _decryptTextMessageInternal(
+        data,
+        allowRepair: allowRepair,
+      );
+    });
+  }
+
+  Future<String> _decryptTextMessageInternal(
+    Map<String, dynamic> data, {
+    bool allowRepair = false,
+  }) async {
     await ensureReady();
     final uid = currentUserId;
     final store = await _keyManagementService.getStore(uid);
@@ -463,8 +527,14 @@ class ChatEncryptionRepository {
 
     final senderId = resolvedData['senderId']?.toString() ?? '';
     final receiverId = resolvedData['receiverId']?.toString() ?? '';
-    if (senderId == uid && !hasLocalEnvelope) {
-      return '[Encrypted message unavailable]';
+    
+    if (!hasLocalEnvelope) {
+      if (resolvedData.containsKey('e2eeDeviceEnvelopes') && 
+          resolvedData['e2eeDeviceEnvelopes'] != null) {
+        return '[Encrypted message unavailable]';
+      } else if (senderId == uid) {
+        return '[Encrypted message unavailable]';
+      }
     }
 
     try {
@@ -508,9 +578,11 @@ class ChatEncryptionRepository {
 
       if (allowRepair && _canAttemptRepair(senderId)) {
         try {
-          // Delete any broken local session so _ensureSignalContext can rebuild
-          // cleanly. With containsSession = false, the next PreKeyMessage from
-          // the sender will properly establish the receive-side session state.
+          // Delete the broken session so the next PreKeyMessage from the sender
+          // automatically re-establishes the receive-side session. Signal's
+          // Double Ratchet binds each ciphertext to a specific ratchet state —
+          // re-decrypting an old ciphertext with a new session is impossible and
+          // always throws, so we stop after clearing the stale state.
           final repairStore = await _keyManagementService.getStore(currentUserId);
           final repairAddress = ProtocolAddress(
             name: senderId,
@@ -518,37 +590,13 @@ class ChatEncryptionRepository {
           );
           await repairStore.deleteSession(repairAddress);
           _keyManagementService.invalidateBundleCache(senderId);
-          final context = await _ensureSignalContext(senderId);
-          final cipher = _buildCipher(context.store);
-          final ciphertext = Uint8List.fromList(
-            base64Decode(resolvedData['cipherText']?.toString() ?? ''),
+          debugPrint(
+            '[SignalRepo] Repair: deleted stale session for sender=$senderId '
+            'device=${repairAddress.deviceId()} — next PreKeyMessage will re-establish.',
           );
-          final messageType =
-              (resolvedData['e2eeMessageType'] as num?)?.toInt() ?? 3;
-          final decrypted = await cipher.decrypt(
-            ProtocolAddress(
-              name: senderId,
-              deviceId:
-                  (resolvedData['senderSignalDeviceId'] as num?)?.toInt() ??
-                      context.bundle.signalDeviceId,
-            ),
-            CiphertextMessage.fromRaw(
-              messageType: messageType,
-              ciphertext: ciphertext,
-            ),
-          );
-          final plaintext = utf8.decode(decrypted);
-          await _cacheIncomingPlaintext(
-            cacheKey: cacheKey,
-            messageId: resolvedData['messageId']?.toString(),
-            clientMessageId: resolvedData['clientMessageId']?.toString(),
-            senderId: senderId,
-            receiverId: receiverId,
-            plaintext: plaintext,
-            messageType: 'text',
-          );
-          return plaintext;
-        } catch (_) {}
+        } catch (repairError) {
+          debugPrint('[SignalRepo] Repair: session delete failed sender=$senderId error=$repairError');
+        }
       }
 
       return '[Encrypted message unavailable]';
@@ -556,6 +604,21 @@ class ChatEncryptionRepository {
   }
 
   Future<Uint8List> decryptBytesMessage({
+    required Map<String, dynamic> data,
+    required List<int> cipherBytes,
+    bool allowRepair = false,
+  }) async {
+    final peerLockId = data['senderId']?.toString() ?? '';
+    return _withSessionLock(peerLockId, () async {
+      return await _decryptBytesMessageInternal(
+        data: data,
+        cipherBytes: cipherBytes,
+        allowRepair: allowRepair,
+      );
+    });
+  }
+
+  Future<Uint8List> _decryptBytesMessageInternal({
     required Map<String, dynamic> data,
     required List<int> cipherBytes,
     bool allowRepair = false,
@@ -739,13 +802,69 @@ class ChatEncryptionRepository {
       decryptedText: trimmedPlaintext,
       previewText: trimmedPlaintext,
       decryptionStatus: ConversationDecryptionStatus.success,
-      failureReason: null,
+      failureReason: null, // This marks it as "sent"
       timestamp: DateTime.fromMillisecondsSinceEpoch(resolvedTimestampMs),
       isOutgoing: senderId.trim() == uid,
       isDeleted: false,
       isSuspicious: false,
     );
     await _persistProjection(projection);
+  }
+
+  Future<String> createPendingOutgoingMessageProjection({
+    required String conversationId,
+    required String receiverId,
+    required String plaintext,
+    required String messageType,
+  }) async {
+    final uid = currentUserId;
+    if (uid.isEmpty) {
+      throw Exception('No user');
+    }
+    final clientMessageId = _uuid.v4();
+    final now = DateTime.now();
+    final projection = DecryptedConversationMessage(
+      conversationId: conversationId,
+      messageKey: clientMessageId, // Use clientMessageId as a temporary key
+      messageId: null, // Not yet on server
+      clientMessageId: clientMessageId,
+      senderId: uid,
+      receiverId: receiverId,
+      messageType: messageType,
+      algorithm: null,
+      cipherTextPresent: false,
+      decryptedText: plaintext,
+      previewText: plaintext,
+      decryptionStatus: ConversationDecryptionStatus.success,
+      failureReason: 'sending...', // Use this field to indicate status
+      timestamp: now,
+      isOutgoing: true,
+      isDeleted: false,
+      isSuspicious: false,
+    );
+    await _persistProjection(projection);
+    await _emitConversationFromCache(conversationId);
+    return clientMessageId;
+  }
+
+  Future<void> failOutgoingMessageProjection({
+    required String clientMessageId,
+    required String conversationId,
+    required String reason,
+  }) async {
+    final uid = currentUserId;
+    if (uid.isEmpty) return;
+
+    // Just update the status in the DB.
+    // This assumes your cache service can update a single field.
+    await _cacheService.updateMessageProjectionStatus(
+      userId: uid,
+      clientMessageId: clientMessageId,
+      updates: {
+        'failure_reason': reason,
+      },
+    );
+    await _emitConversationFromCache(conversationId);
   }
 
   Future<void> cacheOutgoingMediaBytes({
@@ -937,7 +1056,7 @@ class ChatEncryptionRepository {
     if (cachedPlaintext != null && cachedPlaintext.trim().isNotEmpty) {
       final resolvedSuspicious = senderId != uid
           ? await _detectIncoming(messageId, cachedPlaintext, senderId,
-              fallback: isSuspicious)
+              fallback: false) // E2EE Zero-Trust: Do not trust server flags for incoming
           : isSuspicious;
       final projection = DecryptedConversationMessage(
         conversationId: conversationId,
@@ -985,7 +1104,7 @@ class ChatEncryptionRepository {
     if (decryptedText != null && decryptedText.trim().isNotEmpty) {
       final resolvedSuspicious = senderId != uid
           ? await _detectIncoming(messageId, decryptedText, senderId,
-              fallback: isSuspicious)
+              fallback: false) // E2EE Zero-Trust: Receiver scans locally after decryption
           : isSuspicious;
       final projection = DecryptedConversationMessage(
         conversationId: conversationId,
@@ -1029,7 +1148,7 @@ class ChatEncryptionRepository {
       timestamp: timestamp,
       isOutgoing: senderId == uid,
       isDeleted: false,
-      isSuspicious: isSuspicious,
+      isSuspicious: senderId == uid ? isSuspicious : false, // Un-decryptable incoming is not marked suspicious
     );
     await _persistProjection(projection);
     return projection;
@@ -1048,10 +1167,8 @@ class ChatEncryptionRepository {
       return _detectionCache[messageId]!;
     }
     try {
-      final result = await _aiDetectionService.detectSmishing(
-        plaintext,
-        sender: senderId,
-      );
+      // Execute the ML Pipeline locally (Layer 1 Heuristics -> Layer 2 DistilBERT)
+      final result = await _smishingDetector.analyzeMessage(plaintext);
       _detectionCache[messageId] = result;
       return result;
     } catch (e) {
@@ -1095,8 +1212,12 @@ class ChatEncryptionRepository {
     }
 
     final future = () async {
-      await ensureReady();
-      await _ensureSignalContext(trimmedPeerUserId);
+      try {
+        await ensureReady();
+        await _ensureSignalContext(trimmedPeerUserId);
+      } catch (e) {
+        debugPrint('[ChatEncryptRepo] Signal prewarm failed (non-fatal): $e');
+      }
     }();
     _conversationPrewarmFutures[trimmedPeerUserId] = future;
     try {
@@ -1129,15 +1250,8 @@ class ChatEncryptionRepository {
 
     final orderedDocs =
         List<QueryDocumentSnapshot<Map<String, dynamic>>>.from(docs);
-    final latestDoc = orderedDocs.first;
-    final cachedRows = await _cacheService.readConversationMessages(
-      userId: currentUserId,
-      conversationId: conversationId,
-    );
-    final cachedIndexes = _buildProjectionRowIndexes(cachedRows);
 
     if (docChanges == null) {
-      final generation = _nextConversationHydrationGeneration(conversationId);
       final newestDocs = orderedDocs.take(20).toList(growable: false);
       final olderDocs = orderedDocs.skip(20).toList(growable: false);
 
@@ -1145,7 +1259,6 @@ class ChatEncryptionRepository {
         conversationId: conversationId,
         otherUserId: otherUserId,
         docs: newestDocs,
-        cachedIndexes: cachedIndexes,
       );
       if (warmedNewest) {
         await _emitConversationFromCache(conversationId);
@@ -1154,7 +1267,7 @@ class ChatEncryptionRepository {
       await _syncLatestPreviewFromDoc(
         conversationId: conversationId,
         otherUserId: otherUserId,
-        latestDoc: latestDoc,
+        latestDoc: orderedDocs.first,
       );
 
       if (olderDocs.isNotEmpty) {
@@ -1162,8 +1275,6 @@ class ChatEncryptionRepository {
           conversationId: conversationId,
           otherUserId: otherUserId,
           docs: olderDocs,
-          cachedIndexes: cachedIndexes,
-          generation: generation,
         );
       }
       return;
@@ -1188,22 +1299,21 @@ class ChatEncryptionRepository {
       conversationId: conversationId,
       otherUserId: otherUserId,
       docs: changedDocs,
-      cachedIndexes: cachedIndexes,
     );
     if (processedAny) {
       await _emitConversationFromCache(conversationId);
     }
 
-    final currentLatestIdentity = _messageIdentityFromDoc(latestDoc);
+    final currentLatestIdentity = _messageIdentityFromDoc(orderedDocs.first);
     final shouldRefreshLatestPreview = currentLatestIdentity !=
             (_latestPreviewMessageIds[conversationId] ?? '') ||
-        docChanges.any((change) => change.doc.id == latestDoc.id) ||
+        docChanges.any((change) => change.doc.id == orderedDocs.first.id) ||
         docChanges.any((change) => change.type == DocumentChangeType.removed);
     if (shouldRefreshLatestPreview) {
       await _syncLatestPreviewFromDoc(
         conversationId: conversationId,
         otherUserId: otherUserId,
-        latestDoc: latestDoc,
+        latestDoc: orderedDocs.first,
       );
     }
   }
@@ -1212,33 +1322,23 @@ class ChatEncryptionRepository {
     required String conversationId,
     required String otherUserId,
     required List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-    required _ProjectionRowIndexes cachedIndexes,
-    required int generation,
   }) async {
     if (docs.isEmpty) return;
 
     for (var i = 0; i < docs.length; i += 20) {
-      if ((_conversationHydrationGenerations[conversationId] ?? -1) !=
-          generation) {
-        return;
-      }
       final batch = docs.skip(i).take(20).toList(growable: false);
       final processedAny = await _processConversationDocs(
         conversationId: conversationId,
         otherUserId: otherUserId,
         docs: batch,
-        cachedIndexes: cachedIndexes,
       );
       if (processedAny) {
         await _emitConversationFromCache(conversationId);
       }
-      await Future<void>.delayed(Duration.zero);
+      // YIELD: Give the UI 15ms to render frames so scrolling stays buttery smooth
+      await Future<void>.delayed(const Duration(milliseconds: 15));
     }
 
-    if ((_conversationHydrationGenerations[conversationId] ?? -1) !=
-        generation) {
-      return;
-    }
     await _emitConversationFromCache(conversationId);
   }
 
@@ -1246,7 +1346,6 @@ class ChatEncryptionRepository {
     required String conversationId,
     required String otherUserId,
     required List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-    required _ProjectionRowIndexes cachedIndexes,
   }) async {
     if (docs.isEmpty) {
       return false;
@@ -1254,6 +1353,9 @@ class ChatEncryptionRepository {
 
     var processedAny = false;
     for (final doc in docs) {
+      // YIELD: Prevent UI freezing during heavy libsignal decryption math
+      await Future<void>.delayed(const Duration(milliseconds: 4));
+
       final rawData = Map<String, dynamic>.from(doc.data())
         ..putIfAbsent('messageId', () => doc.id);
       final normalized = _normalizeRemoteMessage(
@@ -1261,14 +1363,6 @@ class ChatEncryptionRepository {
         messageId: doc.id,
         otherUserId: otherUserId,
       );
-      if (_hasReusableSuccessfulProjection(
-        docId: doc.id,
-        normalized: normalized,
-        cachedIndexes: cachedIndexes,
-      )) {
-        continue;
-      }
-
       await mapRemoteMessage(
         conversationId: conversationId,
         messageId: doc.id,
@@ -1889,12 +1983,17 @@ class ChatEncryptionRepository {
     final pending = _pendingContextBuilds[peerUserId];
     if (pending != null) return pending;
 
-    final future = _doEnsureSignalContexts(
-      peerUserId,
-      excludedDeviceDocIds: excludedDeviceDocIds,
-    );
+    final future = () async {
+      try {
+        return await _doEnsureSignalContexts(
+          peerUserId,
+          excludedDeviceDocIds: excludedDeviceDocIds,
+        );
+      } finally {
+        _pendingContextBuilds.remove(peerUserId);
+      }
+    }();
     _pendingContextBuilds[peerUserId] = future;
-    future.whenComplete(() => _pendingContextBuilds.remove(peerUserId));
     return future;
   }
 
@@ -1952,13 +2051,24 @@ class ChatEncryptionRepository {
                 consumeOneTimePreKey: true,
               ) ??
               liveBundle;
+          final PreKeyBundle signalBundle;
+          try {
+            signalBundle = liveBundle.toSignalPreKeyBundle();
+          } catch (bundleError) {
+            debugPrint(
+              '[SignalRepo] Bundle construction failed peer=$peerUserId '
+              'device=${liveBundle.signalDeviceId} error=$bundleError — skipping device',
+            );
+            _sessionRebuildDebounce.remove(debounceKey);
+            continue;
+          }
           final sessionBuilder = SessionBuilder(
             sessionStore: store,
             identityKeyStore: store,
           );
           await sessionBuilder.processPreKeyBundle(
             liveBundle.toProtocolAddress(),
-            liveBundle.toSignalPreKeyBundle(),
+            signalBundle,
           );
           debugPrint(
             '[SignalRepo] Session ready peer=$peerUserId '

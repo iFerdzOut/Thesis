@@ -1,8 +1,9 @@
 // ignore_for_file: avoid_print
 
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
+import '../generated/dataconnect/smishing_shield_connector.dart';
+import '../feedback_local_db.dart';
 import 'feedback_consent_service.dart';
 
 /// FeedbackDatabaseService
@@ -10,8 +11,8 @@ import 'feedback_consent_service.dart';
 /// Collects false positives and false negatives for future
 /// DistilBERT model retraining — this is the thesis novelty.
 ///
-/// Data is uploaded directly to Firestore under `model_feedback`
-/// for thesis evaluation and retraining support.
+/// Rule 4: Data is buffered in encrypted SQLite first, then manually 
+/// synced anonymously to PostgreSQL via Firebase Data Connect.
 ///
 /// False Positive = AI flagged as smishing BUT user says it's safe
 /// False Negative = AI missed it BUT user says it's smishing
@@ -21,11 +22,9 @@ import 'feedback_consent_service.dart';
 /// - User can delete their own feedback
 /// - Data is anonymized before global collection
 class FeedbackDatabaseService {
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
   String get _uid => _auth.currentUser?.uid ?? '';
-  String get _userHash => _uid.hashCode.toRadixString(16);
 
   // ══════════════════════════════════════════════════════════════════════
   // SAVE FEEDBACK
@@ -48,7 +47,7 @@ class FeedbackDatabaseService {
       sender: sender,
     );
 
-    await _saveDirectlyToModelFeedback(data);
+    await _bufferFeedbackLocally(data);
 
     print('[FeedbackDB] False positive saved for retraining');
   }
@@ -70,7 +69,7 @@ class FeedbackDatabaseService {
       sender: sender,
     );
 
-    await _saveDirectlyToModelFeedback(data);
+    await _bufferFeedbackLocally(data);
 
     print('[FeedbackDB] False negative saved for retraining');
   }
@@ -92,64 +91,46 @@ class FeedbackDatabaseService {
       sender: sender,
     );
 
-    await _saveDirectlyToModelFeedback(data);
+    await _bufferFeedbackLocally(data);
 
     print('[FeedbackDB] Confirmed smishing saved');
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // READ FEEDBACK
+  // POSTGRESQL SYNC LOOP (Rule 4)
   // ══════════════════════════════════════════════════════════════════════
 
-  /// Stream all feedback entries for the current user
-  Stream<QuerySnapshot> getUserFeedback() {
-    if (_uid.isEmpty) return const Stream.empty();
-    return _firestore
-        .collection('model_feedback')
-        .where('userHash', isEqualTo: _userHash)
-        .snapshots();
-  }
+  /// Manually triggered by the user to push local buffer to Postgres.
+  /// Wipes SQLite rows upon a successful 200 OK.
+  Future<void> syncFeedbackToPostgres() async {
+    final unsynced = await FeedbackLocalDb.getUnsyncedFeedback();
+    if (unsynced.isEmpty) return;
 
-  /// Get feedback count by label
-  Future<Map<String, int>> getFeedbackStats() async {
-    if (_uid.isEmpty) return {};
+    List<int> successfulIds = [];
 
-    final snapshot = await _firestore
-        .collection('model_feedback')
-        .where('userHash', isEqualTo: _userHash)
-        .get();
-
-    final stats = <String, int>{
-      'false_positive': 0,
-      'false_negative': 0,
-      'confirmed_smishing': 0,
-    };
-
-    for (final doc in snapshot.docs) {
-      final label = doc.data()['label'] as String? ?? '';
-      if (stats.containsKey(label)) {
-        stats[label] = stats[label]! + 1;
+    for (final row in unsynced) {
+      try {
+        // Execute the strongly-typed GraphQL mutation via generated Dart SDK.
+        await SmishingShieldConnectorConnector.instance.insertModelFeedback(
+          label: row['label'] as String,
+          aiPrediction: row['aiPrediction'] as String,
+          userCorrection: row['userCorrection'] as String,
+          source: row['source'] as String,
+          senderType: row['senderType'] as String,
+          messageSanitized: row['messageSanitized'] as String,
+          messageLength: row['messageLength'] as int,
+          hasUrl: row['hasUrl'] == 1,
+          appVersion: row['appVersion'] as String,
+        ).execute();
+        successfulIds.add(row['id'] as int);
+      } catch (e) {
+        print('[FeedbackDB] Failed to sync row ${row['id']}: $e');
       }
     }
 
-    return stats;
-  }
-
-  /// Delete a feedback entry
-  Future<void> deleteFeedback(String docId) async {
-    if (_uid.isEmpty) return;
-    await _firestore.collection('model_feedback').doc(docId).delete();
-  }
-
-  /// Get global feedback count (for dashboard)
-  Future<int> getGlobalFeedbackCount() async {
-    try {
-      final snapshot =
-          await _firestore.collection('model_feedback').count().get();
-      return snapshot.count ?? 0;
-    } catch (e) {
-      return 0;
-    }
+    // Rule 4: Wipe SQLite rows on successful upload
+    await FeedbackLocalDb.deleteFeedbackBatch(successfulIds);
+    print('[FeedbackDB] Successfully synced ${successfulIds.length} feedback items to PostgreSQL.');
   }
 
   // ══════════════════════════════════════════════════════════════════════
@@ -171,42 +152,26 @@ class FeedbackDatabaseService {
       'source': source,
       // Anonymize sender — only keep type (number/shortcode/unknown)
       'senderType': _categorizeSender(sender ?? ''),
-      // Store message for retraining
-      'message': message,
       'messageSanitized': _sanitizeMessage(message),
       'messageLength': message.length,
       'hasUrl': message.contains('http') ||
           message.contains('www.') ||
           message.contains('.com') ||
           message.contains('.ph'),
-      'reportedAt': FieldValue.serverTimestamp(),
       'appVersion': '1.0.0',
     };
   }
 
-  /// Save anonymized feedback directly to model_feedback.
-  /// No raw sender or raw personal identifiers are stored.
-  Future<void> _saveDirectlyToModelFeedback(Map<String, dynamic> data) async {
+  /// Buffers feedback locally in SQLCipher
+  Future<void> _bufferFeedbackLocally(Map<String, dynamic> data) async {
     try {
-      final sanitizedMessage =
-          data['messageSanitized']?.toString().trim().isNotEmpty == true
-              ? data['messageSanitized'].toString().trim()
-              : _sanitizeMessage(data['message']?.toString() ?? '');
+      // Enforce zero raw PII before local storage
+      data.remove('message');
+      data.remove('sender');
 
-      // Remove any potentially identifying info before global save
-      final anonymized = Map<String, dynamic>.from(data)
-        ..remove('sender')
-        ..remove('message')
-        ..remove('messageSanitized');
-
-      await _firestore.collection('model_feedback').add({
-        ...anonymized,
-        'messageSanitized': sanitizedMessage,
-        'uploadMode': 'direct_report',
-        'userHash': _userHash,
-      });
+      await FeedbackLocalDb.insertFeedback(data);
     } catch (e) {
-      print('[FeedbackDB] Global save error: $e');
+      print('[FeedbackDB] Local SQLite buffer error: $e');
     }
   }
 

@@ -91,8 +91,11 @@ class MessageScreeningService {
     'NOREPLYMAYA',
   };
 
+  bool _repositoryReady = false;
+
   Future<void> warmUp() async {
     await _repository.initialize();
+    _repositoryReady = true;
     await _trustedDomainService.initialize();
   }
 
@@ -106,7 +109,10 @@ class MessageScreeningService {
     ScreenedMessageModel message, {
     bool forceRescore = false,
   }) async {
-    await _repository.initialize();
+    if (!_repositoryReady) {
+      await _repository.initialize();
+      _repositoryReady = true;
+    }
     final String body = message.body.trim();
     final double warningThreshold = await _riskScoringService.warningThreshold;
     final double quarantineThreshold =

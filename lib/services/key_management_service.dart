@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
@@ -41,12 +40,13 @@ class KeyManagementService {
   final Map<String, List<PreKeyBundleModel>> _bundleCache =
       <String, List<PreKeyBundleModel>>{};
   final Map<String, DateTime> _bundleCacheTime = <String, DateTime>{};
-  static const Duration _bundleCacheTtl = Duration(seconds: 30);
+  static const Duration _bundleCacheTtl = Duration(seconds: 5);
 
   static const int _defaultSignalDeviceId = 1;
   static const int _protocolVersion = 2;
   static const int _preKeyBatchSize = 40;
   static const int _preKeyRefillThreshold = 20;
+  static const int _signedPreKeyRotationDays = 15;
 
   String get currentUserId => _auth.currentUser?.uid ?? '';
 
@@ -81,9 +81,14 @@ class KeyManagementService {
     if (!forceRepublish) {
       final pending = _pendingEnsureIdentity[uid];
       if (pending != null) return pending;
-      final future = _doEnsureDeviceIdentity(uid: uid);
+      final future = () async {
+        try {
+          await _doEnsureDeviceIdentity(uid: uid);
+        } finally {
+          _pendingEnsureIdentity.remove(uid);
+        }
+      }();
       _pendingEnsureIdentity[uid] = future;
-      future.whenComplete(() => _pendingEnsureIdentity.remove(uid));
       return future;
     }
 
@@ -94,29 +99,24 @@ class KeyManagementService {
     required String uid,
     bool forceRepublish = false,
   }) async {
-    // FIX: The original guard skipped _publishPublicBundle entirely when
-    // _initializedUserId == uid. This meant if the app went offline during
-    // bootstrap and the device doc was never written to Firestore, the in-memory
-    // marker would be set but the peer would never find an active device doc,
-    // causing "Recipient has not enabled secure messaging yet" on every send.
-    // Now we always verify the Firestore doc exists before trusting the marker.
-    if (!forceRepublish && _initializedUserId == uid) {
+    var requiresRepublish = forceRepublish;
+
+    if (!requiresRepublish && _initializedUserId == uid) {
       final hasDoc = await hasActiveDeviceDocuments(uid);
-      if (hasDoc) {
-        await _refillPreKeysIfNeeded(uid);
-        return;
+      if (!hasDoc) {
+        debugPrint(
+          '[KeyMgmt] In-memory marker set for $uid but no active Firestore '
+          'device doc found — republishing bundle.',
+        );
+        requiresRepublish = true;
       }
-      // Doc is missing — fall through to republish.
-      debugPrint(
-        '[KeyMgmt] In-memory marker set for $uid but no active Firestore '
-        'device doc found — republishing bundle.',
-      );
     }
 
     var identityRow = await _cacheService.readIdentity(uid);
+    IdentityKeyPair identityKeyPair;
+
     if (identityRow == null) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      final identityKeyPair = IdentityKeyPair.generate();
+      identityKeyPair = IdentityKeyPair.generate();
       final registrationId = 1 + _random.nextInt(16380);
       final deviceDocId = _uuid.v4();
       final signalDeviceId = await _reserveUniqueSignalDeviceId(uid);
@@ -131,20 +131,40 @@ class KeyManagementService {
       if (identityRow == null) {
         throw Exception('Failed to persist Signal identity.');
       }
-      await _ensureSignedPreKey(uid, identityKeyPair, nowMs: now);
-      await _ensureKyberPreKey(uid, identityKeyPair, nowMs: now);
-      await _refillPreKeysIfNeeded(uid, identityKeyPair: identityKeyPair);
+      requiresRepublish = true;
     } else {
       identityRow = await _repairIdentityBindingIfNeeded(uid, identityRow);
-      final identityKeyPair = IdentityKeyPair.deserialize(
+      identityKeyPair = IdentityKeyPair.deserialize(
         bytes: _blob(identityRow['identity_key_pair']).toList(),
       );
-      await _ensureSignedPreKey(uid, identityKeyPair);
-      await _ensureKyberPreKey(uid, identityKeyPair);
-      await _refillPreKeysIfNeeded(uid, identityKeyPair: identityKeyPair);
     }
 
-    await _publishPublicBundle(uid);
+    final currentDeviceDocId = identityRow['device_doc_id']?.toString().trim() ?? '';
+    if (currentDeviceDocId.isEmpty) {
+      throw Exception('Device document ID is missing after identity initialization.');
+    }
+
+    // PERF: Stale device cleanup is now handled only within _publishPublicBundle
+    // to avoid running a Firestore query on every single message send.
+    // await _cleanupStaleDeviceDocuments(uid, currentDeviceDocId);
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final rotatedSigned = await _ensureSignedPreKey(uid, identityKeyPair, nowMs: nowMs);
+    final rotatedKyber = await _ensureKyberPreKey(uid, identityKeyPair, nowMs: nowMs);
+
+    if (rotatedSigned || rotatedKyber) {
+      requiresRepublish = true;
+    }
+
+    await _refillPreKeysIfNeeded(uid);
+
+    if (requiresRepublish) {
+      await _publishPublicBundle(uid);
+    } else {
+      // Flush newly minted One-Time Pre-Keys if we skipped the full republish
+      await _uploadPendingPreKeys(uid);
+    }
+
     _initializedUserId = uid;
   }
 
@@ -270,17 +290,17 @@ class KeyManagementService {
         final bMs = _timestampMs(b.data()['updatedAt']);
         return bMs.compareTo(aMs);
       });
-    final bundles = <PreKeyBundleModel>[];
-    for (final deviceDoc in deviceDocs) {
-      final bundle = await _bundleForDeviceDoc(
-        peerUserId: peerUserId,
-        deviceDoc: deviceDoc,
-        consumeOneTimePreKey: consumeOneTimePreKey,
-      );
-      if (bundle != null) {
-        bundles.add(bundle);
-      }
-    }
+
+    // FIX: Run all bundle fetches (and OTK consumption transactions) concurrently 
+    // rather than sequentially. This drastically reduces network wait time.
+    final bundleFutures = deviceDocs.map((deviceDoc) => _bundleForDeviceDoc(
+          peerUserId: peerUserId,
+          deviceDoc: deviceDoc,
+          consumeOneTimePreKey: consumeOneTimePreKey,
+        ));
+    final fetchedBundles = await Future.wait(bundleFutures);
+    final bundles = fetchedBundles.whereType<PreKeyBundleModel>().toList();
+
     // Cache peek-only results so repeated sends skip the Firestore read.
     if (!consumeOneTimePreKey && bundles.isNotEmpty) {
       _bundleCache[peerUserId] = bundles;
@@ -709,17 +729,29 @@ class KeyManagementService {
     return null;
   }
 
-  Future<void> _ensureSignedPreKey(
+  Future<bool> _ensureSignedPreKey(
     String uid,
     IdentityKeyPair identityKeyPair, {
     int? nowMs,
   }) async {
     final store = await getStore(uid);
     final existing = await store.getAllSignedPreKeyIds();
+    
+    int nextId = 1;
     if (existing.isNotEmpty) {
-      return;
+      final latestId = existing.reduce(max);
+      final latestRecord = await store.loadSignedPreKey(latestId);
+      if (latestRecord != null) {
+        final timestampMs = latestRecord.timestamp().toInt();
+        final age = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
+        if (age.inDays < _signedPreKeyRotationDays) {
+          return false; // Current Signed Pre-Key is still fresh
+        }
+        debugPrint('[KeyMgmt] Rotating Signed Pre-Key for $uid (age: ${age.inDays} days)');
+      }
+      nextId = latestId + 1;
     }
-    const int id = 1;
+    
     final privateKey = PrivateKey.generate();
     final publicKey = privateKey.getPublicKey();
     final identityPrivate = PrivateKey.deserialize(
@@ -729,26 +761,37 @@ class KeyManagementService {
       message: publicKey.serialize().toList(),
     );
     final record = SignedPreKeyRecord(
-      id: id,
+      id: nextId,
       timestamp: BigInt.from(nowMs ?? DateTime.now().millisecondsSinceEpoch),
       publicKey: publicKey,
       privateKey: privateKey,
       signature: signature,
     );
-    await store.storeSignedPreKey(id, record);
+    await store.storeSignedPreKey(nextId, record);
+    return true;
   }
 
-  Future<void> _ensureKyberPreKey(
+  Future<bool> _ensureKyberPreKey(
     String uid,
     IdentityKeyPair identityKeyPair, {
     int? nowMs,
   }) async {
     final store = await getStore(uid);
     final existing = await store.getAllKyberPreKeyIds();
+    
+    int nextId = 1;
     if (existing.isNotEmpty) {
-      return;
+      final latestId = existing.reduce(max);
+      final latestRecord = await store.loadKyberPreKey(latestId);
+      if (latestRecord != null) {
+        final timestampMs = latestRecord.timestamp().toInt();
+        final age = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
+        if (age.inDays < _signedPreKeyRotationDays) {
+          return false; // Current Kyber Pre-Key is still fresh
+        }
+      }
+      nextId = latestId + 1;
     }
-    const int id = 1;
     final keyPair = KyberKeyPair.generate();
     final identityPrivate = PrivateKey.deserialize(
       bytes: identityKeyPair.privateKey.toList(),
@@ -757,18 +800,16 @@ class KeyManagementService {
       message: keyPair.getPublicKey().serialize().toList(),
     );
     final record = KyberPreKeyRecord.create(
-      id: id,
+      id: nextId,
       timestamp: BigInt.from(nowMs ?? DateTime.now().millisecondsSinceEpoch),
       keyPair: keyPair,
       signature: signature,
     );
-    await store.storeKyberPreKey(id, record);
+    await store.storeKyberPreKey(nextId, record);
+    return true;
   }
 
-  Future<void> _refillPreKeysIfNeeded(
-    String uid, {
-    IdentityKeyPair? identityKeyPair,
-  }) async {
+  Future<void> _refillPreKeysIfNeeded(String uid) async {
     final store = await getStore(uid);
     final existingIds = await store.getAllPreKeyIds();
     if (existingIds.length >= _preKeyRefillThreshold) {
@@ -776,8 +817,6 @@ class KeyManagementService {
     }
 
     final startingId = existingIds.isEmpty ? 1 : existingIds.reduce(max) + 1;
-    final identity = identityKeyPair ?? await store.getIdentityKeyPair();
-    final now = DateTime.now().millisecondsSinceEpoch;
 
     for (var offset = 0; offset < _preKeyBatchSize; offset++) {
       final preKeyId = startingId + offset;
@@ -794,13 +833,6 @@ class KeyManagementService {
         uploaded: false,
       );
     }
-
-    await _ensureSignedPreKey(uid, identity, nowMs: now);
-    await _ensureKyberPreKey(uid, identity, nowMs: now);
-
-    // FIX: push newly generated OTKs to Firestore immediately so peers can
-    // start new sessions without waiting for the next ensureDeviceIdentity call.
-    await _uploadPendingPreKeys(uid);
   }
 
   int _timestampMs(dynamic value) {

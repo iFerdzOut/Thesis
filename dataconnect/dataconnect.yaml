@@ -1,0 +1,12 @@
+specVersion: "v1"
+serviceId: "thesis"
+location: "asia-southeast1"
+schemaValidation: "COMPATIBLE"
+schema:
+  source: "./schema"
+  datasource:
+    postgresql:
+      database: "fdcdb"
+      cloudSql:
+        instanceId: "thesis-fdc"
+connectorDirs: ["./connector"]

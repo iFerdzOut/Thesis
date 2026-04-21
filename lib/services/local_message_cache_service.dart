@@ -22,6 +22,9 @@ class LocalMessageCacheService {
   Future<Database>? _databaseFuture;
   static const int _schemaVersion = 3;
 
+  final Map<String, Uint8List> _sessionCache = <String, Uint8List>{};
+  final Map<String, Uint8List> _remoteIdentityCache = <String, Uint8List>{};
+
   Future<void> initialize() async {
     await _openDatabase();
   }
@@ -365,6 +368,8 @@ class LocalMessageCacheService {
     required int signalDeviceId,
     required Uint8List identityKey,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    _remoteIdentityCache[cacheKey] = identityKey;
     final db = await _openDatabase();
     await db.insert(
       'remote_identities',
@@ -384,6 +389,10 @@ class LocalMessageCacheService {
     required String peerUid,
     required int signalDeviceId,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    if (_remoteIdentityCache.containsKey(cacheKey)) {
+      return _remoteIdentityCache[cacheKey];
+    }
     final db = await _openDatabase();
     final rows = await db.query(
       'remote_identities',
@@ -394,9 +403,13 @@ class LocalMessageCacheService {
     );
     if (rows.isEmpty) return null;
     final raw = rows.first['identity_key'];
-    if (raw is Uint8List) return raw;
-    if (raw is List<int>) return Uint8List.fromList(raw);
-    return null;
+    Uint8List? result;
+    if (raw is Uint8List) {
+      result = raw;
+    } else if (raw is List<int>) result = Uint8List.fromList(raw);
+    
+    if (result != null) _remoteIdentityCache[cacheKey] = result;
+    return result;
   }
 
   Future<List<int>> readRemoteIdentityDeviceIds({
@@ -421,6 +434,8 @@ class LocalMessageCacheService {
     required int signalDeviceId,
     required Uint8List record,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    _sessionCache[cacheKey] = record;
     final db = await _openDatabase();
     await db.insert(
       'sessions',
@@ -440,6 +455,10 @@ class LocalMessageCacheService {
     required String peerUid,
     required int signalDeviceId,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    if (_sessionCache.containsKey(cacheKey)) {
+      return _sessionCache[cacheKey];
+    }
     final db = await _openDatabase();
     final rows = await db.query(
       'sessions',
@@ -450,9 +469,13 @@ class LocalMessageCacheService {
     );
     if (rows.isEmpty) return null;
     final raw = rows.first['record'];
-    if (raw is Uint8List) return raw;
-    if (raw is List<int>) return Uint8List.fromList(raw);
-    return null;
+    Uint8List? result;
+    if (raw is Uint8List) {
+      result = raw;
+    } else if (raw is List<int>) result = Uint8List.fromList(raw);
+    
+    if (result != null) _sessionCache[cacheKey] = result;
+    return result;
   }
 
   Future<bool> containsSession({
@@ -460,6 +483,10 @@ class LocalMessageCacheService {
     required String peerUid,
     required int signalDeviceId,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    if (_sessionCache.containsKey(cacheKey)) {
+      return true;
+    }
     final db = await _openDatabase();
     final rows = await db.query(
       'sessions',
@@ -476,6 +503,8 @@ class LocalMessageCacheService {
     required String peerUid,
     required int signalDeviceId,
   }) async {
+    final cacheKey = '${userId}_${peerUid}_$signalDeviceId';
+    _sessionCache.remove(cacheKey);
     final db = await _openDatabase();
     await db.delete(
       'sessions',
@@ -488,6 +517,7 @@ class LocalMessageCacheService {
     required String userId,
     required String peerUid,
   }) async {
+    _sessionCache.removeWhere((k, _) => k.startsWith('${userId}_${peerUid}_'));
     final db = await _openDatabase();
     await db.delete(
       'sessions',
@@ -847,6 +877,23 @@ class LocalMessageCacheService {
     );
   }
 
+  Future<void> updateMessageProjectionStatus({
+    required String userId,
+    required String clientMessageId,
+    required Map<String, Object?> updates,
+  }) async {
+    final db = await _openDatabase();
+    final updateData = Map<String, Object?>.from(updates);
+    updateData['updated_at'] = DateTime.now().millisecondsSinceEpoch;
+
+    await db.update(
+      'decrypted_messages',
+      updateData,
+      where: 'user_id = ? AND client_message_id = ?',
+      whereArgs: [userId, clientMessageId],
+    );
+  }
+
   Future<void> saveDecryptedMedia({
     required String userId,
     required String messageKey,
@@ -874,7 +921,7 @@ class LocalMessageCacheService {
       messageKey: messageKey,
       fileName: fileName,
     );
-    await File(newPath).writeAsBytes(bytes, flush: true);
+    await File(newPath).writeAsBytes(bytes, flush: false);
     if (previousPath.isNotEmpty && previousPath != newPath) {
       try {
         final oldFile = File(previousPath);
@@ -1108,30 +1155,38 @@ class LocalMessageCacheService {
     String? clientMessageId,
   }) async {
     final db = await _openDatabase();
-    final clauses = <String>[];
-    final args = <Object?>[userId];
-    if (messageKey != null && messageKey.trim().isNotEmpty) {
-      clauses.add('message_key = ?');
-      args.add(messageKey.trim());
-    }
-    if (messageId != null && messageId.trim().isNotEmpty) {
-      clauses.add('message_id = ?');
-      args.add(messageId.trim());
-    }
-    if (clientMessageId != null && clientMessageId.trim().isNotEmpty) {
-      clauses.add('client_message_id = ?');
-      args.add(clientMessageId.trim());
-    }
-    if (clauses.isEmpty) return null;
 
-    final rows = await db.query(
-      'decrypted_messages',
-      where: 'user_id = ? AND (${clauses.join(' OR ')})',
-      whereArgs: args,
-      orderBy: 'updated_at DESC',
-      limit: 1,
-    );
-    return rows.isEmpty ? null : rows.first;
+    if (messageId != null && messageId.trim().isNotEmpty) {
+      final rows = await db.query(
+        'decrypted_messages',
+        where: 'user_id = ? AND message_id = ?',
+        whereArgs: [userId, messageId.trim()],
+        limit: 1,
+      );
+      if (rows.isNotEmpty) return rows.first;
+    }
+
+    if (clientMessageId != null && clientMessageId.trim().isNotEmpty) {
+      final rows = await db.query(
+        'decrypted_messages',
+        where: 'user_id = ? AND client_message_id = ?',
+        whereArgs: [userId, clientMessageId.trim()],
+        limit: 1,
+      );
+      if (rows.isNotEmpty) return rows.first;
+    }
+
+    if (messageKey != null && messageKey.trim().isNotEmpty) {
+      final rows = await db.query(
+        'decrypted_messages',
+        where: 'user_id = ? AND message_key = ?',
+        whereArgs: [userId, messageKey.trim()],
+        limit: 1,
+      );
+      if (rows.isNotEmpty) return rows.first;
+    }
+
+    return null;
   }
 
   Future<List<Map<String, dynamic>>> readConversationMessages({
@@ -1183,6 +1238,68 @@ class LocalMessageCacheService {
       limit: 1,
     );
     return rows.isEmpty ? null : rows.first;
+  }
+
+  Future<List<Map<String, dynamic>>> exportAllMessages(String userId) async {
+    final db = await _openDatabase();
+    final rows = await db.query(
+      'decrypted_messages',
+      where: 'user_id = ? AND is_deleted = 0',
+      whereArgs: [userId],
+      orderBy: 'message_timestamp_ms ASC',
+    );
+    return rows.map((row) {
+      final out = <String, dynamic>{};
+      for (final e in row.entries) {
+        out[e.key] = e.value;
+      }
+      return out;
+    }).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> exportAllMessagesSince(
+    String userId,
+    int sinceTimestampMs,
+  ) async {
+    final db = await _openDatabase();
+    final rows = await db.query(
+      'decrypted_messages',
+      where: 'user_id = ? AND is_deleted = 0 AND updated_at > ?',
+      whereArgs: [userId, sinceTimestampMs],
+      orderBy: 'updated_at ASC',
+    );
+    return rows.map((row) {
+      final out = <String, dynamic>{};
+      for (final e in row.entries) {
+        out[e.key] = e.value;
+      }
+      return out;
+    }).toList();
+  }
+
+  Future<void> importAllMessages(
+    String userId,
+    List<dynamic> rows,
+  ) async {
+    if (rows.isEmpty) return;
+    final db = await _openDatabase();
+    await db.transaction((txn) async {
+      for (final row in rows) {
+        if (row is! Map) continue;
+        final normalized = <String, Object?>{};
+        for (final e in row.entries) {
+          normalized[e.key.toString()] = e.value;
+        }
+        normalized['user_id'] = userId;
+        try {
+          await txn.insert(
+            'decrypted_messages',
+            normalized,
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+        } catch (_) {}
+      }
+    });
   }
 
   Future<Map<String, dynamic>> exportSignalState(String userId) async {
@@ -1248,6 +1365,9 @@ class LocalMessageCacheService {
     String userId,
     Map<String, dynamic> payload,
   ) async {
+    _sessionCache.clear();
+    _remoteIdentityCache.clear();
+
     final db = await _openDatabase();
 
     Future<Map<String, Object?>> decodeRow(Map<String, dynamic> row) async {

@@ -107,7 +107,7 @@ class SmishingModelService {
           }
         }
 
-        final options = InterpreterOptions()..threads = 1;
+        final options = InterpreterOptions()..threads = 2;
         _interpreter = await Interpreter.fromAsset(
           _modelAssetPath,
           options: options,

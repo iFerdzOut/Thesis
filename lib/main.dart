@@ -3,23 +3,30 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import 'firebase_options.dart';
 import 'screens/call_screen.dart';
 import 'screens/chat_screen.dart';
-import 'screens/contacts_screen.dart';
+import 'screens/friends_management_screen.dart';
 import 'screens/home_screen.dart';
 import 'services/auth_service.dart';
 import 'services/call_notification_service.dart';
 import 'services/chat_notification_service.dart';
 import 'services/e2ee_service.dart';
+import 'services/chat_encryption_repository.dart';
 import 'services/fcm_call_service.dart';
 import 'services/fcm_chat_service.dart';
+import 'services/message_screening_service.dart';
 import 'services/friend_request_notification_service.dart';
 import 'services/session_identity_service.dart';
 import 'services/sms_service.dart';
+import 'services/sms_background_worker.dart';
+import 'widgets/secure_backup_gate.dart';
 
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -45,7 +52,15 @@ Future<void> main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
+  // Activate App Check with Play Integrity as per the Master Blueprint
+  await FirebaseAppCheck.instance.activate(
+    androidProvider: kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+  );
+
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  // Rule 3: Initialize SMS background batching
+  SmsBackgroundWorker.initialize();
 
   runApp(const SmishingShieldApp());
 }
@@ -527,13 +542,13 @@ class _AuthGateState extends State<AuthGate> {
         .whenComplete(() => _activeChatRouteKeys.remove(chatId));
   }
 
-  void _openContactsScreenFromFriendRequest() {
+  void _openFriendsScreenFromFriendRequest() {
     final navigator = appNavigatorKey.currentState;
     if (navigator == null) return;
 
     navigator.push(
       MaterialPageRoute(
-        builder: (_) => const ContactsScreen(initialTabIndex: 1),
+        builder: (_) => const FriendsManagementScreen(initialTabIndex: 2),
       ),
     );
   }
@@ -578,6 +593,8 @@ class _AuthGateState extends State<AuthGate> {
     if (_callServicesStarted) return;
     _callServicesStarted = true;
 
+    // Phase 1 (next frame): lightweight native-handler wiring only — no I/O,
+    // no DB, no network. Keeps the first rendered frame fast.
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted || !_callServicesStarted) return;
       debugPrint('[AuthGate] Starting Call Services...');
@@ -624,6 +641,25 @@ class _AuthGateState extends State<AuthGate> {
         debugPrint('$stackTrace');
       }
 
+      final friendRequestService = FriendRequestNotificationService();
+      friendRequestService.onFriendRequestNotificationTap = ({
+        required String senderId,
+        required String senderName,
+      }) {
+        _openFriendsScreenFromFriendRequest();
+      };
+      try {
+        friendRequestService.setupNativeFriendRequestHandler();
+      } catch (error, stackTrace) {
+        debugPrint('[AuthGate] Friend request handler startup failed: $error');
+        debugPrint('$stackTrace');
+      }
+
+      // Phase 2 (600 ms later): heavy I/O — E2EE key DB, Signal bootstrap,
+      // FCM token. Enough headroom for the UI to draw its first frames first.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (!mounted || !_callServicesStarted) return;
+
       // FIX: This is a background safety-net for app resume (e.g. killed and
       // reopened without going through login). It intentionally stays
       // fire-and-forget here because login_screen.dart and
@@ -634,21 +670,12 @@ class _AuthGateState extends State<AuthGate> {
       // silently if bootstrap already ran this session.
       E2eeService().scheduleAutomaticAccountBootstrapIfPossible();
 
-      final friendRequestService = FriendRequestNotificationService();
-      friendRequestService.onFriendRequestNotificationTap = ({
-        required String senderId,
-        required String senderName,
-      }) {
-        _openContactsScreenFromFriendRequest();
-      };
       try {
-        friendRequestService.setupNativeFriendRequestHandler();
-      } catch (error, stackTrace) {
-        debugPrint('[AuthGate] Friend request handler startup failed: $error');
-        debugPrint('$stackTrace');
+        await ChatEncryptionRepository().ensureReady();
+      } catch (error) {
+        debugPrint('[AuthGate] E2EE ensureReady failed: $error');
       }
 
-      await Future<void>.delayed(const Duration(milliseconds: 350));
       if (!mounted || !_callServicesStarted) return;
       try {
         await FcmCallService().init();
@@ -657,7 +684,6 @@ class _AuthGateState extends State<AuthGate> {
         debugPrint('$stackTrace');
       }
 
-      await Future<void>.delayed(const Duration(milliseconds: 150));
       if (!mounted || !_callServicesStarted) return;
       try {
         FcmChatService().initForegroundNotifications();
@@ -667,14 +693,33 @@ class _AuthGateState extends State<AuthGate> {
         );
         debugPrint('$stackTrace');
       }
+
+      // Phase 3 (background): pre-warm the DistilBERT model so the first
+      // incoming message doesn't pay the load cost during rendering.
+      unawaited(MessageScreeningService().warmUp());
     });
   }
 
   Future<void> _ensureDeferredBootstrapStarted() async {
     if (_deferredBootstrapStarted) return;
     _deferredBootstrapStarted = true;
+
+    // Yield two frames so the UI renders before any blocking I/O begins.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return;
+
     await SessionIdentityService.instance.initialize();
+
+    // Request SMS permission when the app starts up
+    if (!await Permission.sms.isGranted) {
+      await Permission.sms.request();
+    }
+
     SmsService.init();
+
+    // Rule 3: Start scanning the SMS inbox silently in batches of 10
+    SmsBackgroundWorker.registerPeriodicScan();
+
     try {
       await CallNotificationService.configure();
     } catch (error, stackTrace) {
@@ -717,9 +762,12 @@ class _AuthGateState extends State<AuthGate> {
       _stopCallServices();
     }
 
-    return HomeScreen(
-      hasSession: hasSession,
-      hasOnlineAccess: hasOnlineAccess,
+    return SecureBackupGate(
+      key: ValueKey(user?.uid), // Forces the gate to re-check when the user logs in
+      child: HomeScreen(
+        hasSession: hasSession,
+        hasOnlineAccess: hasOnlineAccess,
+      ),
     );
   }
 }

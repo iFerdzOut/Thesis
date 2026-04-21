@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -21,6 +22,7 @@ import '../services/cloudinary_service.dart';
 import '../services/device_contact_sync_service.dart';
 import '../services/e2ee_service.dart';
 import '../services/feedback_service.dart';
+import '../services/feedback_database_service.dart';
 import '../services/fcm_chat_service.dart';
 import '../services/media_service.dart';
 import '../services/online_chat_service.dart';
@@ -118,6 +120,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // Edit state
   String? _editingMessageId;
   int _editingCount = 0;
+
+  late Stream<QuerySnapshot<Map<String, dynamic>>> _onlineMessagesStream;
+  late Stream<List<Map<String, dynamic>>> _smsMessagesStream;
 
   String get currentUserId => FirebaseAuth.instance.currentUser?.uid ?? '';
   String get otherUserId => widget.receiverId ?? widget.phone;
@@ -251,6 +256,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
     if (widget.chatType == 'sms') {
+      _smsMessagesStream = _smsStorage.watchMessages(_smsPeerPhone);
       SmsService.enterSmsExperience();
       _smsStorage.markAsRead(_smsPeerPhone);
       unawaited(SmsService.primeSmsThread(address: _smsPeerPhone, force: true));
@@ -259,14 +265,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       unawaited(_refreshSmsContactDisplayName());
       unawaited(_loadSmsCapabilityState());
     } else {
+      _onlineMessagesStream = onlineChatService.getMessages(otherUserId);
       unawaited(_refreshChatRelationship());
       unawaited(_primeOnlineConversationSecurity());
+      unawaited(
+        _chatEncryptionRepository.primeConversation(otherUserId: otherUserId),
+      );
       ChatNotificationService()
           .setActiveChat(onlineChatService.getChatId(otherUserId));
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        unawaited(
-          _chatEncryptionRepository.primeConversation(otherUserId: otherUserId),
-        );
         onlineChatService.markMessagesAsRead(otherUserId);
       });
     }
@@ -1116,10 +1123,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ? 'none'
         : snapshot.docChanges.map((change) {
             final data = change.doc.data() ?? const <String, dynamic>{};
+            final deletedFor = data['deletedFor'] as List?;
+            final deletedForSig = deletedFor?.join(',') ?? '';
             return '${_documentChangeTypeKey(change.type)}:${change.doc.id}:'
                 '${_extractBestMessageTime(data).millisecondsSinceEpoch}:'
                 '${data['isDeleted'] == true ? 1 : 0}:'
-                '${data['isReported'] == true ? 1 : 0}';
+                '${data['isReported'] == true ? 1 : 0}:$deletedForSig';
           }).join('|');
     return '${docs.length}|$rawFirstId|$rawLastId|$changeSignature|'
         '${snapshot.metadata.hasPendingWrites ? 1 : 0}|'
@@ -1243,7 +1252,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ── Send / Edit text message ──────────────────────────────────────────
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
-    if (text.isEmpty || _isSendingMessage) return;
+    if (text.isEmpty) return; // Removed _isSendingMessage check for fast sending
     if (widget.chatType == 'online' && _isConversationBlocked) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(_blockedBannerText)),
@@ -1277,45 +1286,63 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
-    setState(() => _isSendingMessage = true);
-    try {
-      if (widget.chatType == 'sms') {
-        if (!_smsCanSendFromApp) {
-          throw Exception(
-            'Set Smishing Shield PH as the default SMS app to send SMS reliably.',
-          );
-        }
-        await SmsService.sendSMS(
-          phone: _smsPeerPhone,
-          message: text,
-          simSlot: _selectedSmsSimSlot,
-        );
-        await SmsService.primeSmsThread(address: _smsPeerPhone, force: true);
-        unawaited(SmsService.scheduleInboxMaintenance(force: true));
-      } else {
-        final keyboardGifUrl = _extractKeyboardGifUrl(text);
-        if (keyboardGifUrl != null) {
-          await _sendRemoteMediaUrlToFirestore(
-            mediaUrl: keyboardGifUrl,
-            type: 'gif',
-            fileName: _inferKeyboardGifFileName(keyboardGifUrl),
-          );
-        } else {
-          await onlineChatService.sendMessage(
-            receiverId: otherUserId,
-            text: text,
-            receiverName: _displayName,
-          );
-        }
+    // --- Optimistic UI Updates ---
+    messageController.clear();
+    _scrollToBottom(immediate: false);
+
+    if (widget.chatType == 'sms') {
+      if (!_smsCanSendFromApp) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Set Smishing Shield PH as the default SMS app to send SMS reliably.')
+        ));
+        return;
       }
-      messageController.clear();
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Send failed: $e')));
-    } finally {
-      if (mounted) {
-        setState(() => _isSendingMessage = false);
+      
+      // Fire-and-forget SMS
+      unawaited(() async {
+        try {
+          await SmsService.sendSMS(
+            phone: _smsPeerPhone,
+            message: text,
+            simSlot: _selectedSmsSimSlot,
+          );
+          await SmsService.primeSmsThread(address: _smsPeerPhone, force: true);
+          unawaited(SmsService.scheduleInboxMaintenance(force: true));
+        } catch (e) {
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('SMS Send failed: $e')));
+        }
+      }());
+    } else {
+      final keyboardGifUrl = _extractKeyboardGifUrl(text);
+      if (keyboardGifUrl != null) {
+        // Fire-and-forget media link
+        unawaited(_sendRemoteMediaUrlToFirestore(
+          mediaUrl: keyboardGifUrl,
+          type: 'gif',
+          fileName: _inferKeyboardGifFileName(keyboardGifUrl),
+        ).catchError((e) {
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to send GIF: $e')));
+        }));
+      } else {
+        // Fire-and-forget text
+        unawaited(onlineChatService.sendMessage(
+          receiverId: otherUserId,
+          text: text,
+          receiverName: _displayName,
+        ).catchError((Object e) {
+          if (!mounted) return;
+          final msg = e.toString().contains('not enabled secure messaging')
+              ? 'Contact hasn\'t set up secure messaging yet. Ask them to open the app and try again.'
+              : e.toString().contains('No logged-in user')
+                  ? 'You\'re not signed in. Please restart the app.'
+                  : 'Message failed to send. Please try again.';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(msg),
+              duration: const Duration(seconds: 4),
+            ),
+          );
+        }));
       }
     }
   }
@@ -1786,6 +1813,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> reportLocalMessage(MessageModel msg) async {
     try {
       await ensureFeedbackUploadPreference(context);
+      
+      // Buffer the anonymized report in SQLite (Confirmed Smishing)
+      final feedbackDbService = FeedbackDatabaseService();
+      await feedbackDbService.saveConfirmedSmishing(
+        message: msg.text,
+        source: 'sms',
+        sender: _smsPeerPhone,
+      );
+
       await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
@@ -1807,6 +1843,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final docPath = msg['docPath'] ?? '';
     try {
       await ensureFeedbackUploadPreference(context);
+      
+      // Buffer the anonymized report in SQLite (Confirmed Smishing)
+      final feedbackDbService = FeedbackDatabaseService();
+      await feedbackDbService.saveConfirmedSmishing(
+        message: messageText,
+        source: 'online',
+        sender: otherUserId,
+      );
+
       await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
@@ -1826,6 +1871,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> reportFalseNegativeLocal(MessageModel msg) async {
     try {
       await ensureFeedbackUploadPreference(context);
+      
+      // Rule 4: Buffer the anonymized report in SQLite (False Negative)
+      final feedbackDbService = FeedbackDatabaseService();
+      await feedbackDbService.saveFalseNegative(
+        message: msg.text,
+        source: 'sms',
+        sender: _smsPeerPhone,
+      );
+
       await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
@@ -1850,6 +1904,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final docPath = msg['docPath'] ?? '';
     try {
       await ensureFeedbackUploadPreference(context);
+      
+      // Rule 4: Buffer the anonymized report in SQLite (False Negative)
+      final feedbackDbService = FeedbackDatabaseService();
+      await feedbackDbService.saveFalseNegative(
+        message: messageText,
+        source: 'online',
+        sender: otherUserId,
+      );
+
       await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
@@ -2416,7 +2479,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ── Real SMS message list from Firestore ──────────────────────────────
   Widget buildSmsMessageList() {
     return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _smsStorage.watchMessages(_smsPeerPhone),
+      stream: _smsMessagesStream,
       builder: (context, snapshot) {
         if (snapshot.hasError) {
           return const Center(child: Text('Failed to load messages'));
@@ -2584,6 +2647,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget _buildOnlineMessageTile({
     required Map<String, dynamic> data,
     required DocumentSnapshot doc,
+    DecryptedConversationMessage? projection,
     required bool isMe,
     required String resolvedText,
     required bool suspicious,
@@ -2594,9 +2658,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required int editCount,
     required bool isEdited,
     required bool isDeleted,
+    required bool hasPendingWrites,
     Widget? customContent,
   }) {
     final docPath = doc.reference.path;
+    final e2eeIndicator = _buildE2eeIndicatorText(
+      data,
+      projection,
+      isMe: isMe,
+    );
 
     final MessageModel tempMessage;
     if (isDeleted) {
@@ -2665,50 +2735,213 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           Padding(
             padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
-            child: Row(
-              mainAxisAlignment:
-                  isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+            child: Column(
+              crossAxisAlignment:
+                  isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               children: [
-                if (isEdited && !isDeleted && !isCallSummary)
+                if (e2eeIndicator != null &&
+                    e2eeIndicator.trim().isNotEmpty &&
+                    !isCallSummary)
                   Padding(
-                    padding: const EdgeInsets.only(right: 4),
+                    padding: const EdgeInsets.only(bottom: 2),
                     child: Text(
-                      'edited',
+                      e2eeIndicator,
                       style: TextStyle(
                         fontSize: 10,
-                        color: Colors.grey.shade400,
-                        fontStyle: FontStyle.italic,
+                        color: isMe ? Colors.white60 : Colors.grey.shade500,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                   ),
-                Text(
-                  formatTime(time),
-                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                Row(
+                  mainAxisAlignment:
+                      isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+                  children: [
+                    if (isEdited && !isDeleted && !isCallSummary)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Text(
+                          'edited',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Colors.grey.shade400,
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                      ),
+                    Text(
+                      formatTime(time),
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                    if (suspicious && !isDeleted && !isCallSummary) ...[
+                      const SizedBox(width: 6),
+                      const Icon(
+                        Icons.warning_amber_rounded,
+                        size: 14,
+                        color: Colors.orange,
+                      ),
+                    ],
+                    if (isMe && !isDeleted && !isCallSummary) ...[
+                      const SizedBox(width: 4),
+                      Icon(
+                        hasPendingWrites ? Icons.access_time : Icons.done_all,
+                        size: 14,
+                        color: hasPendingWrites
+                            ? Colors.white38
+                            : ((data['isRead'] == true)
+                                ? const Color(0xFF25D366)
+                                : Colors.grey),
+                      ),
+                      if (hasPendingWrites) ...[
+                        const SizedBox(width: 4),
+                        const Text(
+                          'Sending...',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Colors.white38,
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ],
                 ),
-                if (suspicious && !isDeleted && !isCallSummary) ...[
-                  const SizedBox(width: 6),
-                  const Icon(
-                    Icons.warning_amber_rounded,
-                    size: 14,
-                    color: Colors.orange,
-                  ),
-                ],
-                if (isMe && !isDeleted && !isCallSummary) ...[
-                  const SizedBox(width: 4),
-                  Icon(
-                    Icons.done_all,
-                    size: 14,
-                    color: (data['isRead'] == true)
-                        ? const Color(0xFF25D366)
-                        : Colors.grey,
-                  ),
-                ],
               ],
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildCachedProjectionList(
+    List<DecryptedConversationMessage> projections,
+  ) {
+    return NotificationListener<ScrollNotification>(
+      onNotification: _handleMessageScrollNotification,
+      child: ListView.builder(
+        key: PageStorageKey<String>('online_cached_thread_$otherUserId'),
+        controller: _messageScrollController,
+        reverse: true,
+        physics: const ClampingScrollPhysics(
+          parent: AlwaysScrollableScrollPhysics(),
+        ),
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        cacheExtent: 460,
+        padding: const EdgeInsets.all(10),
+        itemCount: projections.length,
+        itemBuilder: (context, index) {
+          final projection = projections[index];
+          return RepaintBoundary(
+            child: _buildCachedProjectionTile(projection),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildCachedProjectionTile(DecryptedConversationMessage projection) {
+    final rawText = projection.decryptedText?.trim().isNotEmpty == true
+        ? projection.decryptedText!.trim()
+        : projection.previewText.trim();
+    final displayText = rawText.isNotEmpty
+        ? rawText
+        : _cachedProjectionFallbackLabel(projection.messageType);
+    final displayType = switch (projection.messageType) {
+      'deleted' => 'deleted',
+      'call_summary' => 'call_summary',
+      _ => 'text',
+    };
+    final message = MessageModel(
+      text: displayText,
+      isMe: projection.isOutgoing,
+      time: projection.timestamp,
+      isSuspicious: projection.isSuspicious,
+      type: displayType,
+    );
+    final e2eeIndicator = _buildE2eeIndicatorText(
+      <String, dynamic>{
+        'e2ee': projection.cipherTextPresent,
+        'cipherText': projection.cipherTextPresent ? 'cached' : '',
+        'e2eeAlgorithm': projection.algorithm,
+      },
+      projection,
+      isMe: projection.isOutgoing,
+    );
+
+    return Column(
+      crossAxisAlignment: projection.isOutgoing
+          ? CrossAxisAlignment.end
+          : CrossAxisAlignment.start,
+      children: [
+        buildMessageContent(message),
+        if (!projection.isDeleted && projection.messageType != 'call_summary')
+          buildSuspiciousWarningCard(
+            isSuspicious: projection.isSuspicious,
+            isMe: projection.isOutgoing,
+          ),
+        Padding(
+          padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
+          child: Column(
+            crossAxisAlignment: projection.isOutgoing
+                ? CrossAxisAlignment.end
+                : CrossAxisAlignment.start,
+            children: [
+              if (e2eeIndicator != null && e2eeIndicator.trim().isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(
+                    e2eeIndicator,
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: projection.isOutgoing
+                          ? Colors.white60
+                          : Colors.grey.shade500,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    formatTime(projection.timestamp),
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                  if (projection.isSuspicious &&
+                      !projection.isDeleted &&
+                      projection.messageType != 'call_summary') ...[
+                    const SizedBox(width: 6),
+                    const Icon(
+                      Icons.warning_amber_rounded,
+                      size: 14,
+                      color: Colors.orange,
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _cachedProjectionFallbackLabel(String messageType) {
+    switch (messageType) {
+      case 'image':
+        return 'Photo';
+      case 'gif':
+        return 'GIF';
+      case 'file':
+        return 'File';
+      case 'call_summary':
+        return 'Call';
+      case 'deleted':
+        return 'Message deleted';
+      default:
+        return 'Encrypted message';
+    }
   }
 
   bool _isEncryptedMediaMessage(Map<String, dynamic> data) {
@@ -3026,9 +3259,65 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return null;
   }
 
+  String? _buildE2eeIndicatorText(
+    Map<String, dynamic> data,
+    DecryptedConversationMessage? projection, {
+    required bool isMe,
+  }) {
+    final looksEncrypted = data['e2ee'] == true ||
+        data['e2eeMedia'] == true ||
+        projection?.cipherTextPresent == true ||
+        (data['cipherText']?.toString().trim().isNotEmpty ?? false);
+    if (!looksEncrypted) {
+      return null;
+    }
+
+    final projectionAlgorithm = projection?.algorithm?.trim() ?? '';
+    final dataAlgorithm = data['e2eeAlgorithm']?.toString().trim() ?? '';
+    final algorithm =
+        projectionAlgorithm.isNotEmpty ? projectionAlgorithm : dataAlgorithm;
+    if (algorithm.isEmpty) {
+      return isMe ? 'Sent: E2EE' : 'Received: E2EE';
+    }
+
+    final version = (data['e2eeProtocolVersion'] as num?)?.toInt() ??
+        (data['e2eeVersion'] as num?)?.toInt() ??
+        _extractVersionFromAlgorithm(algorithm);
+    final label = _friendlyE2eeLabel(algorithm: algorithm, version: version);
+    return isMe ? 'Sent: $label' : 'Received: $label';
+  }
+
+  int _extractVersionFromAlgorithm(String algorithm) {
+    final match = RegExp(r'v(\d+)$').firstMatch(algorithm.trim());
+    if (match == null) {
+      return 0;
+    }
+    return int.tryParse(match.group(1) ?? '') ?? 0;
+  }
+
+  String _friendlyE2eeLabel({
+    required String algorithm,
+    required int version,
+  }) {
+    final normalized = algorithm.trim().toLowerCase();
+    if (normalized == 'signal-v2') {
+      return version > 0 ? 'Signal v$version' : 'Signal';
+    }
+    if (normalized == 'x25519-aesgcm-v1') {
+      return version > 0
+          ? 'Legacy X25519/AES-GCM v$version'
+          : 'Legacy X25519/AES-GCM';
+    }
+    if (version > 0 && !normalized.endsWith('v$version')) {
+      return '$algorithm v$version';
+    }
+    return algorithm;
+  }
+
   Widget _buildDecryptingBubble({
     required bool isMe,
     required DateTime time,
+    String? e2eeIndicator,
   }) {
     return Column(
       crossAxisAlignment:
@@ -3052,9 +3341,27 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         Padding(
           padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
-          child: Text(
-            formatTime(time),
-            style: const TextStyle(fontSize: 11, color: Colors.white38),
+          child: Column(
+            crossAxisAlignment:
+                isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            children: [
+              if (e2eeIndicator != null && e2eeIndicator.trim().isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(
+                    e2eeIndicator,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: Colors.white54,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              Text(
+                formatTime(time),
+                style: const TextStyle(fontSize: 11, color: Colors.white38),
+              ),
+            ],
           ),
         ),
       ],
@@ -3226,37 +3533,51 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget buildOnlineMessageList() {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: onlineChatService.getMessages(otherUserId),
-      builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return const Center(child: Text('Failed to load messages'));
-        }
-        if (!snapshot.hasData) {
-          return const Center(child: CircularProgressIndicator());
-        }
+    return StreamBuilder<List<DecryptedConversationMessage>>(
+      stream: _chatEncryptionRepository.watchConversation(
+        otherUserId: otherUserId,
+      ),
+      initialData: const <DecryptedConversationMessage>[],
+      builder: (context, projectionSnapshot) {
+        final projections =
+            projectionSnapshot.data ?? const <DecryptedConversationMessage>[];
+        final projectionLookups = _resolveProjectionLookups(projections);
 
-        final docs = _resolveOnlineDocs(snapshot.data!);
+        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: _onlineMessagesStream,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              if (projections.isNotEmpty) {
+                return _buildCachedProjectionList(projections);
+              }
+              return const Center(child: Text('Failed to load messages'));
+            }
+            if (!snapshot.hasData) {
+              if (projections.isNotEmpty) {
+                return _buildCachedProjectionList(projections);
+              }
+              return const Center(child: CircularProgressIndicator());
+            }
 
-        if (docs.isNotEmpty) {
-          _scheduleScrollToLatest(docs.first.id, messageCount: docs.length);
-        }
+            final docs = _resolveOnlineDocs(snapshot.data!);
+            if (docs.isEmpty && projections.isNotEmpty) {
+              return _buildCachedProjectionList(projections);
+            }
 
-        _scheduleConversationSnapshotSync(
-          docs: docs,
-          docChanges: snapshot.data!.docChanges,
-        );
+            if (docs.isNotEmpty) {
+              _scheduleScrollToLatest(docs.first.id, messageCount: docs.length);
+            }
 
-        return StreamBuilder<List<DecryptedConversationMessage>>(
-          stream: _chatEncryptionRepository.watchConversation(
-            otherUserId: otherUserId,
-          ),
-          builder: (context, projectionSnapshot) {
-            final projections = projectionSnapshot.data ??
-                const <DecryptedConversationMessage>[];
-            final projectionLookups = _resolveProjectionLookups(projections);
+            _scheduleConversationSnapshotSync(
+              docs: docs,
+              docChanges: snapshot.data!.docChanges,
+            );
 
-            return NotificationListener<ScrollNotification>(
+            return StreamBuilder<bool>(
+              stream: onlineChatService.getIsTyping(otherUserId: otherUserId),
+              builder: (context, typingSnap) {
+                final isTyping = typingSnap.data ?? false;
+                return NotificationListener<ScrollNotification>(
               onNotification: _handleMessageScrollNotification,
               child: ListView.builder(
                 key: PageStorageKey<String>('online_thread_$otherUserId'),
@@ -3269,9 +3590,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ScrollViewKeyboardDismissBehavior.onDrag,
                 cacheExtent: 460,
                 padding: const EdgeInsets.all(10),
-                itemCount: docs.length,
+                itemCount: docs.length + (isTyping ? 1 : 0),
                 itemBuilder: (context, index) {
-                  final doc = docs[index];
+                  if (isTyping && index == 0) {
+                    return const _TypingIndicatorBubble();
+                  }
+                  final doc = docs[isTyping ? index - 1 : index];
                   final data = doc.data();
                   final projection = _resolveConversationProjection(
                     doc.id,
@@ -3289,6 +3613,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   final time = _extractBestMessageTime(data);
                   final fileName = data['fileName'] as String? ?? '';
                   final editCount = data['editCount'] as int? ?? 0;
+                  final hasPendingWrites = doc.metadata.hasPendingWrites;
                   final isEdited = editCount > 0;
                   final isDeleted =
                       data['isDeleted'] == true || type == 'deleted';
@@ -3302,8 +3627,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   final isDecrypting = isEncryptedText && resolvedText == null;
 
                   if (isDecrypting) {
+                    final e2eeIndicator = _buildE2eeIndicatorText(
+                      data,
+                      projection,
+                      isMe: isMe,
+                    );
                     return RepaintBoundary(
-                      child: _buildDecryptingBubble(isMe: isMe, time: time),
+                      child: _buildDecryptingBubble(
+                        isMe: isMe,
+                        time: time,
+                        e2eeIndicator: e2eeIndicator,
+                      ),
                     );
                   }
 
@@ -3312,6 +3646,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       child: _buildOnlineMessageTile(
                         data: data,
                         doc: doc,
+                        projection: projection,
                         isMe: isMe,
                         resolvedText: resolvedText ?? '',
                         suspicious: suspicious,
@@ -3322,6 +3657,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         editCount: editCount,
                         isEdited: isEdited,
                         isDeleted: isDeleted,
+                        hasPendingWrites: hasPendingWrites,
                         customContent: _buildEncryptedMediaContent(
                           messageId: doc.id,
                           data: Map<String, dynamic>.from(data),
@@ -3338,6 +3674,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     child: _buildOnlineMessageTile(
                       data: data,
                       doc: doc,
+                      projection: projection,
                       isMe: isMe,
                       resolvedText: resolvedText ?? '',
                       suspicious: suspicious,
@@ -3348,10 +3685,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       editCount: editCount,
                       isEdited: isEdited,
                       isDeleted: isDeleted,
+                      hasPendingWrites: hasPendingWrites,
                     ),
                   );
                 },
               ),
+            );
+              },
             );
           },
         );
@@ -3877,6 +4217,77 @@ class _RiskyLinkDialogState extends State<_RiskyLinkDialog> {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _TypingIndicatorBubble extends StatefulWidget {
+  const _TypingIndicatorBubble();
+
+  @override
+  State<_TypingIndicatorBubble> createState() => _TypingIndicatorBubbleState();
+}
+
+class _TypingIndicatorBubbleState extends State<_TypingIndicatorBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 4, right: 60),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E1E1E),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) {
+            return AnimatedBuilder(
+              animation: _controller,
+              builder: (_, __) {
+                final phase = (_controller.value + i / 3.0) % 1.0;
+                final opacity =
+                    (0.3 + 0.7 * (0.5 + 0.5 * sin(phase * 2 * pi)))
+                        .clamp(0.0, 1.0);
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: Opacity(
+                    opacity: opacity,
+                    child: const Text(
+                      '•',
+                      style: TextStyle(
+                        fontSize: 20,
+                        color: Color(0xFF25D366),
+                        height: 1.0,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            );
+          }),
+        ),
+      ),
     );
   }
 }

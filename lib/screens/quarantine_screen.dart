@@ -897,6 +897,14 @@ class _FrictionDialogState extends State<_FrictionDialog> {
             const SizedBox(height: 8),
             TextField(
               controller: _textController,
+              textCapitalization: TextCapitalization.characters,
+              onSubmitted: (_) async {
+                if (_typedCorrectly && !_submitting) {
+                  setState(() => _submitting = true);
+                  Navigator.pop(context);
+                  await widget.onConfirm();
+                }
+              },
               inputFormatters: [
                 TextInputFormatter.withFunction((oldValue, newValue) {
                   if (newValue.text.length > oldValue.text.length + 1) {

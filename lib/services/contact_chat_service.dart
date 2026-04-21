@@ -52,6 +52,17 @@ class ContactChatService {
   }) async {
     if (targetUid.isEmpty || targetUid == currentUserId) return;
 
+    // Check if the target has blocked the current user
+    final targetSettings = await _firestore
+        .collection('users')
+        .doc(targetUid)
+        .collection('chat_settings')
+        .doc(currentUserId)
+        .get();
+    if (targetSettings.exists && targetSettings.data()?['blocked'] == true) {
+      throw Exception('Cannot send friend request to this user.');
+    }
+
     final me = await _getCurrentUserProfile();
     final batch = _firestore.batch();
 

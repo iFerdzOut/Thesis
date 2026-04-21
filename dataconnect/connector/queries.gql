@@ -1,0 +1,9 @@
+# A simple query is required by the SDK generator, even if you only use mutations.
+query ListModelFeedbacks @auth(level: PUBLIC) {
+  modelFeedbacks {
+    id
+    label
+    source
+    reportedAt
+  }
+}

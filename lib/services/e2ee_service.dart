@@ -11,6 +11,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'chat_encryption_repository.dart';
 import 'key_management_service.dart';
+import 'local_message_cache_service.dart';
 
 class EncryptedTextPayload {
   final String cipherText;
@@ -142,6 +143,7 @@ class E2eeService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final ChatEncryptionRepository _signalRepository = ChatEncryptionRepository();
   final KeyManagementService _keyManagementService = KeyManagementService();
+  final LocalMessageCacheService _localCache = LocalMessageCacheService();
   final X25519 _keyExchange = X25519();
   final AesGcm _cipher = AesGcm.with256bits();
   final Hkdf _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
@@ -183,6 +185,14 @@ class E2eeService {
   static const Duration _repairCooldown = Duration(seconds: 5);
 
   String get currentUserId => _auth.currentUser?.uid ?? '';
+
+  Future<bool> hasLocalIdentity() async {
+    return await _hasLocalIdentity(currentUserId);
+  }
+
+  Future<bool> hasRemoteBackup() async {
+    return await _hasRemoteRecoveryBackup(currentUserId);
+  }
 
   Future<E2eeSessionContext> ensureSessionForPeer({
     required String peerId,
@@ -258,16 +268,33 @@ class E2eeService {
   Future<Map<String, dynamic>> encryptTextEnvelope({
     required String receiverId,
     required String plaintext,
+    String? clientMessageId,
   }) async {
-    await _keyManagementService.ensureDeviceIdentity(
-      userId: currentUserId,
-      forceRepublish: false,
-    );
-    final envelope = await _signalRepository.encryptTextEnvelope(
+    try {
+      // FIRE AND FORGET: Do not await network round-trip on every message send!
+      unawaited(_keyManagementService.ensureDeviceIdentity(
+        userId: currentUserId,
+        forceRepublish: false,
+      ));
+      final envelope = await _signalRepository.encryptTextEnvelope(
+        receiverId: receiverId,
+        plaintext: plaintext,
+        clientMessageId: clientMessageId,
+      );
+      // PERF: Disabling automatic backup on every message send. This is a
+      // major performance bottleneck. Backups should be periodic or user-initiated.
+      // unawaited(syncAutomaticAccountBackupIfAvailable());
+      return envelope;
+    } catch (error) {
+      debugPrint('[E2eeService] Signal text encrypt fallback: $error');
+    }
+
+    final envelope = await _encryptTextEnvelopeLegacy(
       receiverId: receiverId,
       plaintext: plaintext,
     );
-    unawaited(syncAutomaticAccountBackupIfAvailable());
+    // PERF: Disabling automatic backup on every message send.
+    // unawaited(syncAutomaticAccountBackupIfAvailable());
     return envelope;
   }
 
@@ -276,15 +303,18 @@ class E2eeService {
     required List<int> bytes,
   }) async {
     try {
-      await _keyManagementService.ensureDeviceIdentity(
+      // FIRE AND FORGET: Do not await network round-trip on every upload!
+      unawaited(_keyManagementService.ensureDeviceIdentity(
         userId: currentUserId,
         forceRepublish: false,
-      );
+      ));
       final envelope = await _signalRepository.encryptBinaryEnvelope(
         receiverId: receiverId,
         bytes: bytes,
       );
-      unawaited(syncAutomaticAccountBackupIfAvailable());
+      // PERF: Disabling automatic backup on every message send. This is a
+      // major performance bottleneck. Backups should be periodic or user-initiated.
+      // unawaited(syncAutomaticAccountBackupIfAvailable());
       return envelope;
     } catch (error) {
       debugPrint('[E2eeService] Signal media encrypt fallback: $error');
@@ -294,8 +324,39 @@ class E2eeService {
       receiverId: receiverId,
       bytes: bytes,
     );
-    unawaited(syncAutomaticAccountBackupIfAvailable());
+    // PERF: Disabling automatic backup on every message send.
+    // unawaited(syncAutomaticAccountBackupIfAvailable());
     return envelope;
+  }
+
+  Future<Map<String, dynamic>> _encryptTextEnvelopeLegacy({
+    required String receiverId,
+    required String plaintext,
+  }) async {
+    await ensureIdentityForCurrentUser(syncRemote: true);
+    final session = await ensureSessionForPeer(peerId: receiverId);
+    final conversationKey = await _deriveConversationKey(
+      keyPair: session.localKeyPair,
+      peerPublicKey: session.peerPublicKey,
+      otherUserId: receiverId,
+    );
+    final nonce = _randomBytes(12);
+    final secretBox = await _cipher.encrypt(
+      utf8.encode(plaintext),
+      secretKey: conversationKey,
+      nonce: nonce,
+    );
+
+    return {
+      ...EncryptedTextPayload(
+        cipherText: base64Encode(secretBox.cipherText),
+        nonce: base64Encode(secretBox.nonce),
+        mac: base64Encode(secretBox.mac.bytes),
+        version: session.sessionVersion,
+        algorithm: session.algorithm,
+      ).toMap(),
+      ...session.toMetadataMap(),
+    };
   }
 
   Future<Map<String, dynamic>> _encryptBinaryEnvelopeLegacy({
@@ -399,7 +460,8 @@ class E2eeService {
       nonce: nonce,
     );
 
-    await _firestore.collection('users').doc(uid).set({
+    final docRef = _firestore.collection('users').doc(uid);
+    await docRef.set({
       'e2eeRecoveryEnabled': true,
       'e2eeRecoveryVersion': _recoveryVersion,
       'e2eeRecoveryAlgorithm': _recoveryAlgorithm,
@@ -410,6 +472,38 @@ class E2eeService {
       'e2eeRecoveryCipherText': base64Encode(secretBox.cipherText),
       'e2eeRecoveryUpdatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
+
+    // Verify the write actually reached the server (catches the case where
+    // the write was queued offline and the local Future resolved without
+    // the data ever persisting to Firestore).
+    try {
+      final verify = await docRef.get(const GetOptions(source: Source.server));
+      final vData = verify.data() ?? const <String, dynamic>{};
+      if ((vData['e2eeRecoveryCipherText']?.toString() ?? '').isEmpty) {
+        throw Exception(
+          'Backup could not be confirmed on the server. '
+          'Please check your internet connection and try again.',
+        );
+      }
+    } on FirebaseException catch (fe) {
+      if (fe.code == 'unavailable' || fe.code == 'failed-precondition') {
+        throw Exception(
+          'You appear to be offline. Please connect to the internet and '
+          'try setting up your backup PIN again.',
+        );
+      }
+      rethrow;
+    }
+
+    await docRef.update({
+      'msgBackupVersion': FieldValue.delete(),
+      'msgBackupSalt': FieldValue.delete(),
+      'msgBackupNonce': FieldValue.delete(),
+      'msgBackupMac': FieldValue.delete(),
+      'msgBackupCipherText': FieldValue.delete(),
+      'msgBackupUpdatedAt': FieldValue.delete(),
+    });
+    await _saveInitialMessageBackup(uid: uid, passphrase: trimmed);
   }
 
   Future<void> restoreIdentityFromRecoveryKey({
@@ -425,7 +519,10 @@ class E2eeService {
       throw Exception('No logged-in user found.');
     }
 
-    final userDoc = await _firestore.collection('users').doc(uid).get();
+    final userDoc = await _firestore
+        .collection('users')
+        .doc(uid)
+        .get(const GetOptions(source: Source.server));
     final data = userDoc.data() ?? <String, dynamic>{};
     final cipherTextB64 = data['e2eeRecoveryCipherText']?.toString() ?? '';
     final saltB64 = data['e2eeRecoverySalt']?.toString() ?? '';
@@ -544,6 +641,35 @@ class E2eeService {
     }
 
     await ensureIdentityForCurrentUser();
+
+    await _restoreMessageBackups(
+      uid: uid,
+      passphrase: trimmed,
+      userData: data,
+    );
+  }
+
+  Future<void> clearRemoteBackup() async {
+    final uid = currentUserId;
+    if (uid.isEmpty) return;
+
+    await _firestore.collection('users').doc(uid).update({
+      'e2eeRecoveryEnabled': FieldValue.delete(),
+      'e2eeRecoveryVersion': FieldValue.delete(),
+      'e2eeRecoveryAlgorithm': FieldValue.delete(),
+      'e2eeRecoveryIterations': FieldValue.delete(),
+      'e2eeRecoverySalt': FieldValue.delete(),
+      'e2eeRecoveryNonce': FieldValue.delete(),
+      'e2eeRecoveryMac': FieldValue.delete(),
+      'e2eeRecoveryCipherText': FieldValue.delete(),
+      'e2eeRecoveryUpdatedAt': FieldValue.delete(),
+      'msgBackupVersion': FieldValue.delete(),
+      'msgBackupSalt': FieldValue.delete(),
+      'msgBackupNonce': FieldValue.delete(),
+      'msgBackupMac': FieldValue.delete(),
+      'msgBackupCipherText': FieldValue.delete(),
+      'msgBackupUpdatedAt': FieldValue.delete(),
+    });
   }
 
   Future<bool> bootstrapAutomaticAccountBackup({
@@ -845,7 +971,7 @@ class E2eeService {
     final future = () async {
       try {
         await ensureIdentityForCurrentUser(forceRepublish: false);
-        await saveRecoveryKeyBackup(passphrase: passphrase);
+        await _saveIncrementalMessageBackup(uid: uid, passphrase: passphrase);
       } catch (error) {
         debugPrint('[E2eeService] Automatic backup sync skipped: $error');
       }
@@ -981,6 +1107,7 @@ class E2eeService {
     String? mac,
     String messageType = 'text',
     int? timestampMs,
+    String? algorithm,
   }) async {
     final trimmedText = plaintext.trim();
     if (senderId.trim().isEmpty ||
@@ -1014,6 +1141,31 @@ class E2eeService {
       nonce: nonce,
       mac: mac,
       clientMessageId: clientMessageId,
+    );
+  }
+
+  Future<String> createPendingOutgoingMessageProjection({
+    required String conversationId,
+    required String receiverId,
+    required String plaintext,
+  }) {
+    return _signalRepository.createPendingOutgoingMessageProjection(
+      conversationId: conversationId,
+      receiverId: receiverId,
+      plaintext: plaintext,
+      messageType: 'text',
+    );
+  }
+
+  Future<void> failOutgoingMessageProjection({
+    required String clientMessageId,
+    required String conversationId,
+    required String reason,
+  }) {
+    return _signalRepository.failOutgoingMessageProjection(
+      clientMessageId: clientMessageId,
+      conversationId: conversationId,
+      reason: reason,
     );
   }
 
@@ -1136,7 +1288,19 @@ class E2eeService {
         forceRepublish: forceRepublish,
       );
     } catch (error) {
-      debugPrint('[E2eeService] Signal identity bootstrap skipped: $error');
+      debugPrint('[E2eeService] Signal identity bootstrap failed: $error — scheduling retry in 10s');
+      // Schedule a single retry so a transient Firestore/network error at
+      // startup doesn't permanently prevent the user's bundle from being
+      // published (which would block peers from messaging them).
+      Future<void>.delayed(const Duration(seconds: 10)).then((_) async {
+        if (currentUserId == uid) {
+          try {
+            await _keyManagementService.ensureDeviceIdentity(userId: uid);
+          } catch (retryError) {
+            debugPrint('[E2eeService] Signal identity retry also failed: $retryError');
+          }
+        }
+      });
     }
     await _ensureLocalIdentityForCurrentUser(uid);
     if (!syncRemote) {
@@ -1341,7 +1505,9 @@ class E2eeService {
           data,
           allowRepair: allowRepair,
         );
-        unawaited(syncAutomaticAccountBackupIfAvailable());
+        // PERF: Disabling automatic backup on every message decryption. This is a
+        // major performance bottleneck. Backups should be periodic or user-initiated.
+        // unawaited(syncAutomaticAccountBackupIfAvailable());
         return plaintext;
       } catch (error) {
         debugPrint('[E2eeService] Signal text decrypt fallback: $error');
@@ -1769,7 +1935,9 @@ class E2eeService {
           cipherBytes: cipherBytes,
           allowRepair: allowRepair,
         );
-        unawaited(syncAutomaticAccountBackupIfAvailable());
+        // PERF: Disabling automatic backup on every message decryption. This is a
+        // major performance bottleneck. Backups should be periodic or user-initiated.
+        // unawaited(syncAutomaticAccountBackupIfAvailable());
         return clearBytes;
       } catch (error) {
         debugPrint('[E2eeService] Signal media decrypt fallback: $error');
@@ -2282,6 +2450,235 @@ class E2eeService {
     return List<int>.generate(length, (_) => _random.nextInt(256));
   }
 
+  Future<void> _saveInitialMessageBackup({
+    required String uid,
+    required String passphrase,
+  }) async {
+    try {
+      final messages = await _localCache.exportAllMessages(uid);
+      if (messages.isEmpty) return;
+
+      final payloadJson = jsonEncode({
+        'version': 2,
+        'savedAt': DateTime.now().toUtc().toIso8601String(),
+        'messages': messages,
+      });
+
+      final salt = _randomBytes(16);
+      final nonce = _randomBytes(12);
+      final key =
+          await _deriveRecoverySecretKey(passphrase: passphrase, salt: salt);
+      final secretBox = await _cipher.encrypt(
+        utf8.encode(payloadJson),
+        secretKey: key,
+        nonce: nonce,
+      );
+
+      final backupCollection =
+          _firestore.collection('users').doc(uid).collection('message_backups');
+
+      final oldChunks = await backupCollection.get();
+      for (final doc in oldChunks.docs) {
+        await doc.reference.delete();
+      }
+
+      await backupCollection.add({
+        'version': 2,
+        'salt': base64Encode(salt),
+        'nonce': base64Encode(secretBox.nonce),
+        'mac': base64Encode(secretBox.mac.bytes),
+        'cipherText': base64Encode(secretBox.cipherText),
+        'savedAt': FieldValue.serverTimestamp(),
+      });
+      debugPrint(
+          '[E2eeService] Initial message backup saved: ${messages.length} messages');
+    } catch (error) {
+      debugPrint('[E2eeService] Initial message backup save skipped: $error');
+    }
+  }
+
+  Future<void> _saveIncrementalMessageBackup({
+    required String uid,
+    required String passphrase,
+  }) async {
+    try {
+      final backupCollection =
+          _firestore.collection('users').doc(uid).collection('message_backups');
+
+      final lastBackupSnapshot = await backupCollection
+          .orderBy('savedAt', descending: true)
+          .limit(1)
+          .get();
+
+      int lastBackupTimestampMs = 0;
+      if (lastBackupSnapshot.docs.isNotEmpty) {
+        final lastBackupData = lastBackupSnapshot.docs.first.data();
+        final savedAt = lastBackupData['savedAt'];
+        if (savedAt is Timestamp) {
+          lastBackupTimestampMs = savedAt.millisecondsSinceEpoch;
+        }
+      }
+
+      final messages = await _localCache.exportAllMessagesSince(
+        uid,
+        lastBackupTimestampMs,
+      );
+
+      if (messages.isEmpty) {
+        debugPrint('[E2eeService] No new messages to back up.');
+        return;
+      }
+
+      final now = DateTime.now().toUtc();
+      final payloadJson = jsonEncode({
+        'version': 2,
+        'savedAt': now.toIso8601String(),
+        'messages': messages,
+      });
+
+      final salt = _randomBytes(16);
+      final nonce = _randomBytes(12);
+      final key =
+          await _deriveRecoverySecretKey(passphrase: passphrase, salt: salt);
+      final secretBox = await _cipher.encrypt(
+        utf8.encode(payloadJson),
+        secretKey: key,
+        nonce: nonce,
+      );
+
+      await backupCollection.add({
+        'version': 2,
+        'salt': base64Encode(salt),
+        'nonce': base64Encode(secretBox.nonce),
+        'mac': base64Encode(secretBox.mac.bytes),
+        'cipherText': base64Encode(secretBox.cipherText),
+        'savedAt': FieldValue.serverTimestamp(),
+      });
+      debugPrint(
+          '[E2eeService] Incremental backup saved: ${messages.length} new messages');
+    } catch (error) {
+      debugPrint('[E2eeService] Incremental message backup failed: $error');
+    }
+  }
+
+  Future<void> _restoreMessageBackups({
+    required String uid,
+    required String passphrase,
+    required Map<String, dynamic> userData,
+  }) async {
+    final oldCipherTextB64 = userData['msgBackupCipherText']?.toString() ?? '';
+    if (oldCipherTextB64.isNotEmpty) {
+      debugPrint(
+          '[E2eeService] Found legacy message backup, attempting restore...');
+      await _restoreLegacyMessageBackup(
+        uid: uid,
+        passphrase: passphrase,
+        userData: userData,
+      );
+    }
+
+    try {
+      final backupCollection =
+          _firestore.collection('users').doc(uid).collection('message_backups');
+
+      final backupChunksSnapshot =
+          await backupCollection.orderBy('savedAt').get();
+      if (backupChunksSnapshot.docs.isEmpty) {
+        if (oldCipherTextB64.isEmpty) {
+          debugPrint('[E2eeService] No message backups found to restore.');
+        }
+        return;
+      }
+
+      debugPrint(
+          '[E2eeService] Found ${backupChunksSnapshot.docs.length} incremental backup chunks, restoring...');
+      int totalMessagesRestored = 0;
+
+      for (final chunkDoc in backupChunksSnapshot.docs) {
+        final chunkData = chunkDoc.data();
+        final cipherTextB64 = chunkData['cipherText']?.toString() ?? '';
+        final saltB64 = chunkData['salt']?.toString() ?? '';
+        final nonceB64 = chunkData['nonce']?.toString() ?? '';
+        final macB64 = chunkData['mac']?.toString() ?? '';
+
+        if (cipherTextB64.isEmpty ||
+            saltB64.isEmpty ||
+            nonceB64.isEmpty ||
+            macB64.isEmpty) {
+          continue;
+        }
+
+        try {
+          final key = await _deriveRecoverySecretKey(
+            passphrase: passphrase,
+            salt: base64Decode(saltB64),
+          );
+          final secretBox = SecretBox(
+            base64Decode(cipherTextB64),
+            nonce: base64Decode(nonceB64),
+            mac: Mac(base64Decode(macB64)),
+          );
+          final clearBytes = await _cipher.decrypt(secretBox, secretKey: key);
+          final payload =
+              jsonDecode(utf8.decode(clearBytes)) as Map<String, dynamic>;
+          final messages = payload['messages'] as List<dynamic>? ?? const [];
+
+          if (messages.isNotEmpty) {
+            await _localCache.importAllMessages(uid, messages);
+            totalMessagesRestored += messages.length;
+          }
+        } catch (error) {
+          debugPrint(
+              '[E2eeService] Failed to decrypt a backup chunk, skipping. Error: $error');
+        }
+      }
+      debugPrint(
+          '[E2eeService] Incremental backup restored: $totalMessagesRestored messages from ${backupChunksSnapshot.docs.length} chunks.');
+    } catch (error) {
+      debugPrint(
+          '[E2eeService] Incremental message backup restore failed: $error');
+    }
+  }
+
+  Future<void> _restoreLegacyMessageBackup({
+    required String uid,
+    required String passphrase,
+    required Map<String, dynamic> userData,
+  }) async {
+    final cipherTextB64 = userData['msgBackupCipherText']?.toString() ?? '';
+    final saltB64 = userData['msgBackupSalt']?.toString() ?? '';
+    final nonceB64 = userData['msgBackupNonce']?.toString() ?? '';
+    final macB64 = userData['msgBackupMac']?.toString() ?? '';
+
+    if (cipherTextB64.isEmpty ||
+        saltB64.isEmpty ||
+        nonceB64.isEmpty ||
+        macB64.isEmpty) {
+      return;
+    }
+
+    try {
+      final key = await _deriveRecoverySecretKey(
+        passphrase: passphrase,
+        salt: base64Decode(saltB64),
+      );
+      final secretBox = SecretBox(
+        base64Decode(cipherTextB64),
+        nonce: base64Decode(nonceB64),
+        mac: Mac(base64Decode(macB64)),
+      );
+      final clearBytes = await _cipher.decrypt(secretBox, secretKey: key);
+      final payload =
+          jsonDecode(utf8.decode(clearBytes)) as Map<String, dynamic>;
+      final messages = payload['messages'] as List<dynamic>? ?? const [];
+      await _localCache.importAllMessages(uid, messages);
+      debugPrint(
+          '[E2eeService] Legacy message backup restored: ${messages.length} messages');
+    } catch (error) {
+      debugPrint('[E2eeService] Legacy message backup restore skipped: $error');
+    }
+  }
+
   Future<SecretKey> _deriveRecoverySecretKey({
     required String passphrase,
     required List<int> salt,
@@ -2342,7 +2739,12 @@ class E2eeService {
   }
 
   Future<bool> _hasRemoteRecoveryBackup(String uid) async {
-    final userDoc = await _firestore.collection('users').doc(uid).get();
+    // Always fetch from the server so a stale local cache or an offline-queued
+    // write that never committed doesn't produce a false positive.
+    final userDoc = await _firestore
+        .collection('users')
+        .doc(uid)
+        .get(const GetOptions(source: Source.server));
     final data = userDoc.data() ?? const <String, dynamic>{};
     final cipherTextB64 = data['e2eeRecoveryCipherText']?.toString() ?? '';
     final saltB64 = data['e2eeRecoverySalt']?.toString() ?? '';
@@ -2377,4 +2779,4 @@ class E2eeService {
     _peerRepairTimestamps.clear();
     _automaticBackupBootstrapFuture = null;
   }
-}
+} 

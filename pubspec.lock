@@ -9,6 +9,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.3.59"
+  archive:
+    dependency: transitive
+    description:
+      name: archive
+      sha256: cb6a278ef2dbb298455e1a713bda08524a175630ec643a242c399c932a0a1f7d
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.6.1"
   args:
     dependency: transitive
     description:
@@ -161,6 +169,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.7.12"
+  equatable:
+    dependency: "direct main"
+    description:
+      name: equatable
+      sha256: "3e0141505477fd8ad55d6eb4e7776d3fe8430be8e497ccb1521370c3f21a3e2b"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.8"
   fake_async:
     dependency: transitive
     description:
@@ -225,6 +241,30 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.9.3+5"
+  firebase_app_check:
+    dependency: "direct main"
+    description:
+      name: firebase_app_check
+      sha256: c4124632094a4062d7a1ff0a9f9c657ff54bece5d8393af4626cb191351a2aac
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.3.2+10"
+  firebase_app_check_platform_interface:
+    dependency: transitive
+    description:
+      name: firebase_app_check_platform_interface
+      sha256: "4ca80bcc6c5c55289514d85e7c8ba8bc354342d23ab807b01c3f82e2fc7158e4"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.1.1+10"
+  firebase_app_check_web:
+    dependency: transitive
+    description:
+      name: firebase_app_check_web
+      sha256: b3150a78fe18c27525af05b149724ee33bd8592a5959e484fdfa5c98e25edb5f
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.2.0+14"
   firebase_auth:
     dependency: "direct main"
     description:
@@ -273,6 +313,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.24.1"
+  firebase_data_connect:
+    dependency: "direct main"
+    description:
+      name: firebase_data_connect
+      sha256: decc24f2ce21a305aa38f4840302aa893ad5cafd7ee4e05c2eb8a2808cb21c97
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.1.5+4"
   firebase_messaging:
     dependency: "direct main"
     description:
@@ -454,6 +502,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.2"
+  flutter_sms_inbox:
+    dependency: "direct main"
+    description:
+      name: flutter_sms_inbox
+      sha256: "50580e4265ab65b128777ea3db9b0286ef7beff12df644de42643b26e8b76ee5"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.4"
   flutter_test:
     dependency: "direct dev"
     description: flutter
@@ -472,6 +528,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.4.0"
+  get_it:
+    dependency: "direct main"
+    description:
+      name: get_it
+      sha256: d85128a5dae4ea777324730dc65edd9c9f43155c109d5cc0a69cab74139fbac1
+      url: "https://pub.dev"
+    source: hosted
+    version: "7.7.0"
   glob:
     dependency: transitive
     description:
@@ -480,6 +544,30 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.3"
+  google_identity_services_web:
+    dependency: transitive
+    description:
+      name: google_identity_services_web
+      sha256: "5d187c46dc59e02646e10fe82665fc3884a9b71bc1c90c2b8b749316d33ee454"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.3.3+1"
+  googleapis_auth:
+    dependency: transitive
+    description:
+      name: googleapis_auth
+      sha256: befd71383a955535060acde8792e7efc11d2fccd03dd1d3ec434e85b68775938
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.6.0"
+  grpc:
+    dependency: transitive
+    description:
+      name: grpc
+      sha256: e93ee3bce45c134bf44e9728119102358c7cd69de7832d9a874e2e74eb8cab40
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.2.4"
   hooks:
     dependency: transitive
     description:
@@ -496,6 +584,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.6.0"
+  http2:
+    dependency: transitive
+    description:
+      name: http2
+      sha256: "382d3aefc5bd6dc68c6b892d7664f29b5beb3251611ae946a98d35158a82bbfa"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.3.1"
   http_parser:
     dependency: transitive
     description:
@@ -568,6 +664,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.2.2"
+  intl:
+    dependency: transitive
+    description:
+      name: intl
+      sha256: "3df61194eb431efc39c4ceba583b95633a403f46c9fd341e550ce0bfa50e9aa5"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.20.2"
   js:
     dependency: transitive
     description:
@@ -672,6 +776,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.17.6"
+  nested:
+    dependency: transitive
+    description:
+      name: nested
+      sha256: "03bac4c528c64c95c722ec99280375a6f2fc708eec17c7b3f07253b626cd2a20"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.0"
   nm:
     dependency: transitive
     description:
@@ -824,6 +936,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.8"
+  protobuf:
+    dependency: transitive
+    description:
+      name: protobuf
+      sha256: "68645b24e0716782e58948f8467fd42a880f255096a821f9e7d0ec625b00c84d"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.1.0"
+  provider:
+    dependency: "direct main"
+    description:
+      name: provider
+      sha256: "4e82183fa20e5ca25703ead7e05de9e4cceed1fbd1eadc1ac3cb6f565a09f272"
+      url: "https://pub.dev"
+    source: hosted
+    version: "6.1.5+1"
   pub_semver:
     dependency: transitive
     description:
@@ -1109,6 +1237,39 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "5.15.0"
+  workmanager:
+    dependency: "direct main"
+    description:
+      path: workmanager
+      ref: HEAD
+      resolved-ref: "7f4f870d593f858b0f55bd344c9863a6099cb30f"
+      url: "https://github.com/fluttercommunity/flutter_workmanager.git"
+    source: git
+    version: "0.9.0+3"
+  workmanager_android:
+    dependency: transitive
+    description:
+      name: workmanager_android
+      sha256: "9ae744db4ef891f5fcd2fb8671fccc712f4f96489a487a1411e0c8675e5e8cb7"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.0+2"
+  workmanager_apple:
+    dependency: transitive
+    description:
+      name: workmanager_apple
+      sha256: "1cc12ae3cbf5535e72f7ba4fde0c12dd11b757caf493a28e22d684052701f2ca"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.1+2"
+  workmanager_platform_interface:
+    dependency: transitive
+    description:
+      name: workmanager_platform_interface
+      sha256: f40422f10b970c67abb84230b44da22b075147637532ac501729256fcea10a47
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.9.1+1"
   xdg_directories:
     dependency: transitive
     description:

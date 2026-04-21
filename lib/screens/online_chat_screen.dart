@@ -11,7 +11,8 @@ import '../services/online_chat_service.dart';
 import '../services/user_profile_service.dart';
 import '../widgets/user_avatar.dart';
 import 'chat_screen.dart';
-import 'contacts_screen.dart';
+import 'friends_management_screen.dart';
+import 'new_online_message_screen.dart';
 
 class OnlineChatScreen extends StatefulWidget {
   const OnlineChatScreen({super.key});
@@ -268,7 +269,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           context: context,
           builder: (_) => AlertDialog(
             title: const Text('Delete Conversation?'),
-            content: Text('Hide your chat with $name from this device?'),
+            content: Text('Delete your chat with $name? The messages will be removed from your device, but the other person can still see them.'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
@@ -276,6 +277,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
               ),
               ElevatedButton(
                 onPressed: () => Navigator.pop(context, true),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
                 child: const Text('Delete'),
               ),
             ],
@@ -285,11 +287,38 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
 
     if (!confirmed) return;
 
-    await onlineChatService.hideConversation(uid);
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Conversation with $name hidden')),
-    );
+    try {
+      final chatId = onlineChatService.getChatId(uid);
+      final chatRef = FirebaseFirestore.instance.collection('chats').doc(chatId);
+      final currentUserId = onlineChatService.currentUserId;
+      
+      // 1. Hide conversation from the active list
+      await onlineChatService.hideConversation(uid);
+
+      // 2. Mark all existing messages as deleted for the current user only
+      final messages = await chatRef.collection('messages').get();
+      if (messages.docs.isNotEmpty) {
+        final batch = FirebaseFirestore.instance.batch();
+        for (final doc in messages.docs) {
+          batch.set(
+            doc.reference,
+            {'deletedFor': FieldValue.arrayUnion([currentUserId])},
+            SetOptions(merge: true),
+          );
+        }
+        await batch.commit();
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Conversation with $name deleted')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to delete conversation: $e')),
+      );
+    }
   }
 
   Future<void> _toggleConversationMute({
@@ -464,7 +493,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                     style: TextStyle(color: Colors.white),
                   ),
                   subtitle: const Text(
-                    'Remove this conversation from your chat list',
+            'Delete this conversation from your end only',
                     style: TextStyle(color: Colors.white54),
                   ),
                   onTap: () {
@@ -606,6 +635,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   }) {
     final activeEntries = <String, _ConversationEntry>{};
     final friendOnlyEntries = <String, _ConversationEntry>{};
+    final hiddenUids = <String>{};
     final query = searchText.trim().toLowerCase();
 
     for (final doc in chatSnapshot.docs) {
@@ -614,9 +644,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
         final hiddenFor = Map<String, dynamic>.from(
           data['hiddenFor'] ?? const <String, dynamic>{},
         );
-        if (hiddenFor[onlineChatService.currentUserId] == true) {
-          continue;
-        }
 
         final participants = _readStringList(data['participants']);
         final otherUserId = participants.firstWhere(
@@ -624,6 +651,11 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           orElse: () => '',
         );
         if (otherUserId.isEmpty) continue;
+
+        if (hiddenFor[onlineChatService.currentUserId] == true) {
+          hiddenUids.add(otherUserId);
+          continue;
+        }
 
         final names = Map<String, dynamic>.from(
           data['participantNames'] ?? const <String, dynamic>{},
@@ -718,6 +750,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
         final uid = _docUid(doc);
         if (uid.isEmpty) continue;
         if (activeEntries.containsKey(uid)) continue;
+            if (hiddenUids.contains(uid)) continue;
 
         final name = (data['name']?.toString().trim().isNotEmpty == true)
             ? data['name'].toString().trim()
@@ -950,9 +983,21 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                 ),
               ),
               const SizedBox(width: 12),
-              Container(
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(999),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const FriendsManagementScreen(),
+                  ),
+                );
+              },
+              child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 decoration: BoxDecoration(
                   color: _surfaceElevatedColor,
                   borderRadius: BorderRadius.circular(999),
@@ -961,18 +1006,20 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                 child: const Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.lock_outline, color: Colors.white70, size: 14),
+                    Icon(Icons.people_alt_outlined, color: Colors.white, size: 16),
                     SizedBox(width: 6),
                     Text(
-                      'Encrypted',
+                      'Friends',
                       style: TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.w700,
-                        fontSize: 12,
+                        fontSize: 13,
                       ),
                     ),
                   ],
                 ),
+              ),
+            ),
               ),
             ],
           ),
@@ -1124,16 +1171,16 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (_) => const ContactsScreen(),
+                  builder: (_) => const NewOnlineMessageScreen(),
                 ),
               );
             },
             icon: const Icon(
-              Icons.person_add_alt_1,
+              Icons.edit_square,
               color: Colors.white,
             ),
             label: const Text(
-              'Open Contacts',
+              'New Message',
               style: TextStyle(color: Colors.white),
             ),
           ),
@@ -1581,11 +1628,11 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           Navigator.push(
             context,
             MaterialPageRoute(
-              builder: (_) => const ContactsScreen(),
+              builder: (_) => const NewOnlineMessageScreen(),
             ),
           );
         },
-        child: const Icon(Icons.chat, color: Colors.white),
+        child: const Icon(Icons.edit_square, color: Colors.white),
       ),
       body: Column(
         children: [

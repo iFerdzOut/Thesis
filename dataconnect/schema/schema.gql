@@ -1,0 +1,15 @@
+# PostgreSQL Table Definition for the Thesis Feedback Loop
+type ModelFeedback @table(name: "model_feedback") {
+  id: UUID! @default(expr: "uuidV4()")
+  label: String!             # 'false_positive', 'false_negative', 'confirmed_smishing'
+  aiPrediction: String!
+  userCorrection: String!
+  source: String!            # 'sms' or 'online'
+  senderType: String!        # 'phone_number', 'sender_id', 'unknown'
+  messageSanitized: String!  # Strict PII sanitized string
+  messageLength: Int!
+  hasUrl: Boolean!
+  appVersion: String!
+  
+  reportedAt: Timestamp! @default(expr: "request.time")
+}
