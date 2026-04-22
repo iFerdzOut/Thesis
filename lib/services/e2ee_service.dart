@@ -72,6 +72,39 @@ class E2eeService {
     return await _hasRemoteRecoveryBackup(currentUserId);
   }
 
+  Future<RemoteBackupStatus> getRemoteBackupStatus() async {
+    final uid = currentUserId;
+    if (uid.isEmpty) {
+      return const RemoteBackupStatus.none();
+    }
+
+    final userDoc = await _firestore
+        .collection('users')
+        .doc(uid)
+        .get(const GetOptions(source: Source.server));
+    final data = userDoc.data() ?? const <String, dynamic>{};
+    final hasRecoveryPayload = _hasRecoveryPayload(data);
+    final hasPinMetadata = data['zkPinEnabled'] == true ||
+        (data['zkPinSalt']?.toString().trim().isNotEmpty ?? false) ||
+        (data['zkMasterKeyCipherText']?.toString().trim().isNotEmpty ?? false);
+    final hasLegacyBackup =
+        (data['msgBackupCipherText']?.toString().trim().isNotEmpty ?? false);
+    final hasIncrementalBackups = (await _firestore
+            .collection('users')
+            .doc(uid)
+            .collection('message_backups')
+            .limit(1)
+            .get(const GetOptions(source: Source.server)))
+        .docs
+        .isNotEmpty;
+
+    return RemoteBackupStatus(
+      hasRecoveryPayload: hasRecoveryPayload,
+      hasPinMetadata: hasPinMetadata,
+      hasMessageBackup: hasLegacyBackup || hasIncrementalBackups,
+    );
+  }
+
   Future<String> getCurrentUserPublicKeyBase64() async {
     await ensureIdentityForCurrentUser();
     final keyPair = await _readCurrentUserKeyPair();
@@ -195,11 +228,20 @@ class E2eeService {
       pin: pin.trim(),
       salt: base64Decode(saltB64),
     );
-    await restoreIdentityFromRecoveryKey(passphrase: derivedPassphrase);
+    if (_hasRecoveryPayload(data)) {
+      await restoreIdentityFromRecoveryKey(passphrase: derivedPassphrase);
+    } else if (!await _hasLocalIdentity(uid)) {
+      throw Exception(
+        'Your PIN exists on the server, but the encrypted identity backup is '
+        'incomplete. Try your recovery code or reset via email.',
+      );
+    }
     await _secureStorage.write(
       key: '$_zeroKnowledgePassphrasePrefix$uid',
       value: derivedPassphrase,
     );
+    await ensureReady(syncRemote: true);
+    await syncAutomaticAccountBackupIfAvailable();
   }
 
   Future<void> _restoreFromLegacyPin(String normalizedPin) async {
@@ -262,6 +304,8 @@ class E2eeService {
         key: '$_zeroKnowledgePassphrasePrefix$uid',
         value: derivedPassphrase,
       );
+      await ensureReady(syncRemote: true);
+      await syncAutomaticAccountBackupIfAvailable();
     } catch (_) {
       throw Exception('Recovery code is incorrect.');
     }
@@ -790,6 +834,7 @@ class E2eeService {
     if (passphrase == null || passphrase.isEmpty) {
       return;
     }
+    final backupPassphrase = passphrase;
 
     final inFlight = _automaticBackupSyncFuture;
     if (inFlight != null) {
@@ -800,7 +845,10 @@ class E2eeService {
     final future = () async {
       try {
         await ensureIdentityForCurrentUser(forceRepublish: false);
-        await _saveIncrementalMessageBackup(uid: uid, passphrase: passphrase);
+        await _saveIncrementalMessageBackup(
+          uid: uid,
+          passphrase: backupPassphrase,
+        );
       } catch (error) {
         debugPrint('[E2eeService] Automatic backup sync skipped: $error');
       }
@@ -1604,6 +1652,17 @@ class E2eeService {
         macB64.isNotEmpty;
   }
 
+  bool _hasRecoveryPayload(Map<String, dynamic> data) {
+    final cipherTextB64 = data['e2eeRecoveryCipherText']?.toString() ?? '';
+    final saltB64 = data['e2eeRecoverySalt']?.toString() ?? '';
+    final nonceB64 = data['e2eeRecoveryNonce']?.toString() ?? '';
+    final macB64 = data['e2eeRecoveryMac']?.toString() ?? '';
+    return cipherTextB64.isNotEmpty &&
+        saltB64.isNotEmpty &&
+        nonceB64.isNotEmpty &&
+        macB64.isNotEmpty;
+  }
+
   void _resetCachesIfUserChanged(String uid) {
     if (_cachedKeyPairUserId == null || _cachedKeyPairUserId == uid) return;
     _cachedKeyPairUserId = null;
@@ -1682,4 +1741,24 @@ class RSAKeyPairData {
   final String publicKeyPem;
 
   RSAKeyPairData(this.privateKeyPem, this.publicKeyPem);
+}
+
+class RemoteBackupStatus {
+  final bool hasRecoveryPayload;
+  final bool hasPinMetadata;
+  final bool hasMessageBackup;
+
+  const RemoteBackupStatus({
+    required this.hasRecoveryPayload,
+    required this.hasPinMetadata,
+    required this.hasMessageBackup,
+  });
+
+  const RemoteBackupStatus.none()
+      : hasRecoveryPayload = false,
+        hasPinMetadata = false,
+        hasMessageBackup = false;
+
+  bool get requiresPinRestore =>
+      hasRecoveryPayload || hasPinMetadata || hasMessageBackup;
 }

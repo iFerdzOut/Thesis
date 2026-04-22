@@ -19,6 +19,8 @@ class SecureBackupGate extends StatefulWidget {
 }
 
 class _SecureBackupGateState extends State<SecureBackupGate> {
+  static final Set<String> _sessionUnlockedUsers = <String>{};
+
   bool _isChecking = true;
   bool _needsSetup = false;
   bool _needsRestore = false;
@@ -36,6 +38,25 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
     _checkState();
   }
 
+  void _syncSessionStateForUser(String? uid) {
+    final normalizedUid = uid?.trim();
+    if (normalizedUid == null || normalizedUid.isEmpty) {
+      _sessionUnlockedUsers.clear();
+      _unlockedThisSession = false;
+      return;
+    }
+    _unlockedThisSession = _sessionUnlockedUsers.contains(normalizedUid);
+  }
+
+  void _markUnlockedForCurrentSession(String uid) {
+    final normalizedUid = uid.trim();
+    if (normalizedUid.isEmpty) {
+      return;
+    }
+    _sessionUnlockedUsers.add(normalizedUid);
+    _unlockedThisSession = true;
+  }
+
   Future<void> _checkState() async {
     if (!mounted) return;
     setState(() {
@@ -46,6 +67,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
     });
 
     final uid = FirebaseAuth.instance.currentUser?.uid;
+    _syncSessionStateForUser(uid);
     if (uid == null) {
       if (mounted) setState(() => _isChecking = false);
       return;
@@ -59,7 +81,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
     // launch — only re-verify when local identity is no longer present
     // (which is the only case that requires a restore or fresh setup).
     try {
-      final confirmed = null;
+      const confirmed = null;
       if (confirmed == 'true') {
         final hasLocal = await e2ee.hasLocalIdentity();
         if (hasLocal) {
@@ -83,11 +105,12 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
       debugPrint('[SecureBackupGate] hasLocalIdentity error: $error');
     }
 
-    bool hasRemote;
+    late final RemoteBackupStatus remoteStatus;
     try {
-      hasRemote = await e2ee.hasRemoteBackup();
+      remoteStatus = await e2ee.getRemoteBackupStatus();
     } catch (error) {
-      debugPrint('[SecureBackupGate] hasRemoteBackup error (offline?): $error');
+      debugPrint(
+          '[SecureBackupGate] getRemoteBackupStatus error (offline?): $error');
       // Server unreachable — if the user has no local identity (reinstall),
       // show an offline/retry UI instead of silently failing open.
       if (!hasLocal && mounted) {
@@ -104,16 +127,22 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
 
     if (!mounted) return;
 
-    if (hasRemote) {
+    if (remoteStatus.requiresPinRestore) {
       if (!_unlockedThisSession) {
+        // User has a remote backup but hasn't entered PIN this session
+        // Show restore screen to decrypt messages
+        if (!mounted) return;
         setState(() {
           _needsRestore = true;
           _isChecking = false;
         });
         return;
       }
+      // Already unlocked this session, proceed with app
+      debugPrint(
+          '[SecureBackupGate] Already unlocked this session, proceeding');
       unawaited(e2ee.ensureReady());
-      setState(() => _isChecking = false);
+      if (mounted) setState(() => _isChecking = false);
       return;
     }
 
@@ -204,16 +233,33 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
         canPop: false,
         child: SecureBackupRestoreScreen(
           onRestoreComplete: () async {
-            _unlockedThisSession = true;
-            setState(() {
-              _needsRestore = false;
-              _isChecking = true;
-            });
-            _checkState();
+            final uid = FirebaseAuth.instance.currentUser?.uid;
+            // User successfully entered PIN and restored backup
+            // Mark as unlocked for this session
+            if (uid != null) {
+              _markUnlockedForCurrentSession(uid);
+            }
+            debugPrint(
+                '[SecureBackupGate] Backup restore complete, unlocking session');
+            if (mounted) {
+              setState(() {
+                _needsRestore = false;
+                _isChecking = true;
+              });
+              // Wait a moment for UI to update, then check state again
+              await Future.delayed(const Duration(milliseconds: 100));
+              _checkState();
+            }
           },
           onEmailResetComplete: () {
+            final uid = FirebaseAuth.instance.currentUser?.uid;
             if (!mounted) return;
-            _unlockedThisSession = true;
+            // Email reset clears backup, so user needs new setup
+            if (uid != null) {
+              _markUnlockedForCurrentSession(uid);
+            }
+            debugPrint(
+                '[SecureBackupGate] Email reset complete, clearing backup');
             setState(() {
               _needsRestore = false;
               _isChecking = true;
@@ -229,12 +275,23 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
         canPop: false,
         child: SecureBackupSetupScreen(
           onSetupComplete: () async {
-            _unlockedThisSession = true;
-            setState(() {
-              _needsSetup = false;
-              _isChecking = true;
-            });
-            _checkState();
+            final uid = FirebaseAuth.instance.currentUser?.uid;
+            // User successfully set up PIN and backup
+            // Mark as unlocked for this session
+            if (uid != null) {
+              _markUnlockedForCurrentSession(uid);
+            }
+            debugPrint(
+                '[SecureBackupGate] Backup setup complete, unlocking session');
+            if (mounted) {
+              setState(() {
+                _needsSetup = false;
+                _isChecking = true;
+              });
+              // Wait a moment for UI to update, then check state again
+              await Future.delayed(const Duration(milliseconds: 100));
+              _checkState();
+            }
           },
         ),
       );

@@ -9,6 +9,7 @@ import android.content.res.Configuration
 import android.media.AudioManager
 import android.media.AudioFocusRequest
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.media.ToneGenerator
@@ -203,6 +204,12 @@ class MainActivity : FlutterActivity() {
                 "prepareCallAudioState" -> {
                     val speaker = call.argument<Boolean>("speaker") ?: false
                     prepareCallAudioState(speaker)
+                    result.success(null)
+                }
+
+                "setSpeakerphoneOn" -> {
+                    val speaker = call.argument<Boolean>("speaker") ?: false
+                    setSpeakerphoneOn(speaker)
                     result.success(null)
                 }
 
@@ -1287,6 +1294,56 @@ class MainActivity : FlutterActivity() {
         try {
             audioManager.isMicrophoneMute = false
         } catch (_: Exception) {
+        }
+
+        setCommunicationDevice(audioManager, speaker)
+    }
+
+    private fun setSpeakerphoneOn(speaker: Boolean) {
+        val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+        requestCallAudioFocus(audioManager)
+
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        } catch (_: Exception) {
+        }
+
+        try {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = speaker
+        } catch (_: Exception) {
+        }
+
+        try {
+            audioManager.isMicrophoneMute = false
+        } catch (_: Exception) {
+        }
+
+        setCommunicationDevice(audioManager, speaker)
+    }
+
+    private fun setCommunicationDevice(audioManager: AudioManager, speaker: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return
+        }
+
+        try {
+            audioManager.clearCommunicationDevice()
+        } catch (_: Exception) {
+        }
+
+        try {
+            val targetType =
+                if (speaker) AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                else AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            val targetDevice = audioManager.availableCommunicationDevices.firstOrNull {
+                it.type == targetType
+            }
+            if (targetDevice != null) {
+                audioManager.setCommunicationDevice(targetDevice)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to select communication device: ${e.message}", e)
         }
     }
 

@@ -362,8 +362,7 @@ class _CallScreenState extends State<CallScreen>
       final remoteEnabledVideo = data['${remotePrefix}_videoEnabled'] == true ||
           data['isVideo'] == true;
       final remoteMuted = data['${remotePrefix}_micMuted'] == true;
-      final remoteCameraIsOff =
-          data['${remotePrefix}_cameraOff'] == true;
+      final remoteCameraIsOff = data['${remotePrefix}_cameraOff'] == true;
       final localCameraIsOff = data['${localPrefix}_cameraOff'] == true;
 
       if (mounted) {
@@ -597,7 +596,16 @@ class _CallScreenState extends State<CallScreen>
   Future<void> _resetPostCallAudio() async {
     try {
       await _channel.invokeMethod('resetCallAudioState');
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[CallScreen] resetCallAudioState error: $e');
+    }
+
+    // Also reset via Helper
+    try {
+      await Helper.setSpeakerphoneOn(true);
+    } catch (e) {
+      debugPrint('[CallScreen] Helper reset error: $e');
+    }
 
     _audioOutput = 'speaker';
   }
@@ -652,20 +660,23 @@ class _CallScreenState extends State<CallScreen>
   Future<void> _setAudioOutput({required bool speaker}) async {
     _audioOutput = speaker ? 'speaker' : 'earpiece';
     try {
+      await _channel.invokeMethod('setSpeakerphoneOn', {'speaker': speaker});
+    } catch (e) {
+      debugPrint('[CallScreen] Native setSpeakerphoneOn failed: $e');
+    }
+    try {
+      // Try using Helper first (flutter_webrtc built-in)
       await Helper.setSpeakerphoneOn(speaker);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[CallScreen] Helper.setSpeakerphoneOn failed: $e');
+    }
+    if (!mounted) return;
+    setState(() {});
   }
 
   void _cycleAudioOutput() {
-    setState(() {
-      if (_audioOutput == 'earpiece') {
-        _audioOutput = 'speaker';
-        _setAudioOutput(speaker: true);
-      } else {
-        _audioOutput = 'earpiece';
-        _setAudioOutput(speaker: false);
-      }
-    });
+    final useSpeaker = _audioOutput == 'earpiece';
+    unawaited(_setAudioOutput(speaker: useSpeaker));
   }
 
   IconData get _audioIcon =>
@@ -685,17 +696,39 @@ class _CallScreenState extends State<CallScreen>
     _audioOutput = speaker ? 'speaker' : 'earpiece';
 
     try {
+      // Reset audio state first
       await _channel.invokeMethod('resetCallAudioState');
       await Future<void>.delayed(const Duration(milliseconds: 120));
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[CallScreen] resetCallAudioState error: $e');
+    }
 
     try {
+      // Then prepare with the desired audio mode
       await _channel.invokeMethod(
         'prepareCallAudioState',
         {'speaker': speaker},
       );
       await Future<void>.delayed(const Duration(milliseconds: 160));
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[CallScreen] prepareCallAudioState error: $e');
+    }
+
+    // Also set via Helper as fallback
+    try {
+      await _channel.invokeMethod('setSpeakerphoneOn', {'speaker': speaker});
+    } catch (e) {
+      debugPrint(
+          '[CallScreen] Native setSpeakerphoneOn during prepare error: $e');
+    }
+
+    // Also set via Helper as fallback
+    try {
+      await Helper.setSpeakerphoneOn(speaker);
+    } catch (e) {
+      debugPrint(
+          '[CallScreen] Helper.setSpeakerphoneOn during prepare error: $e');
+    }
   }
 
   Future<void> _startOutgoingCall() async {
@@ -1006,7 +1039,7 @@ class _CallScreenState extends State<CallScreen>
     }
   }
 
-  void _switchCamera() {
+  Future<void> _switchCamera() async {
     final videoTracks = callService.localStream?.getVideoTracks() ?? const [];
     if (videoTracks.isEmpty) {
       if (!mounted) return;
@@ -1018,9 +1051,21 @@ class _CallScreenState extends State<CallScreen>
       return;
     }
 
-    setState(() => isFrontCamera = !isFrontCamera);
-    for (final track in videoTracks) {
-      Helper.switchCamera(track);
+    try {
+      for (final track in videoTracks) {
+        await Helper.switchCamera(track);
+      }
+      if (!mounted) return;
+      setState(() => isFrontCamera = !isFrontCamera);
+    } catch (e) {
+      debugPrint('[CallScreen] Camera switch error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not switch camera: $e'),
+          ),
+        );
+      }
     }
   }
 
@@ -1059,7 +1104,9 @@ class _CallScreenState extends State<CallScreen>
         setState(() => isVideoEnabled = false);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Could not start camera: $e')),
+            SnackBar(
+              content: Text('Could not start camera: $e'),
+            ),
           );
         }
       }
@@ -1491,8 +1538,7 @@ class _CallScreenState extends State<CallScreen>
   }
 
   bool get _showRemoteVideo =>
-      !isRemoteCameraOff &&
-      (callService.hasRemoteVideoTrack || isVideoEnabled);
+      !isRemoteCameraOff && (callService.hasRemoteVideoTrack || isVideoEnabled);
 
   Widget _buildVideoCallUI() {
     if (_isInPictureInPictureMode) {
