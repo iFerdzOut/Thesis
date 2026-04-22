@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/detection_result_model.dart';
+import '../models/safety_status.dart';
 import '../models/screened_message_model.dart';
 import 'native_channel_router.dart';
 import 'notification_service.dart';
@@ -15,6 +16,7 @@ import 'local_detection_repository.dart';
 import 'message_routing_service.dart';
 import 'message_screening_service.dart';
 import 'sms_storage_service.dart';
+import 'smishing_detection_pipeline_service.dart';
 import 'url_extraction_service.dart';
 
 class SmsCapabilityState {
@@ -86,6 +88,8 @@ class SmsService {
   static const MethodChannel _channel = NativeChannelRouter.channel;
   static final MessageScreeningService _screeningService =
       MessageScreeningService();
+  static final SmishingDetectionPipelineService _pipelineService =
+      SmishingDetectionPipelineService();
   static const MessageRoutingService _routingService = MessageRoutingService();
   static final LocalDetectionRepository _detectionRepository =
       LocalDetectionRepository();
@@ -271,6 +275,7 @@ class SmsService {
 
     final future = () async {
       try {
+        await _pipelineService.initialize();
         await _screeningService.warmUp();
       } catch (error) {
         debugPrint('[SmsService] Detection warm-up skipped: $error');
@@ -346,17 +351,76 @@ class SmsService {
       return;
     }
 
-    final DetectionResultModel decision = await _resolveScreeningResult(
-      args: args,
+    final ScreenedMessageModel screenedMessage = ScreenedMessageModel(
+      source: limitedMode ? 'sms_limited' : 'sms',
       sender: sender,
+      peer: sender,
       body: body,
       timestampMs: timestampMs,
       messageKey: messageKey,
       providerId: providerId,
       providerThreadId: providerThreadId,
       simSlot: simSlot,
-      limitedMode: limitedMode,
+      subscriptionId: (args['subscriptionId'] as num?)?.toInt(),
     );
+    final SmishingQuickVerdict quickVerdict =
+        await _pipelineService.quickScan(screenedMessage);
+
+    if (quickVerdict.status == SafetyStatus.scanning) {
+      await _storage.saveMessage(
+        SmsMessage(
+          sender: sender,
+          body: body,
+          time: DateTime.fromMillisecondsSinceEpoch(timestampMs),
+          simSlot: simSlot,
+          providerId: providerId,
+          providerThreadId: providerThreadId,
+          messageKey: messageKey,
+          detectionDecision: 'scanning',
+          detectionReasons: const <String>[
+            'Scanning suspicious link in the background.',
+          ],
+          detectionSource: 'tiered_worker_pipeline',
+          pipelineStage: 'queue_wait',
+          safetyStatus: SafetyStatus.scanning,
+        ),
+      );
+      _pipelineService.enqueue(
+        message: screenedMessage,
+        priority: SmishingQueuePriority.high,
+        onResult: (DetectionResultModel result) async {
+          await _applyDetectionOutcome(
+            result: result,
+            sender: sender,
+            body: body,
+            timestampMs: timestampMs,
+            simSlot: simSlot,
+            providerId: providerId,
+            providerThreadId: providerThreadId,
+            limitedMode: limitedMode,
+          );
+        },
+      );
+      if (senderDisplay.isNotEmpty && senderDisplay != sender) {
+        await _storage.updateThreadSenderDisplay(sender, senderDisplay);
+      }
+      await primeInboxThreads(force: true);
+      unawaited(scheduleInboxMaintenance(force: true));
+      return;
+    }
+
+    final DetectionResultModel decision = quickVerdict.result ??
+        await _resolveScreeningResult(
+          args: args,
+          sender: sender,
+          body: body,
+          timestampMs: timestampMs,
+          messageKey: messageKey,
+          providerId: providerId,
+          providerThreadId: providerThreadId,
+          simSlot: simSlot,
+          limitedMode: limitedMode,
+        );
 
     if (messageKey.isNotEmpty) {
       await _detectionRepository.bindProviderIdentity(
@@ -365,63 +429,16 @@ class SmsService {
         providerThreadId: providerThreadId,
       );
     }
-
-    final message = SmsMessage(
+    await _applyDetectionOutcome(
+      result: decision,
       sender: sender,
       body: body,
-      time: DateTime.fromMillisecondsSinceEpoch(timestampMs),
-      isSuspicious: decision.isSuspicious,
+      timestampMs: timestampMs,
       simSlot: simSlot,
-      riskScore: decision.riskScore,
-      riskLevel: decision.riskLevel,
-      detectionReasons: decision.explanations,
-      modelScore: decision.modelScore,
-      heuristicScore: decision.heuristicScore,
-      detectionSource: decision.detectionSource,
-      pipelineStage: decision.pipelineStage,
       providerId: providerId,
       providerThreadId: providerThreadId,
-      messageKey: decision.messageKey,
-      detectionDecision: decision.decision,
-      extractedUrls: decision.extractedUrls,
-      primaryUrl: decision.primaryUrl,
-      primaryDomain: decision.primaryDomain,
-      needsRescan: decision.needsRescan,
+      limitedMode: limitedMode,
     );
-
-    if (_routingService.shouldQuarantine(decision)) {
-      if (providerId != null && providerId > 0) {
-        try {
-          await _channel.invokeMethod<bool>('deleteProviderSms', {
-            'providerId': providerId,
-          });
-        } catch (error) {
-          debugPrint('[SmsService] deleteProviderSms error: $error');
-        }
-      }
-
-      await _storage.saveToQuarantine(message);
-      if (!_smsExperienceActive) {
-        await NotificationService.showSuspiciousNotification(sender: sender);
-      }
-    } else {
-      if (providerId != null && providerId > 0 && !limitedMode) {
-        await syncThread(
-          address: sender,
-          threadId: providerThreadId,
-          force: true,
-        );
-      } else {
-        await _storage.saveMessage(message);
-      }
-      if (!_smsExperienceActive) {
-        await NotificationService.showSafeNotification(
-          sender: sender,
-          body: body,
-          timestampMs: timestampMs,
-        );
-      }
-    }
 
     if (senderDisplay.isNotEmpty && senderDisplay != sender) {
       await _storage.updateThreadSenderDisplay(sender, senderDisplay);
@@ -433,6 +450,82 @@ class SmsService {
 
     await primeInboxThreads(force: true);
     unawaited(scheduleInboxMaintenance(force: true));
+  }
+
+  static Future<void> _applyDetectionOutcome({
+    required DetectionResultModel result,
+    required String sender,
+    required String body,
+    required int timestampMs,
+    required int simSlot,
+    required int? providerId,
+    required String? providerThreadId,
+    required bool limitedMode,
+  }) async {
+    final SmsMessage message = SmsMessage(
+      sender: sender,
+      body: body,
+      time: DateTime.fromMillisecondsSinceEpoch(timestampMs),
+      isSuspicious: result.isSuspicious,
+      simSlot: simSlot,
+      riskScore: result.riskScore,
+      riskLevel: result.riskLevel,
+      detectionReasons: result.explanations,
+      modelScore: result.modelScore,
+      heuristicScore: result.heuristicScore,
+      detectionSource: result.detectionSource,
+      pipelineStage: result.pipelineStage,
+      providerId: providerId,
+      providerThreadId: providerThreadId,
+      messageKey: result.messageKey,
+      detectionDecision: result.decision,
+      extractedUrls: result.extractedUrls,
+      primaryUrl: result.primaryUrl,
+      primaryDomain: result.primaryDomain,
+      needsRescan: result.needsRescan,
+      safetyStatus:
+          result.shouldQuarantine ? SafetyStatus.malicious : SafetyStatus.safe,
+    );
+
+    if (_routingService.shouldQuarantine(result)) {
+      if (providerId != null && providerId > 0) {
+        try {
+          await _channel.invokeMethod<bool>('deleteProviderSms', {
+            'providerId': providerId,
+          });
+        } catch (error) {
+          debugPrint('[SmsService] deleteProviderSms error: $error');
+        }
+      }
+
+      await _storage.removeVisibleProviderMessage(
+        peer: sender,
+        providerId: providerId ?? -1,
+      );
+      await _storage.saveToQuarantine(message);
+      if (!_smsExperienceActive) {
+        await NotificationService.showSuspiciousNotification(sender: sender);
+      }
+      return;
+    }
+
+    if (providerId != null && providerId > 0 && !limitedMode) {
+      await syncThread(
+        address: sender,
+        threadId: providerThreadId,
+        force: true,
+      );
+      return;
+    }
+
+    await _storage.saveMessage(message);
+    if (!_smsExperienceActive) {
+      await NotificationService.showSafeNotification(
+        sender: sender,
+        body: body,
+        timestampMs: timestampMs,
+      );
+    }
   }
 
   static Future<void> _handleRoleChanged(Map<String, dynamic> args) async {
@@ -523,13 +616,15 @@ class SmsService {
   }
 
   static Future<void> _rescanPendingFallbackMessages() async {
-    final pending = await _detectionRepository.listPendingRescanMessages(limit: 12);
+    final pending =
+        await _detectionRepository.listPendingRescanMessages(limit: 12);
     if (pending.isEmpty) {
       return;
     }
 
     for (final ScreenedMessageModel item in pending) {
-      final DetectionResultModel rescored = await _screeningService.screenMessage(
+      final DetectionResultModel rescored =
+          await _screeningService.screenMessage(
         item,
         forceRescore: true,
       );
@@ -764,11 +859,11 @@ class SmsService {
     return <String, dynamic>{
       ...payload,
       'threads': threads,
-      'changedThreadIds': (payload['changedThreadIds'] as List<dynamic>? ??
-              const <dynamic>[])
-          .map((item) => item.toString())
-          .where((item) => item.trim().isNotEmpty)
-          .toList(growable: false),
+      'changedThreadIds':
+          (payload['changedThreadIds'] as List<dynamic>? ?? const <dynamic>[])
+              .map((item) => item.toString())
+              .where((item) => item.trim().isNotEmpty)
+              .toList(growable: false),
     };
   }
 
@@ -845,9 +940,9 @@ class SmsService {
               .toList(growable: false);
       for (final threadId in changedThreadIds) {
         final thread = threads.firstWhere(
-              (item) => item['threadId']?.toString() == threadId,
-              orElse: () => const <String, dynamic>{},
-            );
+          (item) => item['threadId']?.toString() == threadId,
+          orElse: () => const <String, dynamic>{},
+        );
         final sender = thread['sender']?.toString() ?? '';
         if (sender.isEmpty) {
           continue;
@@ -923,8 +1018,7 @@ class SmsService {
 
       final detectionDecision = message['detectionDecision']?.toString() ?? '';
       final detectionSource = message['detectionSource']?.toString() ?? '';
-      final bool needsUpgradeSweep =
-          detectionDecision.isEmpty ||
+      final bool needsUpgradeSweep = detectionDecision.isEmpty ||
           detectionDecision == DetectionDecision.noUrlAllow ||
           detectionSource == 'sms_no_url_allow';
       if (!needsUpgradeSweep) {
@@ -966,9 +1060,8 @@ class SmsService {
         final sender = message['sender']?.toString() ?? '';
         final body =
             message['body']?.toString() ?? message['text']?.toString() ?? '';
-        final timestampMs =
-            (message['timestampMs'] as num?)?.toInt() ??
-                DateTime.now().millisecondsSinceEpoch;
+        final timestampMs = (message['timestampMs'] as num?)?.toInt() ??
+            DateTime.now().millisecondsSinceEpoch;
         final rescored = await _screenStoredSmsEntry(
           sender: sender,
           body: body,
@@ -1000,7 +1093,8 @@ class SmsService {
         }
       } catch (error) {
         errors++;
-        debugPrint('[SmsService] URL extractor upgrade sweep item failed: $error');
+        debugPrint(
+            '[SmsService] URL extractor upgrade sweep item failed: $error');
       }
     }
 
@@ -1013,7 +1107,8 @@ class SmsService {
     );
   }
 
-  static Future<SmsRescanSummary> rescanStoredMessagesWithCurrentPipeline() async {
+  static Future<SmsRescanSummary>
+      rescanStoredMessagesWithCurrentPipeline() async {
     await _storage.initialize();
     final stopwatch = Stopwatch()..start();
 
@@ -1168,7 +1263,8 @@ class SmsService {
       return;
     }
 
-    final future = syncThread(address: address, threadId: threadId, force: force);
+    final future =
+        syncThread(address: address, threadId: threadId, force: force);
     _threadPrimeFutures[key] = future;
     try {
       await future;
@@ -1211,8 +1307,8 @@ class SmsService {
           .whereType<int>()
           .toSet()
           .toList(growable: false);
-      final overlays =
-          await _detectionRepository.getScreeningResultsForProviderIds(providerIds);
+      final overlays = await _detectionRepository
+          .getScreeningResultsForProviderIds(providerIds);
       final enrichedMessages = messages.map((message) {
         final providerId = (message['providerId'] as num?)?.toInt();
         final overlay = providerId == null ? null : overlays[providerId];
@@ -1362,22 +1458,25 @@ class SmsService {
     int? providerId,
     String? providerThreadId,
     int? simSlot,
-  }) {
-    return _screeningService.screenMessage(
-      ScreenedMessageModel(
-        source: 'sms',
-        sender: sender,
-        peer: sender,
-        body: body,
-        timestampMs: timestampMs,
-        messageKey: messageKey,
-        providerId: providerId,
-        providerThreadId: providerThreadId,
-        simSlot: simSlot,
-        subscriptionId: null,
-      ),
-      forceRescore: true,
+  }) async {
+    final ScreenedMessageModel message = ScreenedMessageModel(
+      source: 'sms',
+      sender: sender,
+      peer: sender,
+      body: body,
+      timestampMs: timestampMs,
+      messageKey: messageKey,
+      providerId: providerId,
+      providerThreadId: providerThreadId,
+      simSlot: simSlot,
+      subscriptionId: null,
     );
+    final SmishingQuickVerdict quickVerdict =
+        await _pipelineService.quickScan(message);
+    if (quickVerdict.result != null) {
+      return quickVerdict.result!;
+    }
+    return _pipelineService.deepScan(message);
   }
 
   static String _storedMessageKeyForMap(
@@ -1389,8 +1488,8 @@ class SmsService {
       return existing;
     }
     final providerId = (map['providerId'] as num?)?.toInt();
-    final timestampMs =
-        (map['timestampMs'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch;
+    final timestampMs = (map['timestampMs'] as num?)?.toInt() ??
+        DateTime.now().millisecondsSinceEpoch;
     final sender = map['sender']?.toString() ??
         map['peer']?.toString() ??
         'unknown_sender';
@@ -1408,9 +1507,12 @@ class SmsService {
       'riskScore': rescored.riskScore,
       'riskLevel': rescored.riskLevel,
       'messageKey': rescored.messageKey,
-      'body': original['body']?.toString() ?? original['text']?.toString() ?? '',
-      'text': original['text']?.toString() ?? original['body']?.toString() ?? '',
+      'body':
+          original['body']?.toString() ?? original['text']?.toString() ?? '',
+      'text':
+          original['text']?.toString() ?? original['body']?.toString() ?? '',
       'needsRescan': rescored.needsRescan,
+      'safetyStatus': rescored.shouldQuarantine ? 'malicious' : 'safe',
     };
   }
 
@@ -1444,6 +1546,7 @@ class SmsService {
       'riskLevel': rescored.riskLevel,
       'messageKey': rescored.messageKey,
       'needsRescan': rescored.needsRescan,
+      'safetyStatus': rescored.shouldQuarantine ? 'malicious' : 'safe',
     };
   }
 
@@ -1478,6 +1581,9 @@ class SmsService {
       primaryUrl: rescored.primaryUrl,
       primaryDomain: rescored.primaryDomain,
       needsRescan: rescored.needsRescan,
+      safetyStatus: rescored.shouldQuarantine
+          ? SafetyStatus.malicious
+          : SafetyStatus.safe,
     );
   }
 
@@ -1508,6 +1614,9 @@ class SmsService {
       primaryUrl: rescored.primaryUrl,
       primaryDomain: rescored.primaryDomain,
       needsRescan: rescored.needsRescan,
+      safetyStatus: rescored.shouldQuarantine
+          ? SafetyStatus.malicious
+          : SafetyStatus.safe,
     );
   }
 }

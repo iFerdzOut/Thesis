@@ -10,6 +10,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_sqlcipher/sqflite.dart';
 
+import '../models/safety_status.dart';
+
 class SmsMessage {
   const SmsMessage({
     required this.sender,
@@ -36,6 +38,7 @@ class SmsMessage {
     this.primaryUrl,
     this.primaryDomain,
     this.needsRescan = false,
+    this.safetyStatus = SafetyStatus.safe,
   });
 
   final String sender;
@@ -62,6 +65,7 @@ class SmsMessage {
   final String? primaryUrl;
   final String? primaryDomain;
   final bool needsRescan;
+  final SafetyStatus safetyStatus;
 }
 
 class SmsSyncCursor {
@@ -91,7 +95,7 @@ class SmsStorageService {
   static const String _legacyMessagesKey = 'sms_local_messages_v2';
   static const String _legacyQuarantineKey = 'sms_local_quarantine_v2';
   static const String _legacyHiddenThreadsKey = 'sms_hidden_threads_v1';
-  static const int _schemaVersion = 1;
+  static const int _schemaVersion = 2;
 
   Database? _database;
   Future<Database>? _databaseFuture;
@@ -166,6 +170,9 @@ class SmsStorageService {
         version: _schemaVersion,
         onCreate: (Database db, int version) async {
           await _createSchema(db);
+        },
+        onUpgrade: (Database db, int oldVersion, int newVersion) async {
+          await _upgradeSchema(db, oldVersion, newVersion);
         },
       );
       _database = database;
@@ -269,6 +276,7 @@ class SmsStorageService {
         primary_url TEXT,
         primary_domain TEXT,
         needs_rescan INTEGER NOT NULL DEFAULT 0,
+        safety_status TEXT NOT NULL DEFAULT 'safe',
         updated_at INTEGER NOT NULL DEFAULT 0
       )
     ''');
@@ -289,6 +297,7 @@ class SmsStorageService {
         primary_url TEXT,
         primary_domain TEXT,
         needs_rescan INTEGER NOT NULL DEFAULT 0,
+        safety_status TEXT NOT NULL DEFAULT 'malicious',
         time TEXT,
         timestamp TEXT,
         timestamp_ms INTEGER NOT NULL,
@@ -328,6 +337,24 @@ class SmsStorageService {
       CREATE INDEX idx_sms_threads_last_timestamp
       ON sms_threads(last_timestamp_ms DESC)
     ''');
+  }
+
+  Future<void> _upgradeSchema(
+      Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute(
+        "ALTER TABLE sms_messages ADD COLUMN safety_status TEXT NOT NULL DEFAULT 'safe'",
+      );
+      await db.execute(
+        "ALTER TABLE sms_quarantine ADD COLUMN safety_status TEXT NOT NULL DEFAULT 'malicious'",
+      );
+      await db.execute(
+        "UPDATE sms_messages SET safety_status = CASE WHEN is_suspicious = 1 THEN 'malicious' ELSE 'safe' END",
+      );
+      await db.execute(
+        "UPDATE sms_quarantine SET safety_status = 'malicious'",
+      );
+    }
   }
 
   Future<void> _migrateLegacyDataIfNeeded() async {
@@ -402,10 +429,9 @@ class SmsStorageService {
                     threadId,
                 'last_message': thread['lastMessage']?.toString() ?? '',
                 'last_time': thread['lastTime']?.toString(),
-                'last_timestamp_ms':
-                    _coerceInt(thread['lastTimestampMs']) ??
-                        _parseTimestampMs(thread['lastTime']) ??
-                        0,
+                'last_timestamp_ms': _coerceInt(thread['lastTimestampMs']) ??
+                    _parseTimestampMs(thread['lastTime']) ??
+                    0,
                 'last_direction': thread['lastDirection']?.toString(),
                 'last_message_is_quarantined':
                     thread['lastMessageIsQuarantined'] == true ? 1 : 0,
@@ -418,10 +444,9 @@ class SmsStorageService {
                 'has_suspicious': thread['hasSuspicious'] == true ? 1 : 0,
                 'quarantined_count':
                     _coerceInt(thread['quarantinedCount']) ?? 0,
-                'hidden_at_ms':
-                    hiddenThreadIds.contains(threadId)
-                        ? DateTime.now().millisecondsSinceEpoch
-                        : (_coerceInt(thread['hiddenAtMs']) ?? 0),
+                'hidden_at_ms': hiddenThreadIds.contains(threadId)
+                    ? DateTime.now().millisecondsSinceEpoch
+                    : (_coerceInt(thread['hiddenAtMs']) ?? 0),
                 'updated_at': DateTime.now().millisecondsSinceEpoch,
               },
               conflictAlgorithm: ConflictAlgorithm.replace,
@@ -589,7 +614,8 @@ class SmsStorageService {
 
     final db = await _maybeOpenDatabase();
     if (db == null) {
-      _memoryQuarantine[row['id']!.toString()] = _quarantineDisplayMapFromRow(row);
+      _memoryQuarantine[row['id']!.toString()] =
+          _quarantineDisplayMapFromRow(row);
       await _rebuildMemoryThread(threadId);
       await _emitLocalState(threadId: threadId);
       return;
@@ -613,7 +639,8 @@ class SmsStorageService {
     await _emitLocalState(threadId: threadId);
   }
 
-  Future<void> syncVisibleThreads(List<Map<String, dynamic>> nativeThreads) async {
+  Future<void> syncVisibleThreads(
+      List<Map<String, dynamic>> nativeThreads) async {
     await initialize();
     final db = await _maybeOpenDatabase();
     if (db == null) {
@@ -656,10 +683,9 @@ class SmsStorageService {
               _coerceInt(existing['quarantinedCount']) ??
                   _coerceInt(normalized['quarantinedCount']) ??
                   0;
-          normalized['hiddenAtMs'] =
-              _coerceInt(existing['hiddenAtMs']) ??
-                  _coerceInt(normalized['hiddenAtMs']) ??
-                  0;
+          normalized['hiddenAtMs'] = _coerceInt(existing['hiddenAtMs']) ??
+              _coerceInt(normalized['hiddenAtMs']) ??
+              0;
           if ((normalized['unread'] as num?)?.toInt() == 0) {
             normalized['unread'] = _coerceInt(existing['unread']) ?? 0;
           }
@@ -693,8 +719,8 @@ class SmsStorageService {
     if (db == null) {
       final List<Map<String, dynamic>> rows = nativeMessages
           .map(
-            (message) =>
-                _messageDisplayMapFromRow(_messageRowFromMap(threadId, message)),
+            (message) => _messageDisplayMapFromRow(
+                _messageRowFromMap(threadId, message)),
           )
           .toList(growable: true)
         ..sort(
@@ -731,7 +757,8 @@ class SmsStorageService {
     });
 
     if (nativeMessages.isNotEmpty) {
-      final providerThreadId = nativeMessages.first['providerThreadId']?.toString();
+      final providerThreadId =
+          nativeMessages.first['providerThreadId']?.toString();
       if (providerThreadId != null && providerThreadId.isNotEmpty) {
         _providerThreadIdCache[threadId] = providerThreadId;
       }
@@ -847,7 +874,8 @@ class SmsStorageService {
     await removeVisibleMessage(peer: peer, providerId: providerId);
   }
 
-  Future<Map<String, dynamic>?> getQuarantineMessage(String quarantineId) async {
+  Future<Map<String, dynamic>?> getQuarantineMessage(
+      String quarantineId) async {
     await initialize();
     final db = await _maybeOpenDatabase();
     if (db == null) {
@@ -1033,7 +1061,8 @@ class SmsStorageService {
     }
 
     await db.transaction((Transaction txn) async {
-      final placeholders = List<String>.filled(quarantineIds.length, '?').join(',');
+      final placeholders =
+          List<String>.filled(quarantineIds.length, '?').join(',');
       await txn.delete(
         'sms_quarantine',
         where: 'id IN ($placeholders)',
@@ -1065,7 +1094,8 @@ class SmsStorageService {
     return _coerceInt(rows.first['latest']) ?? 0;
   }
 
-  Future<void> updateThreadSenderDisplay(String peer, String senderDisplay) async {
+  Future<void> updateThreadSenderDisplay(
+      String peer, String senderDisplay) async {
     if (senderDisplay.trim().isEmpty) {
       return;
     }
@@ -1086,7 +1116,8 @@ class SmsStorageService {
         'sender_display': senderDisplay,
         'updated_at': DateTime.now().millisecondsSinceEpoch,
       },
-      where: 'thread_id = ? AND (sender_display IS NULL OR sender_display = \'\')',
+      where:
+          'thread_id = ? AND (sender_display IS NULL OR sender_display = \'\')',
       whereArgs: <Object>[threadId],
     );
     if (updated > 0) {
@@ -1124,7 +1155,8 @@ class SmsStorageService {
       latestTimestampMs: int.tryParse(values['latestTimestampMs'] ?? '') ?? 0,
       latestProviderId: int.tryParse(values['latestProviderId'] ?? '') ?? 0,
       lastPrimeAtMs: int.tryParse(values['lastPrimeAtMs'] ?? '') ?? 0,
-      lastMaintenanceAtMs: int.tryParse(values['lastMaintenanceAtMs'] ?? '') ?? 0,
+      lastMaintenanceAtMs:
+          int.tryParse(values['lastMaintenanceAtMs'] ?? '') ?? 0,
     );
   }
 
@@ -1234,11 +1266,10 @@ class SmsStorageService {
       final rows = _memoryThreads.values
           .map((row) => Map<String, dynamic>.from(row))
           .where((row) {
-            final hiddenAtMs = _coerceInt(row['hiddenAtMs']) ?? 0;
-            final lastTimestampMs = _coerceInt(row['lastTimestampMs']) ?? 0;
-            return !(hiddenAtMs > 0 && lastTimestampMs <= hiddenAtMs);
-          })
-          .toList(growable: true)
+        final hiddenAtMs = _coerceInt(row['hiddenAtMs']) ?? 0;
+        final lastTimestampMs = _coerceInt(row['lastTimestampMs']) ?? 0;
+        return !(hiddenAtMs > 0 && lastTimestampMs <= hiddenAtMs);
+      }).toList(growable: true)
         ..sort(
           (a, b) => (_coerceInt(b['lastTimestampMs']) ?? 0)
               .compareTo(_coerceInt(a['lastTimestampMs']) ?? 0),
@@ -1250,14 +1281,11 @@ class SmsStorageService {
       'sms_threads',
       orderBy: 'last_timestamp_ms DESC, updated_at DESC',
     );
-    return rows
-        .map((row) => _threadDisplayMapFromRow(row))
-        .where((row) {
-          final hiddenAtMs = _coerceInt(row['hiddenAtMs']) ?? 0;
-          final lastTimestampMs = _coerceInt(row['lastTimestampMs']) ?? 0;
-          return !(hiddenAtMs > 0 && lastTimestampMs <= hiddenAtMs);
-        })
-        .toList(growable: false);
+    return rows.map((row) => _threadDisplayMapFromRow(row)).where((row) {
+      final hiddenAtMs = _coerceInt(row['hiddenAtMs']) ?? 0;
+      final lastTimestampMs = _coerceInt(row['lastTimestampMs']) ?? 0;
+      return !(hiddenAtMs > 0 && lastTimestampMs <= hiddenAtMs);
+    }).toList(growable: false);
   }
 
   Future<List<Map<String, dynamic>>> _loadMessagesForThread(
@@ -1265,7 +1293,8 @@ class SmsStorageService {
   ) async {
     final db = await _maybeOpenDatabase();
     if (db == null) {
-      return List<Map<String, dynamic>>.from(_memoryMessages[threadId] ?? const [])
+      return List<Map<String, dynamic>>.from(
+          _memoryMessages[threadId] ?? const [])
         ..sort(
           (a, b) => (_coerceInt(a['timestampMs']) ?? 0)
               .compareTo(_coerceInt(b['timestampMs']) ?? 0),
@@ -1350,7 +1379,8 @@ class SmsStorageService {
       orderBy: 'timestamp_ms DESC',
       limit: 1,
     );
-    final quarantineLatest = quarantineRows.isEmpty ? null : quarantineRows.first;
+    final quarantineLatest =
+        quarantineRows.isEmpty ? null : quarantineRows.first;
     final quarantinedCount = Sqflite.firstIntValue(
           await executor.rawQuery(
             'SELECT COUNT(*) AS count FROM sms_quarantine WHERE thread_id = ?',
@@ -1484,7 +1514,8 @@ class SmsStorageService {
               : latest['peer'] ?? latest['sender']) ??
           existing['phone'] ??
           threadId,
-      'lastMessage': latest['message'] ?? latest['body'] ?? latest['text'] ?? '',
+      'lastMessage':
+          latest['message'] ?? latest['body'] ?? latest['text'] ?? '',
       'lastTime': latest['time'],
       'lastTimestampMs': max(visibleTimestampMs, quarantineTimestampMs),
       'lastDirection': useQuarantine
@@ -1607,10 +1638,13 @@ class SmsStorageService {
       'pipeline_stage': map['pipelineStage']?.toString() ?? 'provider_sync',
       'message_key': map['messageKey']?.toString(),
       'detection_decision': map['detectionDecision']?.toString(),
-      'extracted_urls_json': jsonEncode(_stringListFromAny(map['extractedUrls'])),
+      'extracted_urls_json':
+          jsonEncode(_stringListFromAny(map['extractedUrls'])),
       'primary_url': map['primaryUrl']?.toString(),
       'primary_domain': map['primaryDomain']?.toString(),
       'needs_rescan': map['needsRescan'] == true ? 1 : 0,
+      'safety_status': map['safetyStatus']?.toString() ??
+          (map['isSuspicious'] == true ? 'malicious' : 'safe'),
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     };
   }
@@ -1643,7 +1677,8 @@ class SmsStorageService {
       'status': status,
       'source': source,
       'risk_score': message.riskScore ?? 0.0,
-      'risk_level': message.riskLevel ?? (message.isSuspicious ? 'high' : 'safe'),
+      'risk_level':
+          message.riskLevel ?? (message.isSuspicious ? 'high' : 'safe'),
       'detection_reasons_json': jsonEncode(message.detectionReasons),
       'model_score': message.modelScore,
       'heuristic_score': message.heuristicScore ?? 0.0,
@@ -1655,6 +1690,7 @@ class SmsStorageService {
       'primary_url': message.primaryUrl,
       'primary_domain': message.primaryDomain,
       'needs_rescan': message.needsRescan ? 1 : 0,
+      'safety_status': message.safetyStatus.value,
       'updated_at': DateTime.now().millisecondsSinceEpoch,
     };
   }
@@ -1683,6 +1719,7 @@ class SmsStorageService {
       'primary_url': message.primaryUrl,
       'primary_domain': message.primaryDomain,
       'needs_rescan': message.needsRescan ? 1 : 0,
+      'safety_status': message.safetyStatus.value,
       'time': message.time.toIso8601String(),
       'timestamp': message.time.toIso8601String(),
       'timestamp_ms': timestampMs,
@@ -1701,7 +1738,8 @@ class SmsStorageService {
 
   Map<String, Object?> _quarantineRowFromMap(Map<String, dynamic> map) {
     final timestampMs = _coerceInt(map['timestampMs']) ??
-        _parseTimestampMs(map['reportedAt'] ?? map['time'] ?? map['timestamp']) ??
+        _parseTimestampMs(
+            map['reportedAt'] ?? map['time'] ?? map['timestamp']) ??
         DateTime.now().millisecondsSinceEpoch;
     final sender = map['sender']?.toString() ?? '';
     final threadId = map['threadId']?.toString() ?? threadIdForPeer(sender);
@@ -1718,10 +1756,13 @@ class SmsStorageService {
       'provider_thread_id': map['providerThreadId']?.toString(),
       'message_key': map['messageKey']?.toString(),
       'detection_decision': map['detectionDecision']?.toString(),
-      'extracted_urls_json': jsonEncode(_stringListFromAny(map['extractedUrls'])),
+      'extracted_urls_json':
+          jsonEncode(_stringListFromAny(map['extractedUrls'])),
       'primary_url': map['primaryUrl']?.toString(),
       'primary_domain': map['primaryDomain']?.toString(),
       'needs_rescan': map['needsRescan'] == true ? 1 : 0,
+      'safety_status': map['safetyStatus']?.toString() ??
+          (map['isSuspicious'] == true ? 'malicious' : 'safe'),
       'time': map['time']?.toString() ??
           DateTime.fromMillisecondsSinceEpoch(timestampMs).toIso8601String(),
       'timestamp': map['timestamp']?.toString() ??
@@ -1801,6 +1842,7 @@ class SmsStorageService {
       'primaryUrl': row['primary_url']?.toString(),
       'primaryDomain': row['primary_domain']?.toString(),
       'needsRescan': (_coerceInt(row['needs_rescan']) ?? 0) == 1,
+      'safetyStatus': row['safety_status']?.toString() ?? 'safe',
     };
   }
 
@@ -1821,6 +1863,7 @@ class SmsStorageService {
       'primaryUrl': row['primary_url']?.toString(),
       'primaryDomain': row['primary_domain']?.toString(),
       'needsRescan': (_coerceInt(row['needs_rescan']) ?? 0) == 1,
+      'safetyStatus': row['safety_status']?.toString() ?? 'malicious',
       'time': row['time']?.toString(),
       'timestamp': row['timestamp']?.toString(),
       'timestampMs': _coerceInt(row['timestamp_ms']) ?? 0,

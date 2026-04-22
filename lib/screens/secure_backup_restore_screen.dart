@@ -1,11 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../services/auth_service.dart';
 import '../services/e2ee_service.dart';
+import 'secure_backup_setup_screen.dart';
+
+enum _RestoreMode {
+  pin,
+  recoveryCode,
+}
 
 class SecureBackupRestoreScreen extends StatefulWidget {
   final VoidCallback? onRestoreComplete;
-  const SecureBackupRestoreScreen({super.key, this.onRestoreComplete});
+  final VoidCallback? onEmailResetComplete;
+  const SecureBackupRestoreScreen({
+    super.key,
+    this.onRestoreComplete,
+    this.onEmailResetComplete,
+  });
 
   @override
   State<SecureBackupRestoreScreen> createState() =>
@@ -13,22 +25,25 @@ class SecureBackupRestoreScreen extends StatefulWidget {
 }
 
 class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
-  final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _secretController = TextEditingController();
   bool _isLoading = false;
   String? _errorMessage;
+  _RestoreMode _mode = _RestoreMode.pin;
 
   @override
   void dispose() {
-    _pinController.dispose();
+    _secretController.dispose();
     super.dispose();
   }
 
   Future<void> _restoreBackup() async {
-    final pin = _pinController.text.trim();
-    if (pin.length < 6) {
-      setState(() {
-        _errorMessage = 'Please enter your 6-digit PIN.';
-      });
+    final String secret = _secretController.text.trim();
+    if (_mode == _RestoreMode.pin && !RegExp(r'^\d{6}$').hasMatch(secret)) {
+      setState(() => _errorMessage = 'Please enter your 6-digit PIN.');
+      return;
+    }
+    if (_mode == _RestoreMode.recoveryCode && secret.isEmpty) {
+      setState(() => _errorMessage = 'Please enter your recovery code.');
       return;
     }
 
@@ -38,49 +53,59 @@ class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
     });
 
     try {
-      // We append the same constant salt used during setup
-      final securePassphrase = '${pin}SSPH';
-      await E2eeService()
-          .restoreIdentityFromRecoveryKey(passphrase: securePassphrase);
+      if (_mode == _RestoreMode.pin) {
+        await E2eeService().restoreFromPin(pin: secret);
+      } else {
+        await E2eeService().restoreFromRecoveryCode(recoveryCode: secret);
+      }
 
       if (!mounted) return;
+      if (_mode == _RestoreMode.recoveryCode) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => SecureBackupSetupScreen(
+              onSetupComplete: () => Navigator.of(context).pop(),
+            ),
+          ),
+        );
+        if (!mounted) return;
+      }
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Chats successfully restored!'),
           backgroundColor: Color(0xFF25D366),
         ),
       );
-      
-      // Pop with true to indicate success to the previous screen
       if (widget.onRestoreComplete != null) {
         widget.onRestoreComplete!();
       } else {
+        if (!mounted) return;
         Navigator.of(context).pop(true);
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _errorMessage = 'Incorrect PIN or backup not found.';
+        _errorMessage = e.toString().replaceAll('Exception: ', '');
       });
     } finally {
       if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
+        setState(() => _isLoading = false);
       }
     }
   }
 
-  Future<void> _confirmResetBackup() async {
-    final confirm = await showDialog<bool>(
+  Future<void> _confirmEmailReset() async {
+    final bool confirm = await showDialog<bool>(
           context: context,
           builder: (context) => AlertDialog(
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
             ),
-            title: const Text('Reset Cloud Backup?'),
+            title: const Text('Reset via Email?'),
             content: const Text(
-                'If you forgot your PIN, you cannot restore your old messages. '
-                'Resetting will permanently delete your old cloud backup and let you start fresh.'),
+              'Resetting via email erases encrypted history for security. Proceed?',
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
@@ -89,35 +114,53 @@ class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                 onPressed: () => Navigator.pop(context, true),
-                child: const Text('Delete Backup',
-                    style: TextStyle(color: Colors.white)),
+                child: const Text(
+                  'Proceed',
+                  style: TextStyle(color: Colors.white),
+                ),
               ),
             ],
           ),
         ) ??
         false;
+    if (!confirm) return;
 
-    if (!confirm || !mounted) return;
-
-    setState(() => _isLoading = true);
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
     try {
-      await E2eeService().clearRemoteBackup();
-      if (mounted) {
-        if (widget.onRestoreComplete != null) {
-          widget.onRestoreComplete!();
-        } else {
-          Navigator.of(context).pop(true);
-        }
+      final String? email = AuthService().currentUser?.email;
+      if (email == null || email.trim().isEmpty) {
+        throw Exception('Your account has no email address to reset.');
       }
+      await AuthService().sendPasswordResetEmail(email: email.trim());
+      await E2eeService().resetEncryptedHistoryForEmailRecovery();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Password reset email sent to $email. Your encrypted backup was cleared.',
+          ),
+        ),
+      );
+      widget.onEmailResetComplete?.call();
     } catch (e) {
-      if (mounted) setState(() => _errorMessage = 'Failed to reset backup.');
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = e.toString().replaceAll('Exception: ', '');
+      });
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final bool pinMode = _mode == _RestoreMode.pin;
+
     return Scaffold(
       backgroundColor: const Color(0xFF0B1622),
       appBar: AppBar(
@@ -147,7 +190,7 @@ class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
               ),
               const SizedBox(height: 24),
               const Text(
-                'Enter your Backup PIN',
+                'Restore encrypted history',
                 style: TextStyle(
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
@@ -156,28 +199,54 @@ class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 12),
-              const Text(
-                'Enter the 6-digit PIN you created previously to restore your encrypted chat history.',
-                style: TextStyle(fontSize: 14, color: Colors.white70),
+              Text(
+                pinMode
+                    ? 'Enter your 6-digit PIN to derive the local restore key.'
+                    : 'Enter your 16-character recovery code, then create a new PIN.',
+                style: const TextStyle(fontSize: 14, color: Colors.white70),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 40),
+              const SizedBox(height: 20),
+              SegmentedButton<_RestoreMode>(
+                segments: const [
+                  ButtonSegment<_RestoreMode>(
+                    value: _RestoreMode.pin,
+                    label: Text('PIN'),
+                  ),
+                  ButtonSegment<_RestoreMode>(
+                    value: _RestoreMode.recoveryCode,
+                    label: Text('Recovery Code'),
+                  ),
+                ],
+                selected: <_RestoreMode>{_mode},
+                onSelectionChanged: (selection) {
+                  setState(() {
+                    _mode = selection.first;
+                    _secretController.clear();
+                    _errorMessage = null;
+                  });
+                },
+              ),
+              const SizedBox(height: 28),
               TextField(
-                controller: _pinController,
-                keyboardType: TextInputType.number,
-                obscureText: true,
-                maxLength: 6,
+                controller: _secretController,
+                keyboardType:
+                    pinMode ? TextInputType.number : TextInputType.text,
+                obscureText: pinMode,
+                maxLength: pinMode ? 6 : null,
                 textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 32,
-                  letterSpacing: 16,
+                style: TextStyle(
+                  fontSize: pinMode ? 32 : 22,
+                  letterSpacing: pinMode ? 16 : 2,
                   color: Colors.white,
                   fontWeight: FontWeight.bold,
                 ),
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                inputFormatters: pinMode
+                    ? [FilteringTextInputFormatter.digitsOnly]
+                    : const <TextInputFormatter>[],
                 decoration: InputDecoration(
-                  counterText: "",
-                  hintText: '••••••',
+                  counterText: '',
+                  hintText: pinMode ? '• • • • • •' : 'ABCD-EFGH-IJKL-MNOP',
                   hintStyle: const TextStyle(color: Colors.white24),
                   filled: true,
                   fillColor: const Color(0xFF101C2B),
@@ -203,17 +272,20 @@ class _SecureBackupRestoreScreenState extends State<SecureBackupRestoreScreen> {
                   onPressed: _isLoading ? null : _restoreBackup,
                   child: _isLoading
                       ? const CircularProgressIndicator(color: Colors.white)
-                      : const Text(
-                          'Restore',
-                          style: TextStyle(fontSize: 16, color: Colors.white),
+                      : Text(
+                          pinMode
+                              ? 'Restore with PIN'
+                              : 'Restore with Recovery Code',
+                          style: const TextStyle(
+                              fontSize: 16, color: Colors.white),
                         ),
                 ),
               ),
               const SizedBox(height: 16),
               TextButton(
-                onPressed: _isLoading ? null : _confirmResetBackup,
+                onPressed: _isLoading ? null : _confirmEmailReset,
                 child: const Text(
-                  'Forgot PIN? Reset Backup',
+                  'Reset via Email',
                   style: TextStyle(color: Colors.white54, fontSize: 14),
                 ),
               ),

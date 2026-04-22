@@ -56,7 +56,8 @@ class OnlineChatService {
     return _userProfileService.getCurrentUserDisplayName();
   }
 
-  Stream<QuerySnapshot<Map<String, dynamic>>> getMessages(String otherUserId, {int limit = 100}) {
+  Stream<QuerySnapshot<Map<String, dynamic>>> getMessages(String otherUserId,
+      {int limit = 100}) {
     final chatId = getChatId(otherUserId);
     return _firestore
         .collection('chats')
@@ -805,8 +806,9 @@ class OnlineChatService {
         chatId: chatId,
         messageId: messageRef.id,
         senderName: senderName,
-        preview:
-            isSuspicious ? 'A suspicious message was hidden.' : 'Encrypted message',
+        preview: isSuspicious
+            ? 'A suspicious message was hidden.'
+            : 'Encrypted message',
         type: 'text',
       );
     } catch (e) {
@@ -918,7 +920,8 @@ class OnlineChatService {
         sender: currentUserId,
       );
     } catch (e) {
-      debugPrint('[OnlineChatService] Outgoing detection failed on edit (non-fatal): $e');
+      debugPrint(
+          '[OnlineChatService] Outgoing detection failed on edit (non-fatal): $e');
     }
     final messageRef = _firestore
         .collection('chats')
@@ -934,7 +937,8 @@ class OnlineChatService {
         plaintext: newText.trim(),
       );
       final refreshedClientMessageId =
-          encryptedEnvelope['clientMessageId']?.toString().trim().isNotEmpty == true
+          encryptedEnvelope['clientMessageId']?.toString().trim().isNotEmpty ==
+                  true
               ? encryptedEnvelope['clientMessageId'].toString().trim()
               : existingData['clientMessageId']?.toString();
       await _e2eeService.seedDecryptedTextCache(
@@ -1016,7 +1020,7 @@ class OnlineChatService {
         '[OnlineChatService] Message edited (count: ${currentEditCount + 1})');
   }
 
-  // ── Delete message (soft delete — shows "Message deleted") ────────────
+  // ── Delete message for current user only (vanish delete) ───────────────
   Future<void> deleteMessage({
     required String otherUserId,
     required String messageId,
@@ -1024,29 +1028,14 @@ class OnlineChatService {
   }) async {
     final chatId = getChatId(otherUserId);
 
-    if (isMyMessage) {
-      // Sender can fully soft-delete
-      await _firestore
-          .collection('chats')
-          .doc(chatId)
-          .collection('messages')
-          .doc(messageId)
-          .update({
-        'isDeleted': true,
-        'text': '',
-        'type': 'deleted',
-      });
-    } else {
-      // Receiver can only delete for themselves (hide from their view)
-      await _firestore
-          .collection('chats')
-          .doc(chatId)
-          .collection('messages')
-          .doc(messageId)
-          .update({
-        'deletedFor': FieldValue.arrayUnion([currentUserId]),
-      });
-    }
+    await _firestore
+        .collection('chats')
+        .doc(chatId)
+        .collection('messages')
+        .doc(messageId)
+        .update({
+      'deletedFor': FieldValue.arrayUnion([currentUserId]),
+    });
 
     print('[OnlineChatService] Message deleted');
   }

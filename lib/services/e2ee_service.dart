@@ -132,6 +132,8 @@ class E2eeService {
   static const String _accountBackupPassphrasePrefix =
       'e2ee_account_backup_passphrase_';
   static const String _bootstrappedMarkerPrefix = 'e2ee_bootstrapped_v1_';
+  static const String _zeroKnowledgePassphrasePrefix =
+      'e2ee_zero_knowledge_passphrase_';
   static const String _algorithm = 'x25519-aesgcm-v1';
   static const String _recoveryAlgorithm = 'pbkdf2-aesgcm-v1';
   static const int _recoveryVersion = 1;
@@ -405,6 +407,149 @@ class E2eeService {
     return base64Encode(publicKey.bytes);
   }
 
+  Future<String> setupZeroKnowledgePin({
+    required String pin,
+  }) async {
+    final String normalizedPin = pin.trim();
+    if (!RegExp(r'^\d{6}$').hasMatch(normalizedPin)) {
+      throw Exception('PIN must be exactly 6 digits.');
+    }
+
+    final String uid = currentUserId;
+    if (uid.isEmpty) {
+      throw Exception('No logged-in user found.');
+    }
+
+    final List<int> pinSalt = _randomBytes(16);
+    final String derivedPassphrase = await _derivePinPassphrase(
+      pin: normalizedPin,
+      salt: pinSalt,
+    );
+    final String recoveryCode = _generateRecoveryCode();
+    final List<int> masterSalt = _randomBytes(16);
+    final List<int> masterNonce = _randomBytes(12);
+    final SecretKey masterKey = await _deriveRecoverySecretKey(
+      passphrase: recoveryCode,
+      salt: masterSalt,
+    );
+    final SecretBox masterSecretBox = await _cipher.encrypt(
+      utf8.encode(derivedPassphrase),
+      secretKey: masterKey,
+      nonce: masterNonce,
+    );
+
+    await saveRecoveryKeyBackup(passphrase: derivedPassphrase);
+    await _firestore.collection('users').doc(uid).set({
+      'zkPinEnabled': true,
+      'zkPinIterations': _recoveryIterations,
+      'zkPinSalt': base64Encode(pinSalt),
+      'zkMasterKeyAlgorithm': _recoveryAlgorithm,
+      'zkMasterKeySalt': base64Encode(masterSalt),
+      'zkMasterKeyNonce': base64Encode(masterSecretBox.nonce),
+      'zkMasterKeyMac': base64Encode(masterSecretBox.mac.bytes),
+      'zkMasterKeyCipherText': base64Encode(masterSecretBox.cipherText),
+      'zkRecoveryUpdatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+    await _secureStorage.write(
+      key: '$_zeroKnowledgePassphrasePrefix$uid',
+      value: derivedPassphrase,
+    );
+    return recoveryCode;
+  }
+
+  Future<void> restoreFromPin({
+    required String pin,
+  }) async {
+    final String uid = currentUserId;
+    if (uid.isEmpty) {
+      throw Exception('No logged-in user found.');
+    }
+    final DocumentSnapshot<Map<String, dynamic>> userDoc = await _firestore
+        .collection('users')
+        .doc(uid)
+        .get(const GetOptions(source: Source.server));
+    final Map<String, dynamic> data = userDoc.data() ?? <String, dynamic>{};
+    final String saltB64 = data['zkPinSalt']?.toString() ?? '';
+    if (saltB64.isEmpty) {
+      throw Exception('PIN recovery is not configured for this account.');
+    }
+
+    final String derivedPassphrase = await _derivePinPassphrase(
+      pin: pin.trim(),
+      salt: base64Decode(saltB64),
+    );
+    await restoreIdentityFromRecoveryKey(passphrase: derivedPassphrase);
+    await _secureStorage.write(
+      key: '$_zeroKnowledgePassphrasePrefix$uid',
+      value: derivedPassphrase,
+    );
+  }
+
+  Future<void> restoreFromRecoveryCode({
+    required String recoveryCode,
+  }) async {
+    final String uid = currentUserId;
+    if (uid.isEmpty) {
+      throw Exception('No logged-in user found.');
+    }
+
+    final DocumentSnapshot<Map<String, dynamic>> userDoc = await _firestore
+        .collection('users')
+        .doc(uid)
+        .get(const GetOptions(source: Source.server));
+    final Map<String, dynamic> data = userDoc.data() ?? <String, dynamic>{};
+    final String saltB64 = data['zkMasterKeySalt']?.toString() ?? '';
+    final String nonceB64 = data['zkMasterKeyNonce']?.toString() ?? '';
+    final String macB64 = data['zkMasterKeyMac']?.toString() ?? '';
+    final String cipherTextB64 =
+        data['zkMasterKeyCipherText']?.toString() ?? '';
+    if (saltB64.isEmpty ||
+        nonceB64.isEmpty ||
+        macB64.isEmpty ||
+        cipherTextB64.isEmpty) {
+      throw Exception('Recovery code backup was not found.');
+    }
+
+    try {
+      final SecretKey masterKey = await _deriveRecoverySecretKey(
+        passphrase: recoveryCode.trim().toUpperCase(),
+        salt: base64Decode(saltB64),
+      );
+      final List<int> clearBytes = await _cipher.decrypt(
+        SecretBox(
+          base64Decode(cipherTextB64),
+          nonce: base64Decode(nonceB64),
+          mac: Mac(base64Decode(macB64)),
+        ),
+        secretKey: masterKey,
+      );
+      final String derivedPassphrase = utf8.decode(clearBytes);
+      await restoreIdentityFromRecoveryKey(passphrase: derivedPassphrase);
+      await _secureStorage.write(
+        key: '$_zeroKnowledgePassphrasePrefix$uid',
+        value: derivedPassphrase,
+      );
+    } catch (_) {
+      throw Exception('Recovery code is incorrect.');
+    }
+  }
+
+  Future<void> resetEncryptedHistoryForEmailRecovery() async {
+    final String uid = currentUserId;
+    if (uid.isEmpty) {
+      throw Exception('No logged-in user found.');
+    }
+    final CollectionReference<Map<String, dynamic>> backupCollection =
+        _firestore.collection('users').doc(uid).collection('message_backups');
+    final QuerySnapshot<Map<String, dynamic>> backups =
+        await backupCollection.get();
+    for (final QueryDocumentSnapshot<Map<String, dynamic>> doc
+        in backups.docs) {
+      await doc.reference.delete();
+    }
+    await clearRemoteBackup();
+  }
+
   Future<void> saveRecoveryKeyBackup({
     required String passphrase,
   }) async {
@@ -669,7 +814,17 @@ class E2eeService {
       'msgBackupMac': FieldValue.delete(),
       'msgBackupCipherText': FieldValue.delete(),
       'msgBackupUpdatedAt': FieldValue.delete(),
+      'zkPinEnabled': FieldValue.delete(),
+      'zkPinIterations': FieldValue.delete(),
+      'zkPinSalt': FieldValue.delete(),
+      'zkMasterKeyAlgorithm': FieldValue.delete(),
+      'zkMasterKeySalt': FieldValue.delete(),
+      'zkMasterKeyNonce': FieldValue.delete(),
+      'zkMasterKeyMac': FieldValue.delete(),
+      'zkMasterKeyCipherText': FieldValue.delete(),
+      'zkRecoveryUpdatedAt': FieldValue.delete(),
     });
+    await _secureStorage.delete(key: '$_zeroKnowledgePassphrasePrefix$uid');
   }
 
   Future<bool> bootstrapAutomaticAccountBackup({
@@ -1288,7 +1443,8 @@ class E2eeService {
         forceRepublish: forceRepublish,
       );
     } catch (error) {
-      debugPrint('[E2eeService] Signal identity bootstrap failed: $error — scheduling retry in 10s');
+      debugPrint(
+          '[E2eeService] Signal identity bootstrap failed: $error — scheduling retry in 10s');
       // Schedule a single retry so a transient Firestore/network error at
       // startup doesn't permanently prevent the user's bundle from being
       // published (which would block peers from messaging them).
@@ -1297,7 +1453,8 @@ class E2eeService {
           try {
             await _keyManagementService.ensureDeviceIdentity(userId: uid);
           } catch (retryError) {
-            debugPrint('[E2eeService] Signal identity retry also failed: $retryError');
+            debugPrint(
+                '[E2eeService] Signal identity retry also failed: $retryError');
           }
         }
       });
@@ -2689,6 +2846,30 @@ class E2eeService {
     );
   }
 
+  Future<String> _derivePinPassphrase({
+    required String pin,
+    required List<int> salt,
+  }) async {
+    final SecretKey key = await _deriveRecoverySecretKey(
+      passphrase: pin,
+      salt: salt,
+    );
+    final List<int> bytes = await key.extractBytes();
+    return base64UrlEncode(bytes);
+  }
+
+  String _generateRecoveryCode() {
+    const String alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    final StringBuffer buffer = StringBuffer();
+    for (int index = 0; index < 16; index++) {
+      if (index > 0 && index % 4 == 0) {
+        buffer.write('-');
+      }
+      buffer.write(alphabet[_random.nextInt(alphabet.length)]);
+    }
+    return buffer.toString();
+  }
+
   Future<String> _deriveAutomaticBackupPassphrase({
     required String uid,
     required String accountPassword,
@@ -2705,10 +2886,8 @@ class E2eeService {
     String? privateKeyB64;
     String? publicKeyB64;
     try {
-      privateKeyB64 =
-          await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-      publicKeyB64 =
-          await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+      privateKeyB64 = await _secureStorage.read(key: '$_privateKeyPrefix$uid');
+      publicKeyB64 = await _secureStorage.read(key: '$_publicKeyPrefix$uid');
     } catch (error) {
       if (_isKeystoreCorruptionError(error)) {
         // Keystore is corrupted — treat as no local identity so bootstrap
@@ -2779,4 +2958,4 @@ class E2eeService {
     _peerRepairTimestamps.clear();
     _automaticBackupBootstrapFuture = null;
   }
-} 
+}

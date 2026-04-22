@@ -229,6 +229,14 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
             });
             _checkState();
           },
+          onEmailResetComplete: () {
+            if (!mounted) return;
+            setState(() {
+              _needsRestore = false;
+              _isChecking = true;
+            });
+            _checkState();
+          },
         ),
       );
     }

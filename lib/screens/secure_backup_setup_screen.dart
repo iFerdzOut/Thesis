@@ -16,6 +16,8 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
   final TextEditingController _pinController = TextEditingController();
   bool _isLoading = false;
   String? _errorMessage;
+  String? _recoveryCode;
+  bool _recoveryCodeCopied = false;
 
   @override
   void dispose() {
@@ -24,8 +26,8 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
   }
 
   Future<void> _setupBackup() async {
-    final pin = _pinController.text.trim();
-    if (pin.length < 6) {
+    final String pin = _pinController.text.trim();
+    if (!RegExp(r'^\d{6}$').hasMatch(pin)) {
       setState(() {
         _errorMessage = 'Please enter a 6-digit PIN.';
       });
@@ -38,41 +40,50 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
     });
 
     try {
-      // The backend requires at least 8 characters.
-      // We append a constant salt so the user only has to remember 6 digits.
-      final securePassphrase = '${pin}SSPH';
-      await E2eeService().saveRecoveryKeyBackup(passphrase: securePassphrase);
-
+      final String recoveryCode =
+          await E2eeService().setupZeroKnowledgePin(pin: pin);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Secure backup successfully enabled!'),
-          backgroundColor: Color(0xFF25D366),
-        ),
-      );
-      if (widget.onSetupComplete != null) {
-        widget.onSetupComplete!();
-      } else {
-        Navigator.of(context).pop();
-      }
-    } catch (e) {
       setState(() {
-        final msg = e.toString().replaceAll('Exception: ', '');
-        _errorMessage = msg.contains('offline') || msg.contains('internet')
-            ? 'No internet connection. Please go online and try again.'
-            : msg;
+        _recoveryCode = recoveryCode;
+        _recoveryCodeCopied = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = e.toString().replaceAll('Exception: ', '');
       });
     } finally {
       if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
+        setState(() => _isLoading = false);
       }
+    }
+  }
+
+  Future<void> _copyRecoveryCode() async {
+    final String code = _recoveryCode?.trim() ?? '';
+    if (code.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: code));
+    if (!mounted) return;
+    setState(() => _recoveryCodeCopied = true);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Recovery code copied. Save it somewhere secure.'),
+      ),
+    );
+  }
+
+  void _finishSetup() {
+    if (widget.onSetupComplete != null) {
+      widget.onSetupComplete!();
+    } else {
+      Navigator.of(context).pop();
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final bool showingRecoveryCode = _recoveryCode != null;
+
     return Scaffold(
       backgroundColor: const Color(0xFF0B1622),
       appBar: AppBar(
@@ -101,9 +112,11 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
                 ),
               ),
               const SizedBox(height: 24),
-              const Text(
-                'Back up your encrypted chats',
-                style: TextStyle(
+              Text(
+                showingRecoveryCode
+                    ? 'Save your recovery code'
+                    : 'Back up your encrypted chats',
+                style: const TextStyle(
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
                   color: Colors.white,
@@ -111,39 +124,62 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 12),
-              const Text(
-                'Create a 6-digit PIN. This PIN will be used to restore your messages if you reinstall the app or change phones.',
-                style: TextStyle(fontSize: 14, color: Colors.white70),
+              Text(
+                showingRecoveryCode
+                    ? 'This code is your fallback if you forget your PIN. The server never sees your PIN, so you must save this code before you continue.'
+                    : 'Create a 6-digit PIN. It is used locally to derive the key that restores your encrypted history on a new device.',
+                style: const TextStyle(fontSize: 14, color: Colors.white70),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 40),
-              TextField(
-                controller: _pinController,
-                keyboardType: TextInputType.number,
-                obscureText: true,
-                maxLength: 6,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 32,
-                  letterSpacing: 16,
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                decoration: InputDecoration(
-                  counterText: "",
-                  hintText: '••••••',
-                  hintStyle: const TextStyle(color: Colors.white24),
-                  filled: true,
-                  fillColor: const Color(0xFF101C2B),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    borderSide: BorderSide.none,
+              if (!showingRecoveryCode)
+                TextField(
+                  controller: _pinController,
+                  keyboardType: TextInputType.number,
+                  obscureText: true,
+                  maxLength: 6,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 32,
+                    letterSpacing: 16,
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
                   ),
-                  errorText: _errorMessage,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  decoration: InputDecoration(
+                    counterText: '',
+                    hintText: '• • • • • •',
+                    hintStyle: const TextStyle(color: Colors.white24),
+                    filled: true,
+                    fillColor: const Color(0xFF101C2B),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      borderSide: BorderSide.none,
+                    ),
+                    errorText: _errorMessage,
+                  ),
+                  onChanged: (_) => setState(() => _errorMessage = null),
+                )
+              else
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF101C2B),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: const Color(0xFF25D366)),
+                  ),
+                  child: SelectableText(
+                    _recoveryCode!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 28,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 2,
+                    ),
+                  ),
                 ),
-                onChanged: (_) => setState(() => _errorMessage = null),
-              ),
               const Spacer(),
               SizedBox(
                 width: double.infinity,
@@ -155,12 +191,25 @@ class _SecureBackupSetupScreenState extends State<SecureBackupSetupScreen> {
                       borderRadius: BorderRadius.circular(25),
                     ),
                   ),
-                  onPressed: _isLoading ? null : _setupBackup,
+                  onPressed: _isLoading
+                      ? null
+                      : showingRecoveryCode
+                          ? (_recoveryCodeCopied
+                              ? _finishSetup
+                              : _copyRecoveryCode)
+                          : _setupBackup,
                   child: _isLoading
                       ? const CircularProgressIndicator(color: Colors.white)
-                      : const Text(
-                          'Turn On Backup',
-                          style: TextStyle(fontSize: 16, color: Colors.white),
+                      : Text(
+                          showingRecoveryCode
+                              ? (_recoveryCodeCopied
+                                  ? 'I Saved My Recovery Code'
+                                  : 'Copy Recovery Code')
+                              : 'Turn On Backup',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            color: Colors.white,
+                          ),
                         ),
                 ),
               ),

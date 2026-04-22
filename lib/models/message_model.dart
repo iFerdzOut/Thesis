@@ -1,3 +1,5 @@
+import 'safety_status.dart';
+
 class MessageModel {
   final String text;
   final bool isMe;
@@ -20,6 +22,7 @@ class MessageModel {
   final String? primaryUrl;
   final String? primaryDomain;
   final bool needsRescan;
+  final SafetyStatus safetyStatus;
 
   MessageModel({
     required this.text,
@@ -43,6 +46,7 @@ class MessageModel {
     this.primaryUrl,
     this.primaryDomain,
     this.needsRescan = false,
+    this.safetyStatus = SafetyStatus.safe,
   });
 
   Map<String, dynamic> toMap() {
@@ -68,6 +72,7 @@ class MessageModel {
       'primaryUrl': primaryUrl,
       'primaryDomain': primaryDomain,
       'needsRescan': needsRescan,
+      'safetyStatus': safetyStatus.value,
     };
   }
 
@@ -102,6 +107,7 @@ class MessageModel {
       primaryUrl: map['primaryUrl']?.toString(),
       primaryDomain: map['primaryDomain']?.toString(),
       needsRescan: map['needsRescan'] == true,
+      safetyStatus: SafetyStatus.fromValue(map['safetyStatus']?.toString()),
     );
   }
 }

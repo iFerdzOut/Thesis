@@ -40,6 +40,7 @@ class LocalDetectionRepository {
 
   Future<void> initialize() async {
     await _maybeOpenDatabase();
+    await _seedTrustedDomainsIfNeeded();
   }
 
   Future<Database> _openDatabase() async {
@@ -215,6 +216,72 @@ class LocalDetectionRepository {
       CREATE INDEX idx_feedback_logs_label
       ON feedback_logs(label)
     ''');
+    await _insertSeedTrustedDomains(db);
+  }
+
+  static const List<String> _seedTrustedDomains = <String>[
+    'gov.ph',
+    'dict.gov.ph',
+    'doh.gov.ph',
+    'sss.gov.ph',
+    'bir.gov.ph',
+    'bsp.gov.ph',
+    'deped.gov.ph',
+    'tarlacstate-u.edu.ph',
+    'tsu.edu.ph',
+    'up.edu.ph',
+    'gcash.com',
+    'maya.ph',
+    'bpi.com.ph',
+    'bdo.com.ph',
+    'globe.com.ph',
+    'smart.com.ph',
+    'facebook.com',
+    'google.com',
+    'youtube.com',
+    'messenger.com',
+    'x.com',
+    'shopee.ph',
+    'lazada.com.ph',
+  ];
+
+  Future<void> _insertSeedTrustedDomains(Database db) async {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final Batch batch = db.batch();
+    for (final String domain in _seedTrustedDomains) {
+      batch.insert(
+        'trusted_domains',
+        <String, Object?>{
+          'domain': domain,
+          'source': 'initial_seed',
+          'note': 'Seeded trusted domain',
+          'created_at': now,
+          'updated_at': now,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<void> _seedTrustedDomainsIfNeeded() async {
+    final db = await _maybeOpenDatabase();
+    if (db == null) {
+      for (final String domain in _seedTrustedDomains) {
+        _memoryTrustedDomains.putIfAbsent(
+          domain,
+          () => TrustedDomainModel(
+            domain: domain,
+            source: 'initial_seed',
+            note: 'Seeded trusted domain',
+            createdAtMs: DateTime.now().millisecondsSinceEpoch,
+            updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+          ),
+        );
+      }
+      return;
+    }
+    await _insertSeedTrustedDomains(db);
   }
 
   Future<double> getWarningThreshold({
@@ -498,7 +565,8 @@ class LocalDetectionRepository {
   Future<Map<int, DetectionResultModel>> getScreeningResultsForProviderIds(
     Iterable<int> providerIds,
   ) async {
-    final ids = providerIds.where((int id) => id > 0).toSet().toList(growable: false);
+    final ids =
+        providerIds.where((int id) => id > 0).toSet().toList(growable: false);
     if (ids.isEmpty) {
       return <int, DetectionResultModel>{};
     }
@@ -536,7 +604,8 @@ class LocalDetectionRepository {
     if (db == null) {
       return _memoryScreeningResults.values
           .where((record) =>
-              record.result.needsRescan && record.message.source.startsWith('sms'))
+              record.result.needsRescan &&
+              record.message.source.startsWith('sms'))
           .map((record) => record.message)
           .take(limit)
           .toList(growable: false);
