@@ -1,3 +1,5 @@
+import 'safety_status.dart';
+
 enum ConversationDecryptionStatus {
   pending,
   success,
@@ -36,6 +38,8 @@ class DecryptedConversationMessage {
   final bool isOutgoing;
   final bool isDeleted;
   final bool isSuspicious;
+  final SafetyStatus safetyStatus;
+  final double? riskScore;
 
   const DecryptedConversationMessage({
     required this.conversationId,
@@ -55,6 +59,8 @@ class DecryptedConversationMessage {
     required this.isOutgoing,
     required this.isDeleted,
     required this.isSuspicious,
+    this.safetyStatus = SafetyStatus.safe,
+    this.riskScore,
   });
 
   factory DecryptedConversationMessage.fromCacheRow(
@@ -88,6 +94,40 @@ class DecryptedConversationMessage {
       isOutgoing: senderId == currentUserId,
       isDeleted: row['is_deleted'] == 1,
       isSuspicious: row['is_suspicious'] == 1,
+      safetyStatus: SafetyStatus.fromValue(row['safety_status']?.toString()),
+      riskScore: (row['risk_score'] as num?)?.toDouble(),
+    );
+  }
+
+  DecryptedConversationMessage copyWith({
+    String? decryptedText,
+    String? previewText,
+    ConversationDecryptionStatus? decryptionStatus,
+    String? failureReason,
+    bool? isSuspicious,
+    SafetyStatus? safetyStatus,
+    double? riskScore,
+  }) {
+    return DecryptedConversationMessage(
+      conversationId: conversationId,
+      messageKey: messageKey,
+      messageId: messageId,
+      clientMessageId: clientMessageId,
+      senderId: senderId,
+      receiverId: receiverId,
+      messageType: messageType,
+      algorithm: algorithm,
+      cipherTextPresent: cipherTextPresent,
+      decryptedText: decryptedText ?? this.decryptedText,
+      previewText: previewText ?? this.previewText,
+      decryptionStatus: decryptionStatus ?? this.decryptionStatus,
+      failureReason: failureReason ?? this.failureReason,
+      timestamp: timestamp,
+      isOutgoing: isOutgoing,
+      isDeleted: isDeleted,
+      isSuspicious: isSuspicious ?? this.isSuspicious,
+      safetyStatus: safetyStatus ?? this.safetyStatus,
+      riskScore: riskScore ?? this.riskScore,
     );
   }
 }

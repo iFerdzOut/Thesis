@@ -44,6 +44,7 @@ dependencies:
   # Networking
   http: ^1.2.1
   url_launcher: ^6.3.0
+  any_link_preview: ^3.0.1
   uuid: ^4.3.3
   sqflite_sqlcipher: ^3.4.0
 

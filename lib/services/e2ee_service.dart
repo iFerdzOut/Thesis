@@ -454,6 +454,34 @@ class E2eeService {
       key: '$_zeroKnowledgePassphrasePrefix$uid',
       value: derivedPassphrase,
     );
+
+    // Confirm the account doc contains both the recovery backup payload and
+    // the PIN metadata. Without both, the user would be prompted to set up a
+    // PIN again even though setup appeared to succeed.
+    try {
+      final verify = await _firestore
+          .collection('users')
+          .doc(uid)
+          .get(const GetOptions(source: Source.server));
+      final vData = verify.data() ?? const <String, dynamic>{};
+      if ((vData['e2eeRecoveryCipherText']?.toString() ?? '').isEmpty ||
+          (vData['zkPinSalt']?.toString() ?? '').isEmpty ||
+          vData['zkPinEnabled'] != true) {
+        throw Exception(
+          'PIN setup could not be confirmed on the server. '
+          'Please try again.',
+        );
+      }
+    } on FirebaseException catch (fe) {
+      if (fe.code == 'unavailable' || fe.code == 'failed-precondition') {
+        throw Exception(
+          'You appear to be offline. Please connect to the internet and '
+          'try setting up your backup PIN again.',
+        );
+      }
+      rethrow;
+    }
+
     return recoveryCode;
   }
 
@@ -471,7 +499,8 @@ class E2eeService {
     final Map<String, dynamic> data = userDoc.data() ?? <String, dynamic>{};
     final String saltB64 = data['zkPinSalt']?.toString() ?? '';
     if (saltB64.isEmpty) {
-      throw Exception('PIN recovery is not configured for this account.');
+      await _restoreFromLegacyPin(pin.trim());
+      return;
     }
 
     final String derivedPassphrase = await _derivePinPassphrase(
@@ -483,6 +512,22 @@ class E2eeService {
       key: '$_zeroKnowledgePassphrasePrefix$uid',
       value: derivedPassphrase,
     );
+  }
+
+  Future<void> _restoreFromLegacyPin(String normalizedPin) async {
+    if (!RegExp(r'^\d{6}$').hasMatch(normalizedPin)) {
+      throw Exception('PIN must be exactly 6 digits.');
+    }
+
+    final String legacyPassphrase = '${normalizedPin}SSPH';
+    await restoreIdentityFromRecoveryKey(passphrase: legacyPassphrase);
+    final String uid = currentUserId;
+    if (uid.isNotEmpty) {
+      await _secureStorage.write(
+        key: '$_zeroKnowledgePassphrasePrefix$uid',
+        value: legacyPassphrase,
+      );
+    }
   }
 
   Future<void> restoreFromRecoveryCode({
@@ -1284,7 +1329,9 @@ class E2eeService {
         plaintext: trimmedText,
         messageType: messageType,
         timestampMs: timestampMs,
-        algorithm: ChatEncryptionRepository.signalAlgorithm,
+        algorithm: algorithm?.trim().isNotEmpty == true
+            ? algorithm!.trim()
+            : ChatEncryptionRepository.signalAlgorithm,
       );
       return;
     }

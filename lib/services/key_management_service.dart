@@ -100,6 +100,7 @@ class KeyManagementService {
     bool forceRepublish = false,
   }) async {
     var requiresRepublish = forceRepublish;
+    var shouldRegenerateBundleMaterial = forceRepublish;
 
     if (!requiresRepublish && _initializedUserId == uid) {
       final hasDoc = await hasActiveDeviceDocuments(uid);
@@ -109,6 +110,7 @@ class KeyManagementService {
           'device doc found — republishing bundle.',
         );
         requiresRepublish = true;
+        shouldRegenerateBundleMaterial = true;
       }
     }
 
@@ -132,6 +134,7 @@ class KeyManagementService {
         throw Exception('Failed to persist Signal identity.');
       }
       requiresRepublish = true;
+      shouldRegenerateBundleMaterial = true;
     } else {
       identityRow = await _repairIdentityBindingIfNeeded(uid, identityRow);
       identityKeyPair = IdentityKeyPair.deserialize(
@@ -139,9 +142,15 @@ class KeyManagementService {
       );
     }
 
-    final currentDeviceDocId = identityRow['device_doc_id']?.toString().trim() ?? '';
+    final currentDeviceDocId =
+        identityRow['device_doc_id']?.toString().trim() ?? '';
     if (currentDeviceDocId.isEmpty) {
-      throw Exception('Device document ID is missing after identity initialization.');
+      throw Exception(
+          'Device document ID is missing after identity initialization.');
+    }
+
+    if (shouldRegenerateBundleMaterial) {
+      await _refreshPublishedBundleMaterial(uid);
     }
 
     // PERF: Stale device cleanup is now handled only within _publishPublicBundle
@@ -149,8 +158,18 @@ class KeyManagementService {
     // await _cleanupStaleDeviceDocuments(uid, currentDeviceDocId);
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final rotatedSigned = await _ensureSignedPreKey(uid, identityKeyPair, nowMs: nowMs);
-    final rotatedKyber = await _ensureKyberPreKey(uid, identityKeyPair, nowMs: nowMs);
+    final rotatedSigned = await _ensureSignedPreKey(
+      uid,
+      identityKeyPair,
+      nowMs: nowMs,
+      forceRotate: shouldRegenerateBundleMaterial,
+    );
+    final rotatedKyber = await _ensureKyberPreKey(
+      uid,
+      identityKeyPair,
+      nowMs: nowMs,
+      forceRotate: shouldRegenerateBundleMaterial,
+    );
 
     if (rotatedSigned || rotatedKyber) {
       requiresRepublish = true;
@@ -291,7 +310,7 @@ class KeyManagementService {
         return bMs.compareTo(aMs);
       });
 
-    // FIX: Run all bundle fetches (and OTK consumption transactions) concurrently 
+    // FIX: Run all bundle fetches (and OTK consumption transactions) concurrently
     // rather than sequentially. This drastically reduces network wait time.
     final bundleFutures = deviceDocs.map((deviceDoc) => _bundleForDeviceDoc(
           peerUserId: peerUserId,
@@ -600,6 +619,38 @@ class KeyManagementService {
     }
   }
 
+  Future<void> _refreshPublishedBundleMaterial(String uid) async {
+    final store = await getStore(uid);
+    final deviceDocId = await store.getDeviceDocId();
+
+    for (final preKeyId in await store.getAllPreKeyIds()) {
+      await store.removePreKey(preKeyId);
+    }
+    for (final signedPreKeyId in await store.getAllSignedPreKeyIds()) {
+      await store.removeSignedPreKey(signedPreKeyId);
+    }
+    for (final kyberPreKeyId in await store.getAllKyberPreKeyIds()) {
+      await store.removeKyberPreKey(kyberPreKeyId);
+    }
+
+    final oneTimePreKeysSnapshot = await _firestore
+        .collection('users')
+        .doc(uid)
+        .collection('devices')
+        .doc(deviceDocId)
+        .collection('one_time_prekeys')
+        .get();
+    if (oneTimePreKeysSnapshot.docs.isNotEmpty) {
+      final batch = _firestore.batch();
+      for (final doc in oneTimePreKeysSnapshot.docs) {
+        batch.delete(doc.reference);
+      }
+      await batch.commit();
+    }
+
+    invalidateBundleCache(uid);
+  }
+
   Future<int> _reserveUniqueSignalDeviceId(String uid) async {
     final observedMax = await _maxActiveSignalDeviceId(uid);
     final userRef = _firestore.collection('users').doc(uid);
@@ -733,25 +784,30 @@ class KeyManagementService {
     String uid,
     IdentityKeyPair identityKeyPair, {
     int? nowMs,
+    bool forceRotate = false,
   }) async {
     final store = await getStore(uid);
     final existing = await store.getAllSignedPreKeyIds();
-    
+
     int nextId = 1;
-    if (existing.isNotEmpty) {
+    if (!forceRotate && existing.isNotEmpty) {
       final latestId = existing.reduce(max);
       final latestRecord = await store.loadSignedPreKey(latestId);
       if (latestRecord != null) {
         final timestampMs = latestRecord.timestamp().toInt();
-        final age = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
+        final age = DateTime.now()
+            .difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
         if (age.inDays < _signedPreKeyRotationDays) {
           return false; // Current Signed Pre-Key is still fresh
         }
-        debugPrint('[KeyMgmt] Rotating Signed Pre-Key for $uid (age: ${age.inDays} days)');
+        debugPrint(
+            '[KeyMgmt] Rotating Signed Pre-Key for $uid (age: ${age.inDays} days)');
       }
       nextId = latestId + 1;
+    } else if (existing.isNotEmpty) {
+      nextId = existing.reduce(max) + 1;
     }
-    
+
     final privateKey = PrivateKey.generate();
     final publicKey = privateKey.getPublicKey();
     final identityPrivate = PrivateKey.deserialize(
@@ -775,22 +831,26 @@ class KeyManagementService {
     String uid,
     IdentityKeyPair identityKeyPair, {
     int? nowMs,
+    bool forceRotate = false,
   }) async {
     final store = await getStore(uid);
     final existing = await store.getAllKyberPreKeyIds();
-    
+
     int nextId = 1;
-    if (existing.isNotEmpty) {
+    if (!forceRotate && existing.isNotEmpty) {
       final latestId = existing.reduce(max);
       final latestRecord = await store.loadKyberPreKey(latestId);
       if (latestRecord != null) {
         final timestampMs = latestRecord.timestamp().toInt();
-        final age = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
+        final age = DateTime.now()
+            .difference(DateTime.fromMillisecondsSinceEpoch(timestampMs));
         if (age.inDays < _signedPreKeyRotationDays) {
           return false; // Current Kyber Pre-Key is still fresh
         }
       }
       nextId = latestId + 1;
+    } else if (existing.isNotEmpty) {
+      nextId = existing.reduce(max) + 1;
     }
     final keyPair = KyberKeyPair.generate();
     final identityPrivate = PrivateKey.deserialize(

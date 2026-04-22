@@ -743,6 +743,7 @@ class OnlineChatService {
         isSuspicious = await _aiDetectionService.detectSmishing(
           trimmedText,
           sender: currentUserId,
+          bypassOutgoing: false,
         );
       } catch (e) {
         debugPrint(
@@ -918,6 +919,7 @@ class OnlineChatService {
       isSuspicious = await _aiDetectionService.detectSmishing(
         newText.trim(),
         sender: currentUserId,
+        bypassOutgoing: false,
       );
     } catch (e) {
       debugPrint(
@@ -1193,9 +1195,14 @@ class OnlineChatService {
   }) async {
     if (currentUserId.isEmpty) return;
     final chatId = getChatId(otherUserId);
-    await _firestore.collection('chats').doc(chatId).set({
-      'typing': {currentUserId: isTyping},
-    }, SetOptions(merge: true));
+    
+    try {
+      await _firestore.collection('chats').doc(chatId).update({
+        'typing.$currentUserId': isTyping,
+      });
+    } catch (e) {
+      // Ignore errors: if the chat doesn't exist yet, there's no need to update typing status.
+    }
   }
 
   Stream<bool> getIsTyping({required String otherUserId}) {

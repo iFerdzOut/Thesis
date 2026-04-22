@@ -8,11 +8,14 @@ import 'package:libsignal/libsignal.dart';
 import 'package:uuid/uuid.dart';
 import '../models/conversation_preview_model.dart';
 import '../models/decrypted_conversation_message.dart';
+import '../models/detection_result_model.dart';
 import '../models/prekey_bundle_model.dart';
-import '../smishing_detector.dart';
+import '../models/screened_message_model.dart';
+import '../models/safety_status.dart';
 import 'key_management_service.dart';
 import 'libsignal_store_service.dart';
 import 'local_message_cache_service.dart';
+import 'smishing_detection_pipeline_service.dart';
 
 class ChatEncryptionRepository {
   ChatEncryptionRepository._internal();
@@ -32,8 +35,8 @@ class ChatEncryptionRepository {
   final Map<String, String> _memoryPlaintextCache = <String, String>{};
   final Map<String, DateTime> _missingSessionCooldown = <String, DateTime>{};
   final Map<String, DateTime> _sessionRebuildDebounce = <String, DateTime>{};
-  final Map<String, Future<List<_PreparedSignalContext>>> _pendingContextBuilds =
-      <String, Future<List<_PreparedSignalContext>>>{};
+  final Map<String, Future<List<_PreparedSignalContext>>>
+      _pendingContextBuilds = <String, Future<List<_PreparedSignalContext>>>{};
   final Map<String, StreamController<List<DecryptedConversationMessage>>>
       _conversationControllers =
       <String, StreamController<List<DecryptedConversationMessage>>>{};
@@ -47,9 +50,11 @@ class ChatEncryptionRepository {
   final Map<String, String> _lastConversationEmitSignatures =
       <String, String>{};
   final Map<String, String?> _lastPreviewEmitSignatures = <String, String?>{};
-  final SmishingDetector _smishingDetector = SmishingDetector();
+  final SmishingDetectionPipelineService _smishingPipeline =
+      SmishingDetectionPipelineService();
   final Map<String, bool> _detectionCache = <String, bool>{};
-  final Map<String, Future<void>> _conversationPrewarmFutures = <String, Future<void>>{};
+  final Map<String, Future<void>> _conversationPrewarmFutures =
+      <String, Future<void>>{};
   final Map<String, int> _conversationHydrationGenerations = <String, int>{};
   Future<String> Function(
     Map<String, dynamic> data, {
@@ -62,7 +67,8 @@ class ChatEncryptionRepository {
 
   // Forces Signal encryption/decryption for a specific peer to run sequentially.
   // This prevents the Double Ratchet state from branching/corrupting during rapid sends.
-  Future<T> _withSessionLock<T>(String peerId, Future<T> Function() action) async {
+  Future<T> _withSessionLock<T>(
+      String peerId, Future<T> Function() action) async {
     final previousLock = _peerSessionLocks[peerId] ?? Future<void>.value();
     final completer = Completer<void>();
     _peerSessionLocks[peerId] = completer.future;
@@ -409,7 +415,8 @@ class ChatEncryptionRepository {
 
     if (primaryEnvelope == null) {
       if (receiverId == currentUserId && contexts.isEmpty) {
-        throw Exception('Cannot send an encrypted message to yourself on the same device.');
+        throw Exception(
+            'Cannot send an encrypted message to yourself on the same device.');
       }
       throw Exception('Recipient has not enabled secure messaging yet.');
     }
@@ -527,9 +534,9 @@ class ChatEncryptionRepository {
 
     final senderId = resolvedData['senderId']?.toString() ?? '';
     final receiverId = resolvedData['receiverId']?.toString() ?? '';
-    
+
     if (!hasLocalEnvelope) {
-      if (resolvedData.containsKey('e2eeDeviceEnvelopes') && 
+      if (resolvedData.containsKey('e2eeDeviceEnvelopes') &&
           resolvedData['e2eeDeviceEnvelopes'] != null) {
         return '[Encrypted message unavailable]';
       } else if (senderId == uid) {
@@ -583,10 +590,12 @@ class ChatEncryptionRepository {
           // Double Ratchet binds each ciphertext to a specific ratchet state —
           // re-decrypting an old ciphertext with a new session is impossible and
           // always throws, so we stop after clearing the stale state.
-          final repairStore = await _keyManagementService.getStore(currentUserId);
+          final repairStore =
+              await _keyManagementService.getStore(currentUserId);
           final repairAddress = ProtocolAddress(
             name: senderId,
-            deviceId: (resolvedData['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
+            deviceId:
+                (resolvedData['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
           );
           await repairStore.deleteSession(repairAddress);
           _keyManagementService.invalidateBundleCache(senderId);
@@ -595,7 +604,8 @@ class ChatEncryptionRepository {
             'device=${repairAddress.deviceId()} — next PreKeyMessage will re-establish.',
           );
         } catch (repairError) {
-          debugPrint('[SignalRepo] Repair: session delete failed sender=$senderId error=$repairError');
+          debugPrint(
+              '[SignalRepo] Repair: session delete failed sender=$senderId error=$repairError');
         }
       }
 
@@ -1048,16 +1058,13 @@ class ChatEncryptionRepository {
         isDeleted: false,
         isSuspicious: isSuspicious,
       );
-      await _persistProjection(projection);
-      return projection;
+      final scannedProjection = await _applyIncomingSafetyPipeline(projection);
+      await _persistProjection(scannedProjection);
+      return scannedProjection;
     }
 
     final cachedPlaintext = await getCachedPlaintext(cacheKey);
     if (cachedPlaintext != null && cachedPlaintext.trim().isNotEmpty) {
-      final resolvedSuspicious = senderId != uid
-          ? await _detectIncoming(messageId, cachedPlaintext, senderId,
-              fallback: false) // E2EE Zero-Trust: Do not trust server flags for incoming
-          : isSuspicious;
       final projection = DecryptedConversationMessage(
         conversationId: conversationId,
         messageKey: cacheKey,
@@ -1075,10 +1082,11 @@ class ChatEncryptionRepository {
         timestamp: timestamp,
         isOutgoing: senderId == uid,
         isDeleted: false,
-        isSuspicious: resolvedSuspicious,
+        isSuspicious: isSuspicious,
       );
-      await _persistProjection(projection);
-      return projection;
+      final scannedProjection = await _applyIncomingSafetyPipeline(projection);
+      await _persistProjection(scannedProjection);
+      return scannedProjection;
     }
 
     final shouldRetry = _isFreshEncryptedMessage(timestamp);
@@ -1102,10 +1110,6 @@ class ChatEncryptionRepository {
     }
 
     if (decryptedText != null && decryptedText.trim().isNotEmpty) {
-      final resolvedSuspicious = senderId != uid
-          ? await _detectIncoming(messageId, decryptedText, senderId,
-              fallback: false) // E2EE Zero-Trust: Receiver scans locally after decryption
-          : isSuspicious;
       final projection = DecryptedConversationMessage(
         conversationId: conversationId,
         messageKey: cacheKey,
@@ -1123,10 +1127,11 @@ class ChatEncryptionRepository {
         timestamp: timestamp,
         isOutgoing: senderId == uid,
         isDeleted: false,
-        isSuspicious: resolvedSuspicious,
+        isSuspicious: isSuspicious,
       );
-      await _persistProjection(projection);
-      return projection;
+      final scannedProjection = await _applyIncomingSafetyPipeline(projection);
+      await _persistProjection(scannedProjection);
+      return scannedProjection;
     }
 
     final projection = DecryptedConversationMessage(
@@ -1148,34 +1153,99 @@ class ChatEncryptionRepository {
       timestamp: timestamp,
       isOutgoing: senderId == uid,
       isDeleted: false,
-      isSuspicious: senderId == uid ? isSuspicious : false, // Un-decryptable incoming is not marked suspicious
+      isSuspicious: senderId == uid
+          ? isSuspicious
+          : false, // Un-decryptable incoming is not marked suspicious
     );
     await _persistProjection(projection);
     return projection;
   }
 
-  /// Runs AI smishing detection on an incoming (other-user) message.
-  /// Results are cached by [messageId] so the model is not invoked repeatedly
-  /// for the same message as the Firestore snapshot refreshes.
-  Future<bool> _detectIncoming(
-    String messageId,
-    String plaintext,
-    String senderId, {
-    bool fallback = false,
-  }) async {
-    if (_detectionCache.containsKey(messageId)) {
-      return _detectionCache[messageId]!;
+  Future<DecryptedConversationMessage> _applyIncomingSafetyPipeline(
+    DecryptedConversationMessage projection,
+  ) async {
+    if (projection.isOutgoing ||
+        projection.isDeleted ||
+        projection.messageType != 'text') {
+      return projection;
     }
+
+    final plaintext = projection.decryptedText?.trim().isNotEmpty == true
+        ? projection.decryptedText!.trim()
+        : projection.previewText.trim();
+    if (plaintext.isEmpty) {
+      return projection;
+    }
+
+    final detectionKey =
+        projection.clientMessageId?.trim().isNotEmpty == true
+            ? projection.clientMessageId!.trim()
+            : projection.messageId ?? projection.messageKey;
+    if (_detectionCache.containsKey(detectionKey)) {
+      final suspicious = _detectionCache[detectionKey]!;
+      return projection.copyWith(
+        isSuspicious: suspicious,
+        safetyStatus:
+            suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+      );
+    }
+
+    final screenedMessage = ScreenedMessageModel(
+      source: 'online_chat',
+      sender: projection.senderId,
+      peer: projection.senderId,
+      body: plaintext,
+      timestampMs: projection.timestamp.millisecondsSinceEpoch,
+      messageKey: projection.messageKey,
+      providerId: null,
+      providerThreadId: null,
+      simSlot: null,
+      subscriptionId: null,
+    );
+
     try {
-      // Execute the ML Pipeline locally (Layer 1 Heuristics -> Layer 2 DistilBERT)
-      final result = await _smishingDetector.analyzeMessage(plaintext);
-      _detectionCache[messageId] = result;
-      return result;
+      final verdict = await _smishingPipeline.quickScan(screenedMessage);
+      if (verdict.result != null) {
+        _detectionCache[detectionKey] = verdict.result!.isSuspicious;
+        return _projectionWithDetectionResult(projection, verdict.result!);
+      }
+
+      final scanningProjection = projection.copyWith(
+        isSuspicious: false,
+        safetyStatus: SafetyStatus.scanning,
+        riskScore: null,
+      );
+      _smishingPipeline.enqueue(
+        message: screenedMessage,
+        priority: SmishingQueuePriority.high,
+        onResult: (DetectionResultModel result) async {
+          _detectionCache[detectionKey] = result.isSuspicious;
+          final updatedProjection =
+              _projectionWithDetectionResult(scanningProjection, result);
+          await _persistProjection(updatedProjection);
+          await _emitConversationFromCache(projection.conversationId);
+        },
+      );
+      return scanningProjection;
     } catch (e) {
       debugPrint(
-          '[ChatEncryptRepo] Detection failed for $messageId, using fallback: $e');
-      return fallback;
+        '[ChatEncryptRepo] Detection failed for '
+        '${projection.messageId ?? projection.messageKey}: $e',
+      );
+      return projection;
     }
+  }
+
+  DecryptedConversationMessage _projectionWithDetectionResult(
+    DecryptedConversationMessage projection,
+    DetectionResultModel result,
+  ) {
+    return projection.copyWith(
+      isSuspicious: result.isSuspicious,
+      safetyStatus:
+          result.isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+      riskScore: result.riskScore,
+    );
   }
 
   String buildMessageCacheKey(Map<String, dynamic> data) {
@@ -1431,6 +1501,8 @@ class ChatEncryptionRepository {
       cipherTextPresent: projection.cipherTextPresent,
       isDeleted: projection.isDeleted,
       isSuspicious: projection.isSuspicious,
+      safetyStatus: projection.safetyStatus.value,
+      riskScore: projection.riskScore,
     );
   }
 

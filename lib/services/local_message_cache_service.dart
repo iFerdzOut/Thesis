@@ -20,7 +20,7 @@ class LocalMessageCacheService {
 
   Database? _database;
   Future<Database>? _databaseFuture;
-  static const int _schemaVersion = 3;
+  static const int _schemaVersion = 4;
 
   final Map<String, Uint8List> _sessionCache = <String, Uint8List>{};
   final Map<String, Uint8List> _remoteIdentityCache = <String, Uint8List>{};
@@ -152,6 +152,8 @@ class LocalMessageCacheService {
         cipher_text_present INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         is_suspicious INTEGER NOT NULL DEFAULT 0,
+        safety_status TEXT NOT NULL DEFAULT 'safe',
+        risk_score REAL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, message_key)
       )
@@ -258,6 +260,17 @@ class LocalMessageCacheService {
     if (oldVersion < 3) {
       await _createMediaCacheSchema(db);
       await _createIndexes(db);
+    }
+    if (oldVersion < 4) {
+      await db.execute(
+        "ALTER TABLE decrypted_messages ADD COLUMN safety_status TEXT NOT NULL DEFAULT 'safe'",
+      );
+      await db.execute(
+        "ALTER TABLE decrypted_messages ADD COLUMN risk_score REAL",
+      );
+      await db.execute(
+        "UPDATE decrypted_messages SET safety_status = CASE WHEN is_suspicious = 1 THEN 'malicious' ELSE 'safe' END WHERE safety_status IS NULL OR safety_status = ''",
+      );
     }
   }
 
@@ -849,6 +862,8 @@ class LocalMessageCacheService {
     required bool cipherTextPresent,
     required bool isDeleted,
     required bool isSuspicious,
+    String safetyStatus = 'safe',
+    double? riskScore,
   }) async {
     final db = await _openDatabase();
     await db.insert(
@@ -871,6 +886,8 @@ class LocalMessageCacheService {
         'cipher_text_present': cipherTextPresent ? 1 : 0,
         'is_deleted': isDeleted ? 1 : 0,
         'is_suspicious': isSuspicious ? 1 : 0,
+        'safety_status': safetyStatus,
+        'risk_score': riskScore,
         'updated_at': DateTime.now().millisecondsSinceEpoch,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,

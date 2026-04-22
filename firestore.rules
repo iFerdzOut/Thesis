@@ -3,9 +3,6 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ===============================================================
-    // Helper Functions
-    // ===============================================================
     function isAuthenticated() {
       return request.auth != null;
     }
@@ -14,78 +11,111 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // ===============================================================
-    // Collection: users
-    // ===============================================================
+    function isCallParticipant() {
+      return isAuthenticated() && (
+        resource.data.callerId == request.auth.uid ||
+        resource.data.calleeId == request.auth.uid ||
+        request.auth.uid in resource.data.participants
+      );
+    }
+
     match /users/{userId} {
-      // A user can read and update their own document.
-      // PII (email, etc.) is in this doc, so only the owner can read.
-      allow read, update: if isOwner(userId);
+      // The current app reads other user docs for names, email-based discovery,
+      // E2EE public keys, and relationship state. Keep writes restricted.
+      allow get, list: if isAuthenticated();
+      allow create, update: if isOwner(userId);
 
-      // Allow other authenticated users to get a user's public key for E2EE.
-      // This is safe because we are only exposing non-sensitive fields.
-      allow get: if isAuthenticated() &&
-        !('email' in resource.data) &&
-        !('e2eeRecoverySalt' in resource.data);
-
-      // Rules for Signal Protocol device bundles
       match /devices/{deviceId} {
         allow read: if isAuthenticated();
         allow write: if isOwner(userId);
+
+        match /one_time_prekeys/{preKeyId} {
+          allow read: if isAuthenticated();
+          allow create, update: if isOwner(userId);
+          // Peers consume one-time prekeys during X3DH session setup.
+          allow delete: if isAuthenticated();
+        }
       }
 
-      // Rules for legacy E2EE sessions
       match /e2ee_sessions/{sessionId} {
         allow read, write: if isOwner(userId);
       }
 
-      // Rules for the incremental message backup chunks
       match /message_backups/{backupId} {
-        // Users can read and delete their own backup chunks.
         allow read, delete: if isOwner(userId);
-
-        // Users can create new backup chunks with valid data.
         allow create: if isOwner(userId) && isValidMessageBackup(request.resource.data);
-
-        // Updates to backup chunks are not allowed.
         allow update: if false;
+      }
+
+      match /chat_settings/{otherUserId} {
+        allow read: if isOwner(userId) || request.auth.uid == otherUserId;
+        allow write: if isOwner(userId);
+      }
+
+      match /contacts/{contactUserId} {
+        allow read: if isOwner(userId);
+        allow create, delete: if isOwner(userId) || request.auth.uid == contactUserId;
+        allow update: if isOwner(userId);
+      }
+
+      match /friend_requests/{requesterId} {
+        allow read: if isOwner(userId);
+        allow create: if isAuthenticated() && request.auth.uid == requesterId;
+        allow delete: if isOwner(userId) || request.auth.uid == requesterId;
+        allow update: if isOwner(userId);
+      }
+
+      match /sent_friend_requests/{targetUserId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId);
+        allow delete: if isOwner(userId) || request.auth.uid == targetUserId;
+        allow update: if isOwner(userId);
+      }
+
+      match /quarantine/{entryId} {
+        allow read, write: if isOwner(userId);
       }
     }
 
-    // ===============================================================
-    // Collection: chats
-    // ===============================================================
     match /chats/{chatId} {
-      // Users can only read/write to chats they are a part of.
       allow read, write: if isAuthenticated() && request.auth.uid in resource.data.participants;
 
-      // Messages subcollection
       match /messages/{messageId} {
-        // Users can read messages in a chat they are part of.
-        allow read: if isAuthenticated() && get(/databases/$(database)/documents/chats/$(chatId)).data.participants.hasAny([request.auth.uid]);
-
-        // Users can only create messages where they are the sender.
-        allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
-
-        // Users can only update their own messages (e.g., to delete).
-        allow update: if isAuthenticated() && resource.data.senderId == request.auth.uid;
-
-        // Users cannot delete message documents directly. They should be updated with a "deleted" status.
+        allow read: if isAuthenticated() &&
+          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow create: if isAuthenticated() &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow update: if isAuthenticated() &&
+          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
         allow delete: if false;
       }
     }
 
-    // ===============================================================
-    // Collection: calls
-    // ===============================================================
-    match /calls/{callId} {
-      // Only participants of the call can access the call document.
-      allow read, write: if isAuthenticated() && request.auth.uid in resource.data.participants;
+    // Collection-group message listeners rely on document fields directly.
+    // Keep this read-only and narrow it to sender/receiver ownership.
+    match /{path=**}/messages/{messageId} {
+      allow read: if isAuthenticated() && (
+        resource.data.senderId == request.auth.uid ||
+        resource.data.receiverId == request.auth.uid
+      );
     }
 
-    // ===============================================================
-    // Domain-Specific Validators
-    // ===============================================================
+    match /calls/{callId} {
+      allow read: if isCallParticipant();
+      allow create: if isAuthenticated() && request.resource.data.callerId == request.auth.uid;
+      allow update: if isCallParticipant();
+      allow delete: if false;
+
+      match /offerCandidates/{candidateId} {
+        allow read, write: if isCallParticipant();
+      }
+
+      match /answerCandidates/{candidateId} {
+        allow read, write: if isCallParticipant();
+      }
+    }
+
     function isValidMessageBackup(data) {
       let allowedFields = ['version', 'salt', 'nonce', 'mac', 'cipherText', 'savedAt'];
       return data.keys().hasAll(allowedFields) &&

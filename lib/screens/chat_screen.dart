@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -89,6 +90,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       <String, Future<String>>{};
   final Map<String, Future<Uint8List>> _encryptedMediaFutures =
       <String, Future<Uint8List>>{};
+  final Map<String, Future<_LinkMeta>> _linkPreviewCache =
+      <String, Future<_LinkMeta>>{};
   final Map<String, DateTime> _decryptedTextFailureAt = <String, DateTime>{};
   final Map<String, DateTime> _encryptedMediaFailureAt = <String, DateTime>{};
   final Queue<Completer<void>> _textDecryptWaiters = Queue<Completer<void>>();
@@ -2588,9 +2591,265 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
+    final isSafe =
+        !msg.isSuspicious && msg.safetyStatus == SafetyStatus.safe;
+    // primaryUrl/extractedUrls are only populated for SMS messages.
+    // For online chat messages fall back to scanning the text directly.
+    final inlineUrlRegex = RegExp(r'https?://[^\s]+', caseSensitive: false);
+    final previewUrl = msg.primaryUrl?.isNotEmpty == true
+        ? msg.primaryUrl
+        : (msg.extractedUrls.isNotEmpty
+            ? msg.extractedUrls.first
+            : inlineUrlRegex.firstMatch(msg.text)?.group(0));
+
     return IgnorePointer(
       ignoring: msg.safetyStatus == SafetyStatus.malicious || msg.isSuspicious,
-      child: MessageBubble(text: msg.text, isMe: msg.isMe),
+      child: Column(
+        crossAxisAlignment:
+            msg.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          MessageBubble(
+            text: msg.text,
+            isMe: msg.isMe,
+            onUrlTap: isSafe ? _openLegitLink : null,
+          ),
+          if (isSafe && previewUrl != null)
+            _buildLinkPreview(previewUrl, msg.isMe),
+        ],
+      ),
+    );
+  }
+
+  Future<_LinkMeta> _getLinkMeta(String url) =>
+      _linkPreviewCache.putIfAbsent(url, () => _fetchLinkMeta(url));
+
+  Future<_LinkMeta> _fetchLinkMeta(String url) async {
+    Uri uri;
+    try {
+      uri = Uri.parse(url);
+    } catch (_) {
+      return _LinkMeta(domain: url);
+    }
+    final domain = uri.host.replaceAll('www.', '');
+    const timeout = Duration(seconds: 6);
+
+    try {
+      // TikTok oEmbed — returns real thumbnail_url without JS rendering.
+      if (domain.contains('tiktok.com')) {
+        final res = await http.get(
+          Uri.parse(
+              'https://www.tiktok.com/oembed?url=${Uri.encodeComponent(url)}'),
+          headers: {'User-Agent': 'Mozilla/5.0'},
+        ).timeout(timeout);
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body) as Map<String, dynamic>;
+          return _LinkMeta(
+            title: data['title']?.toString(),
+            description: data['author_name']?.toString(),
+            imageUrl: data['thumbnail_url']?.toString(),
+            domain: domain,
+          );
+        }
+      }
+
+      // YouTube oEmbed — returns real thumbnail_url.
+      if (domain.contains('youtube.com') || domain.contains('youtu.be')) {
+        final res = await http.get(
+          Uri.parse(
+              'https://www.youtube.com/oembed?url=${Uri.encodeComponent(url)}&format=json'),
+          headers: {'User-Agent': 'Mozilla/5.0'},
+        ).timeout(timeout);
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body) as Map<String, dynamic>;
+          return _LinkMeta(
+            title: data['title']?.toString(),
+            description: data['author_name']?.toString(),
+            imageUrl: data['thumbnail_url']?.toString(),
+            domain: domain,
+          );
+        }
+      }
+
+      // Generic: fetch HTML and parse og: meta tags.
+      // Use a browser UA so most news/blog sites serve full OG markup.
+      final res = await http.get(uri, headers: {
+        'User-Agent':
+            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+      }).timeout(timeout);
+      if (res.statusCode == 200) {
+        final body = res.body;
+        return _LinkMeta(
+          title: _extractOgContent(body, 'og:title') ??
+              _extractOgContent(body, 'twitter:title'),
+          description: _extractOgContent(body, 'og:description') ??
+              _extractOgContent(body, 'twitter:description'),
+          imageUrl: _extractOgContent(body, 'og:image') ??
+              _extractOgContent(body, 'twitter:image'),
+          domain: domain,
+        );
+      }
+    } catch (_) {}
+
+    return _LinkMeta(domain: domain);
+  }
+
+  static String? _extractOgContent(String html, String property) {
+    // OG meta tags always use double-quoted attributes in practice.
+    // Matches both: property="og:x" content="y"
+    //          and: content="y" property="og:x"
+    final e = RegExp.escape(property);
+    final re = RegExp(
+      '<meta[^>]+(?:property|name)="$e"[^>]+content="([^"]+)"|'
+      '<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="$e"',
+      caseSensitive: false,
+    );
+    final m = re.firstMatch(html);
+    final value = m?.group(1) ?? m?.group(2);
+    return (value == null || value.trim().isEmpty) ? null : value.trim();
+  }
+
+  Widget _buildLinkPreview(String url, bool isMe) {
+    final maxWidth = MediaQuery.of(context).size.width * 0.72;
+
+    Widget urlChip() => GestureDetector(
+          onTap: () => _openLegitLink(url),
+          child: Container(
+            constraints: BoxConstraints(maxWidth: maxWidth),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A2332),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.link, color: Color(0xFF4FC3F7), size: 16),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    url,
+                    style: const TextStyle(
+                      color: Color(0xFF4FC3F7),
+                      fontSize: 12,
+                      decoration: TextDecoration.underline,
+                      decorationColor: Color(0xFF4FC3F7),
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+
+    return Container(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      margin: const EdgeInsets.only(top: 4),
+      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+      child: FutureBuilder<_LinkMeta>(
+        future: _getLinkMeta(url),
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return Container(
+              constraints: BoxConstraints(maxWidth: maxWidth),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A2332),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.5,
+                      color: Color(0xFF4FC3F7),
+                    ),
+                  ),
+                  SizedBox(width: 8),
+                  Text('Loading preview…',
+                      style:
+                          TextStyle(color: Colors.white54, fontSize: 12)),
+                ],
+              ),
+            );
+          }
+
+          final meta = snap.data;
+          if (meta == null || !meta.hasContent) return urlChip();
+
+          return GestureDetector(
+            onTap: () => _openLegitLink(url),
+            child: Container(
+              constraints: BoxConstraints(maxWidth: maxWidth),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A2332),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              clipBehavior: Clip.hardEdge,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (meta.imageUrl != null)
+                    Image.network(
+                      meta.imageUrl!,
+                      width: double.infinity,
+                      height: 140,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (meta.title != null)
+                          Text(
+                            meta.title!,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 13,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        if (meta.description != null) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            meta.description!,
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                        const SizedBox(height: 4),
+                        Text(
+                          meta.domain,
+                          style: const TextStyle(
+                            color: Color(0xFF4FC3F7),
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -2795,7 +3054,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     Widget? customContent,
   }) {
     final docPath = doc.reference.path;
-    final double? riskScore = (data['riskScore'] as num?)?.toDouble();
+    final SafetyStatus safetyStatus =
+        projection?.safetyStatus ??
+        (suspicious ? SafetyStatus.malicious : SafetyStatus.safe);
+    final double? riskScore =
+        projection?.riskScore ?? (data['riskScore'] as num?)?.toDouble();
     final e2eeIndicator = _buildE2eeIndicatorText(
       data,
       projection,
@@ -2818,7 +3081,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         time: time,
         isSuspicious: suspicious,
         type: type,
-        safetyStatus: suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        safetyStatus: safetyStatus,
         filePath: null,
       );
     } else if (type == 'file') {
@@ -2828,7 +3091,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         time: time,
         isSuspicious: suspicious,
         type: type,
-        safetyStatus: suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        safetyStatus: safetyStatus,
         filePath: resolvedText,
       );
     } else {
@@ -2838,7 +3101,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         time: time,
         isSuspicious: suspicious,
         type: type,
-        safetyStatus: suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        safetyStatus: safetyStatus,
       );
     }
 
@@ -2876,8 +3139,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _confirmDeleteOnline(doc.id, isMe);
                     }
                   : null,
-              safetyStatus:
-                  suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+              safetyStatus: safetyStatus,
             ),
           Padding(
             padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
@@ -3004,6 +3266,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       time: projection.timestamp,
       isSuspicious: projection.isSuspicious,
       type: displayType,
+      safetyStatus: projection.safetyStatus,
+      riskScore: projection.riskScore,
     );
     final e2eeIndicator = _buildE2eeIndicatorText(
       <String, dynamic>{
@@ -3025,6 +3289,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           buildSuspiciousWarningCard(
             isSuspicious: projection.isSuspicious,
             isMe: projection.isOutgoing,
+            riskScore: projection.riskScore,
+            safetyStatus: projection.safetyStatus,
           ),
         Padding(
           padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
@@ -4379,6 +4645,20 @@ class _TypingIndicatorBubble extends StatefulWidget {
 
   @override
   State<_TypingIndicatorBubble> createState() => _TypingIndicatorBubbleState();
+}
+
+class _LinkMeta {
+  final String? title;
+  final String? description;
+  final String? imageUrl;
+  final String domain;
+  const _LinkMeta({
+    this.title,
+    this.description,
+    this.imageUrl,
+    required this.domain,
+  });
+  bool get hasContent => title != null || description != null;
 }
 
 class _TypingIndicatorBubbleState extends State<_TypingIndicatorBubble>

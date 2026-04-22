@@ -1,3 +1,4 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../services/auth_service.dart';
@@ -74,6 +75,22 @@ class _LoginScreenState extends State<LoginScreen> {
 
     try {
       await AuthService().login(email: email, password: password);
+
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser != null) {
+        final resolvedName = currentUser.displayName?.trim() ?? '';
+        final resolvedEmail = currentUser.email?.trim() ?? '';
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(currentUser.uid)
+            .set({
+          'uid': currentUser.uid,
+          if (resolvedName.isNotEmpty) 'name': resolvedName,
+          if (resolvedName.isNotEmpty) 'displayName': resolvedName,
+          if (resolvedEmail.isNotEmpty) 'email': resolvedEmail,
+          'lastLoginAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
 
       // FIX: await the full E2EE bootstrap so sessions and device keys are
       // restored before the user opens a chat. The old code used

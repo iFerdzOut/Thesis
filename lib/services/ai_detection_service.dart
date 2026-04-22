@@ -27,8 +27,9 @@ class HybridRiskResult {
     required this.reasons,
   });
 
-  String get summary =>
-      reasons.isEmpty ? 'No major smishing indicators detected.' : reasons.join(' ');
+  String get summary => reasons.isEmpty
+      ? 'No major smishing indicators detected.'
+      : reasons.join(' ');
 }
 
 class AIDetectionService {
@@ -40,9 +41,16 @@ class AIDetectionService {
     return _screeningService.loadModel();
   }
 
-  Future<bool> detectSmishing(String message, {String sender = ''}) async {
-    final HybridRiskResult result =
-        await scoreMessageRisk(message, sender: sender);
+  Future<bool> detectSmishing(
+    String message, {
+    String sender = '',
+    bool bypassOutgoing = true,
+  }) async {
+    final HybridRiskResult result = await scoreMessageRisk(
+      message,
+      sender: sender,
+      bypassOutgoing: bypassOutgoing,
+    );
     return result.isSuspicious;
   }
 
@@ -53,11 +61,13 @@ class AIDetectionService {
   Future<HybridRiskResult> scoreMessageRisk(
     String message, {
     String sender = '',
+    bool bypassOutgoing = true,
   }) async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    // Bypass ML detection entirely for outgoing messages. 
-    // The receiver must decrypt and verify it locally!
-    if (sender.isEmpty || sender == 'Me' || sender == uid) {
+    // SMS/provider sync paths still bypass obviously-local "outgoing" sender
+    // labels, but online chat can opt into scanning by passing
+    // bypassOutgoing:false.
+    if (bypassOutgoing && (sender.isEmpty || sender == 'Me' || sender == uid)) {
       return const HybridRiskResult(
         riskScore: 0.0,
         heuristicScore: 0.0,
