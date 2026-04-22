@@ -48,7 +48,6 @@ class SmishingDetectionPipelineService {
   );
   static const int _legacyBatchSize = 5;
   static const Duration _legacyCooldown = Duration(seconds: 7);
-  static const double _maliciousThreshold = 0.75;
 
   final UrlExtractionService _urlExtractionService = UrlExtractionService();
   final TrustedDomainService _trustedDomainService = TrustedDomainService();
@@ -72,7 +71,7 @@ class SmishingDetectionPipelineService {
   ) async {
     await initialize();
     final String body = message.body.trim();
-    const double threshold = _maliciousThreshold;
+    final double threshold = await _riskScoringService.quarantineThreshold;
     if (body.isEmpty || !_urlRegex.hasMatch(body)) {
       final DetectionResultModel result = DetectionResultModel(
         messageKey: message.messageKey,
@@ -154,7 +153,7 @@ class SmishingDetectionPipelineService {
     final String normalized = _normalize(message.body);
     final SmishingModelOutput? output =
         await _inferenceWorker.runInference(normalized);
-    const double threshold = _maliciousThreshold;
+    final double threshold = await _riskScoringService.quarantineThreshold;
     final double modelScore = output == null || output.logits.isEmpty
         ? 0.0
         : await _riskScoringService.scoreFromLogits(
@@ -164,7 +163,7 @@ class SmishingDetectionPipelineService {
     final double heuristicScore = _heuristicRisk(message.body, domain: domain);
     final double finalScore =
         math.max(modelScore, heuristicScore).clamp(0.0, 1.0);
-    final bool malicious = finalScore >= _maliciousThreshold;
+    final bool malicious = finalScore >= threshold;
     final DetectionResultModel result = DetectionResultModel(
       messageKey: message.messageKey,
       hasUrl: urls.isNotEmpty,

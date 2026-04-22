@@ -30,8 +30,7 @@ dependencies:
   connectivity_plus: ^6.1.0
   shared_preferences: ^2.3.2
   cryptography: ^2.7.0
-  flutter_secure_storage: ^9.2.4
-  libsignal: ^2.2.0
+  flutter_secure_storage: ^10.0.0
   open_filex: ^4.7.0
   path: ^1.9.1
   path_provider: ^2.1.5
@@ -56,6 +55,10 @@ dependencies:
     git:
       url: https://github.com/fluttercommunity/flutter_workmanager.git
       path: workmanager
+  encrypt: ^5.0.3
+  pointycastle: ^3.9.1
+  basic_utils: ^5.7.0
+  crypton: ^2.2.1
 
 dev_dependencies:
   flutter_test:

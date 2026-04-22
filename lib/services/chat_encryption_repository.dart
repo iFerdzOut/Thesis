@@ -1,21 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
-import 'package:libsignal/libsignal.dart';
 import 'package:uuid/uuid.dart';
 import '../models/conversation_preview_model.dart';
 import '../models/decrypted_conversation_message.dart';
 import '../models/detection_result_model.dart';
-import '../models/prekey_bundle_model.dart';
 import '../models/screened_message_model.dart';
 import '../models/safety_status.dart';
-import 'key_management_service.dart';
-import 'libsignal_store_service.dart';
+import 'feedback_database_service.dart';
 import 'local_message_cache_service.dart';
 import 'smishing_detection_pipeline_service.dart';
+import 'security_service.dart';
 
 class ChatEncryptionRepository {
   ChatEncryptionRepository._internal();
@@ -24,19 +21,11 @@ class ChatEncryptionRepository {
       ChatEncryptionRepository._internal();
   factory ChatEncryptionRepository() => _instance;
 
-  static const String signalAlgorithm = 'signal-v2';
-  static const int signalVersion = 2;
-
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final KeyManagementService _keyManagementService = KeyManagementService();
   final LocalMessageCacheService _cacheService = LocalMessageCacheService();
   final Uuid _uuid = const Uuid();
 
   final Map<String, String> _memoryPlaintextCache = <String, String>{};
-  final Map<String, DateTime> _missingSessionCooldown = <String, DateTime>{};
-  final Map<String, DateTime> _sessionRebuildDebounce = <String, DateTime>{};
-  final Map<String, Future<List<_PreparedSignalContext>>>
-      _pendingContextBuilds = <String, Future<List<_PreparedSignalContext>>>{};
   final Map<String, StreamController<List<DecryptedConversationMessage>>>
       _conversationControllers =
       <String, StreamController<List<DecryptedConversationMessage>>>{};
@@ -45,53 +34,24 @@ class ChatEncryptionRepository {
       <String, StreamController<ConversationPreviewModel?>>{};
   final Map<String, Future<void>> _conversationSyncFutures =
       <String, Future<void>>{};
-  final Map<String, Future<void>> _peerSessionLocks = <String, Future<void>>{};
   final Map<String, String> _latestPreviewMessageIds = <String, String>{};
   final Map<String, String> _lastConversationEmitSignatures =
       <String, String>{};
   final Map<String, String?> _lastPreviewEmitSignatures = <String, String?>{};
   final SmishingDetectionPipelineService _smishingPipeline =
       SmishingDetectionPipelineService();
+  final FeedbackDatabaseService _feedbackDb = FeedbackDatabaseService();
   final Map<String, bool> _detectionCache = <String, bool>{};
+  final Set<String> _quarantineEntryCache = <String>{};
   final Map<String, Future<void>> _conversationPrewarmFutures =
       <String, Future<void>>{};
-  final Map<String, int> _conversationHydrationGenerations = <String, int>{};
-  Future<String> Function(
-    Map<String, dynamic> data, {
-    bool allowRepair,
-  })? _legacyTextDecryptor;
+  final SecurityService _securityService = SecurityService();
 
   // Allows the background Isolate to maintain context without needing Auth state resolution
   String? _isolateUid;
   String get currentUserId => _isolateUid ?? _auth.currentUser?.uid ?? '';
 
-  // Forces Signal encryption/decryption for a specific peer to run sequentially.
-  // This prevents the Double Ratchet state from branching/corrupting during rapid sends.
-  Future<T> _withSessionLock<T>(
-      String peerId, Future<T> Function() action) async {
-    final previousLock = _peerSessionLocks[peerId] ?? Future<void>.value();
-    final completer = Completer<void>();
-    _peerSessionLocks[peerId] = completer.future;
-    try {
-      await previousLock;
-      return await action();
-    } finally {
-      completer.complete();
-      if (identical(_peerSessionLocks[peerId], completer.future)) {
-        _peerSessionLocks.remove(peerId);
-      }
-    }
-  }
-
-  Future<void> initialize() async {
-    await _keyManagementService.initialize();
-  }
-
-  bool isSignalEnvelope(Map<String, dynamic> data) {
-    return data['e2ee'] == true &&
-        data['e2eeAlgorithm']?.toString() == signalAlgorithm &&
-        (data['cipherText']?.toString().isNotEmpty ?? false);
-  }
+  Future<void> initialize() async {}
 
   Future<void> ensureReady() async {
     final uid = currentUserId;
@@ -99,16 +59,6 @@ class ChatEncryptionRepository {
       throw Exception('No logged-in user found.');
     }
     await initialize();
-    await _keyManagementService.ensureDeviceIdentity(userId: uid);
-  }
-
-  void registerLegacyDecryptors({
-    required Future<String> Function(
-      Map<String, dynamic> data, {
-      bool allowRepair,
-    }) textDecryptor,
-  }) {
-    _legacyTextDecryptor = textDecryptor;
   }
 
   String conversationIdFor(String otherUserId) {
@@ -299,13 +249,11 @@ class ChatEncryptionRepository {
       'type': 'text',
       'e2ee': true,
       'e2eeAlgorithm':
-          chatData['lastMessageSessionAlgorithm']?.toString() == signalAlgorithm
-              ? signalAlgorithm
-              : chatData['lastMessageAlgorithm']?.toString(),
+          chatData['lastMessageAlgorithm']?.toString() ?? 'rsa-aes-cbc-v1',
       'cipherText': chatData['lastMessageCipherText'],
+      'encrypted_aes_key': chatData['lastMessageEncryptedAesKey'],
+      'iv': chatData['lastMessageIv'],
       'e2eeCacheKey': chatData['lastMessageCacheKey'],
-      'e2eeNonce': chatData['lastMessageNonce'],
-      'e2eeMac': chatData['lastMessageMac'],
       'senderId': chatData['lastMessageSenderId'],
       'receiverId':
           chatData['lastMessageReceiverId']?.toString().isNotEmpty == true
@@ -316,14 +264,6 @@ class ChatEncryptionRepository {
                 ),
       'senderPublicKey': chatData['lastMessageSenderPublicKey'],
       'receiverPublicKey': chatData['lastMessageReceiverPublicKey'],
-      'e2eeSessionId': chatData['lastMessageSessionId'],
-      'e2eeSessionVersion': chatData['lastMessageSessionVersion'],
-      'e2eeSessionPeerId': chatData['lastMessageSessionPeerId'],
-      'e2eeSessionAlgorithm': chatData['lastMessageSessionAlgorithm'],
-      'e2eeSessionLocalPublicKey': chatData['lastMessageSessionLocalPublicKey'],
-      'e2eeSessionPeerPublicKey': chatData['lastMessageSessionPeerPublicKey'],
-      'e2eeDeviceEnvelopes': chatData['lastMessageDeviceEnvelopes'],
-      'e2eeMessageType': chatData['lastMessageE2eeMessageType'],
       'messageId': lastMessageId,
       'clientMessageId': lastMessageId,
       'timestamp': chatData['lastMessageAt'] ?? chatData['updatedAt'],
@@ -345,342 +285,6 @@ class ChatEncryptionRepository {
       decryptionStatus: mapped.decryptionStatus.value,
     );
     await _emitPreviewFromCache(conversationId);
-  }
-
-  Future<Map<String, dynamic>> encryptTextEnvelope({
-    required String receiverId,
-    required String plaintext,
-    String? clientMessageId,
-  }) async {
-    // The lock remains on the main thread so rapid sends execute sequentially
-    return _withSessionLock(receiverId, () async {
-      return await _encryptTextEnvelopeInternal(
-        receiverId: receiverId,
-        plaintext: plaintext,
-        clientMessageId: clientMessageId,
-      );
-    });
-  }
-
-  Future<Map<String, dynamic>> _encryptTextEnvelopeInternal({
-    required String receiverId,
-    required String plaintext,
-    String? clientMessageId,
-  }) async {
-    await ensureReady();
-    final store = await _keyManagementService.getStore(currentUserId);
-    final localDeviceDocId = await store.getDeviceDocId();
-    final receiverContexts = await _ensureSignalContexts(
-      receiverId,
-      excludedDeviceDocIds: receiverId == currentUserId
-          ? <String>{localDeviceDocId}
-          : const <String>{},
-    );
-    final senderSiblingContexts = receiverId == currentUserId
-        ? const <_PreparedSignalContext>[]
-        : await _ensureSignalContexts(
-            currentUserId,
-            excludedDeviceDocIds: <String>{localDeviceDocId},
-          );
-    final contexts = _dedupeSignalContexts(<_PreparedSignalContext>[
-      ...receiverContexts,
-      ...senderSiblingContexts,
-    ]);
-    final resolvedClientMessageId = clientMessageId ?? _uuid.v4();
-    final cacheKey = _uuid.v4();
-    final clearBytes = Uint8List.fromList(utf8.encode(plaintext));
-    final deviceEnvelopes = <String, Map<String, dynamic>>{};
-    Map<String, dynamic>? primaryEnvelope;
-
-    for (final context in contexts) {
-      try {
-        final encrypted = await _buildCipher(
-          context.store,
-        ).encrypt(context.remoteAddress, clearBytes);
-        final envelope = _buildSignalEnvelopeFields(
-          context: context,
-          encrypted: encrypted,
-        );
-        deviceEnvelopes[context.bundle.deviceDocId] = envelope;
-        if (primaryEnvelope == null && context.bundle.userId == receiverId) {
-          primaryEnvelope = envelope;
-        }
-      } catch (error) {
-        debugPrint(
-          '[SignalRepo] Encryption failed peer=$receiverId '
-          'device=${context.bundle.signalDeviceId} error=$error',
-        );
-      }
-    }
-
-    if (primaryEnvelope == null) {
-      if (receiverId == currentUserId && contexts.isEmpty) {
-        throw Exception(
-            'Cannot send an encrypted message to yourself on the same device.');
-      }
-      throw Exception('Recipient has not enabled secure messaging yet.');
-    }
-
-    await _cacheOutgoingPlaintext(
-      cacheKey: cacheKey,
-      clientMessageId: resolvedClientMessageId,
-      senderId: currentUserId,
-      receiverId: receiverId,
-      plaintext: plaintext,
-      messageType: 'text',
-    );
-
-    debugPrint(
-      '[SignalRepo] Encryption success peer=$receiverId '
-      'devices=${deviceEnvelopes.length} clientMessageId=$resolvedClientMessageId',
-    );
-
-    return {
-      'e2ee': true,
-      'e2eeVersion': signalVersion,
-      'e2eeProtocolVersion': signalVersion,
-      'e2eeAlgorithm': signalAlgorithm,
-      'e2eeProtocol': 'signal',
-      'e2eeCacheKey': cacheKey,
-      'clientMessageId': resolvedClientMessageId,
-      ...primaryEnvelope,
-      'e2eeDeviceEnvelopes': deviceEnvelopes,
-    };
-  }
-
-  Future<Map<String, dynamic>> encryptBinaryEnvelope({
-    required String receiverId,
-    required List<int> bytes,
-  }) async {
-    return _withSessionLock(receiverId, () async {
-      return await _encryptBinaryEnvelopeInternal(
-        receiverId: receiverId,
-        bytes: bytes,
-      );
-    });
-  }
-
-  Future<Map<String, dynamic>> _encryptBinaryEnvelopeInternal({
-    required String receiverId,
-    required List<int> bytes,
-  }) async {
-    await ensureReady();
-    final context = await _ensureSignalContext(receiverId);
-    final cipher = _buildCipher(context.store);
-    final clientMessageId = _uuid.v4();
-    final cacheKey = _uuid.v4();
-    final encrypted = await cipher.encrypt(
-      context.remoteAddress,
-      Uint8List.fromList(bytes),
-    );
-
-    debugPrint(
-      '[SignalRepo] Encryption success peer=$receiverId device=${context.bundle.signalDeviceId} '
-      'type=${encrypted.type.value} clientMessageId=$clientMessageId media=1',
-    );
-
-    return {
-      'e2ee': true,
-      'e2eeVersion': signalVersion,
-      'e2eeProtocolVersion': signalVersion,
-      'e2eeAlgorithm': signalAlgorithm,
-      'e2eeProtocol': 'signal',
-      'cipherText': base64Encode(encrypted.ciphertext),
-      'e2eeMessageType': encrypted.type.value,
-      'e2eeCacheKey': cacheKey,
-      'clientMessageId': clientMessageId,
-      ..._buildSignalEnvelopeFields(
-        context: context,
-        encrypted: encrypted,
-      ),
-      'cipherBytes': Uint8List.fromList(encrypted.ciphertext),
-    };
-  }
-
-  Future<String> decryptTextMessage(
-    Map<String, dynamic> data, {
-    bool allowRepair = false,
-  }) async {
-    final peerLockId = data['senderId']?.toString() ?? '';
-    return _withSessionLock(peerLockId, () async {
-      return await _decryptTextMessageInternal(
-        data,
-        allowRepair: allowRepair,
-      );
-    });
-  }
-
-  Future<String> _decryptTextMessageInternal(
-    Map<String, dynamic> data, {
-    bool allowRepair = false,
-  }) async {
-    await ensureReady();
-    final uid = currentUserId;
-    final store = await _keyManagementService.getStore(uid);
-    final localDeviceDocId = await store.getDeviceDocId();
-    final resolvedData = _resolveSignalEnvelopeForDevice(
-      data,
-      localDeviceDocId: localDeviceDocId,
-    );
-    final hasLocalEnvelope = _hasSignalEnvelopeForDevice(
-      data,
-      localDeviceDocId: localDeviceDocId,
-    );
-    final cacheKey = buildMessageCacheKey(resolvedData);
-    final cached = await getCachedPlaintext(cacheKey);
-    if (cached != null && cached.trim().isNotEmpty) {
-      return cached;
-    }
-
-    final senderId = resolvedData['senderId']?.toString() ?? '';
-    final receiverId = resolvedData['receiverId']?.toString() ?? '';
-
-    if (!hasLocalEnvelope) {
-      if (resolvedData.containsKey('e2eeDeviceEnvelopes') &&
-          resolvedData['e2eeDeviceEnvelopes'] != null) {
-        return '[Encrypted message unavailable]';
-      } else if (senderId == uid) {
-        return '[Encrypted message unavailable]';
-      }
-    }
-
-    try {
-      final remoteAddress = ProtocolAddress(
-        name: senderId,
-        deviceId: (resolvedData['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
-      );
-      final cipher = _buildCipher(store);
-      final ciphertext = Uint8List.fromList(
-        base64Decode(resolvedData['cipherText']?.toString() ?? ''),
-      );
-      final messageType =
-          (resolvedData['e2eeMessageType'] as num?)?.toInt() ?? 3;
-      final decrypted = await cipher.decrypt(
-        remoteAddress,
-        CiphertextMessage.fromRaw(
-          messageType: messageType,
-          ciphertext: ciphertext,
-        ),
-      );
-      final plaintext = utf8.decode(decrypted);
-      await _cacheIncomingPlaintext(
-        cacheKey: cacheKey,
-        messageId: resolvedData['messageId']?.toString(),
-        clientMessageId: resolvedData['clientMessageId']?.toString(),
-        senderId: senderId,
-        receiverId: receiverId,
-        plaintext: plaintext,
-        messageType: 'text',
-      );
-      debugPrint(
-        '[SignalRepo] Decryption success sender=$senderId '
-        'device=${remoteAddress.deviceId()} cacheKey=$cacheKey',
-      );
-      return plaintext;
-    } catch (error) {
-      debugPrint(
-        '[SignalRepo] Decryption failed sender=$senderId '
-        'cacheKey=$cacheKey error=$error',
-      );
-
-      if (allowRepair && _canAttemptRepair(senderId)) {
-        try {
-          // Delete the broken session so the next PreKeyMessage from the sender
-          // automatically re-establishes the receive-side session. Signal's
-          // Double Ratchet binds each ciphertext to a specific ratchet state —
-          // re-decrypting an old ciphertext with a new session is impossible and
-          // always throws, so we stop after clearing the stale state.
-          final repairStore =
-              await _keyManagementService.getStore(currentUserId);
-          final repairAddress = ProtocolAddress(
-            name: senderId,
-            deviceId:
-                (resolvedData['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
-          );
-          await repairStore.deleteSession(repairAddress);
-          _keyManagementService.invalidateBundleCache(senderId);
-          debugPrint(
-            '[SignalRepo] Repair: deleted stale session for sender=$senderId '
-            'device=${repairAddress.deviceId()} — next PreKeyMessage will re-establish.',
-          );
-        } catch (repairError) {
-          debugPrint(
-              '[SignalRepo] Repair: session delete failed sender=$senderId error=$repairError');
-        }
-      }
-
-      return '[Encrypted message unavailable]';
-    }
-  }
-
-  Future<Uint8List> decryptBytesMessage({
-    required Map<String, dynamic> data,
-    required List<int> cipherBytes,
-    bool allowRepair = false,
-  }) async {
-    final peerLockId = data['senderId']?.toString() ?? '';
-    return _withSessionLock(peerLockId, () async {
-      return await _decryptBytesMessageInternal(
-        data: data,
-        cipherBytes: cipherBytes,
-        allowRepair: allowRepair,
-      );
-    });
-  }
-
-  Future<Uint8List> _decryptBytesMessageInternal({
-    required Map<String, dynamic> data,
-    required List<int> cipherBytes,
-    bool allowRepair = false,
-  }) async {
-    await ensureReady();
-    final senderId = data['senderId']?.toString() ?? '';
-    if (senderId == currentUserId) {
-      throw Exception('Encrypted media cache is unavailable.');
-    }
-
-    try {
-      final store = await _keyManagementService.getStore(currentUserId);
-      final cipher = _buildCipher(store);
-      final remoteAddress = ProtocolAddress(
-        name: senderId,
-        deviceId: (data['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
-      );
-      final messageType = (data['e2eeMessageType'] as num?)?.toInt() ?? 3;
-      final decrypted = await cipher.decrypt(
-        remoteAddress,
-        CiphertextMessage.fromRaw(
-          messageType: messageType,
-          ciphertext: Uint8List.fromList(cipherBytes),
-        ),
-      );
-      debugPrint(
-        '[SignalRepo] Media decryption success sender=$senderId '
-        'device=${remoteAddress.deviceId()}',
-      );
-      return decrypted;
-    } catch (error) {
-      debugPrint(
-          '[SignalRepo] Media decryption failed sender=$senderId error=$error');
-      if (allowRepair && _canAttemptRepair(senderId)) {
-        await _ensureSignalContext(senderId);
-        final store = await _keyManagementService.getStore(currentUserId);
-        final cipher = _buildCipher(store);
-        final remoteAddress = ProtocolAddress(
-          name: senderId,
-          deviceId: (data['senderSignalDeviceId'] as num?)?.toInt() ?? 1,
-        );
-        final messageType = (data['e2eeMessageType'] as num?)?.toInt() ?? 3;
-        return cipher.decrypt(
-          remoteAddress,
-          CiphertextMessage.fromRaw(
-            messageType: messageType,
-            ciphertext: Uint8List.fromList(cipherBytes),
-          ),
-        );
-      }
-      rethrow;
-    }
   }
 
   Future<String?> getCachedPlaintext(String cacheKey) async {
@@ -971,9 +575,9 @@ class ChatEncryptionRepository {
     final isDeleted =
         normalized['isDeleted'] == true || messageType == 'deleted';
     final isSuspicious = normalized['isSuspicious'] == true;
+    final remoteRiskScore = _extractRemoteRiskScore(normalized);
     final timestamp = _resolveMessageTimestamp(normalized);
     final cacheKey = buildMessageCacheKey(normalized);
-    final legacyEnvelope = isLegacyEnvelope(normalized);
 
     final existing = await _cacheService.readMessageProjectionByIds(
       userId: uid,
@@ -993,9 +597,7 @@ class ChatEncryptionRepository {
       final lastUpdatedAt = DateTime.fromMillisecondsSinceEpoch(
         (existing['updated_at'] as num?)?.toInt() ?? 0,
       );
-      final retryCooldown = legacyEnvelope
-          ? const Duration(seconds: 5)
-          : const Duration(seconds: 30);
+      const retryCooldown = Duration(seconds: 30);
       final recentFailure =
           projection.decryptionStatus == ConversationDecryptionStatus.failed &&
               DateTime.now().difference(lastUpdatedAt) < retryCooldown;
@@ -1003,7 +605,15 @@ class ChatEncryptionRepository {
           (projection.decryptionStatus ==
                   ConversationDecryptionStatus.success ||
               recentFailure)) {
-        return projection;
+        final needsSafetyVerdict = !projection.isOutgoing &&
+            !projection.isDeleted &&
+            projection.messageType == 'text' &&
+            !projection.isSuspicious &&
+            projection.safetyStatus == SafetyStatus.safe &&
+            projection.riskScore == null;
+        if (!needsSafetyVerdict) {
+          return projection;
+        }
       }
     }
 
@@ -1027,6 +637,8 @@ class ChatEncryptionRepository {
         isOutgoing: senderId == uid,
         isDeleted: true,
         isSuspicious: false,
+        safetyStatus: SafetyStatus.safe,
+        riskScore: null,
       );
       await _persistProjection(projection);
       return projection;
@@ -1057,6 +669,8 @@ class ChatEncryptionRepository {
         isOutgoing: senderId == uid,
         isDeleted: false,
         isSuspicious: isSuspicious,
+        safetyStatus: isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        riskScore: remoteRiskScore,
       );
       final scannedProjection = await _applyIncomingSafetyPipeline(projection);
       await _persistProjection(scannedProjection);
@@ -1083,30 +697,19 @@ class ChatEncryptionRepository {
         isOutgoing: senderId == uid,
         isDeleted: false,
         isSuspicious: isSuspicious,
+        safetyStatus: isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        riskScore: remoteRiskScore,
       );
       final scannedProjection = await _applyIncomingSafetyPipeline(projection);
       await _persistProjection(scannedProjection);
       return scannedProjection;
     }
 
-    final shouldRetry = _isFreshEncryptedMessage(timestamp);
     String? decryptedText;
-    if (isSignalEnvelope(normalized)) {
-      final signalText = await decryptTextMessage(
-        normalized,
-        allowRepair: shouldRetry,
-      );
-      if (!_isUnavailablePlaceholder(signalText)) {
-        decryptedText = signalText;
-      }
-    } else if (_legacyTextDecryptor != null && legacyEnvelope) {
-      final legacyText = await _legacyTextDecryptor!(
-        normalized,
-        allowRepair: shouldRetry,
-      );
-      if (!_isUnavailablePlaceholder(legacyText)) {
-        decryptedText = legacyText;
-      }
+    try {
+      decryptedText = await _securityService.decryptMessage(normalized);
+    } catch (e) {
+      debugPrint('[ChatEncryptRepo] Decryption failed: $e');
     }
 
     if (decryptedText != null && decryptedText.trim().isNotEmpty) {
@@ -1128,10 +731,45 @@ class ChatEncryptionRepository {
         isOutgoing: senderId == uid,
         isDeleted: false,
         isSuspicious: isSuspicious,
+        safetyStatus: isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        riskScore: remoteRiskScore,
       );
       final scannedProjection = await _applyIncomingSafetyPipeline(projection);
       await _persistProjection(scannedProjection);
       return scannedProjection;
+    }
+
+    final lowerAlgo = algorithm?.toLowerCase() ?? '';
+    final indicator = lowerAlgo.contains('rsa') ? 'RSA' : 'E2EE';
+
+    // Outgoing messages are encrypted for the receiver's key, so local RSA
+    // decryption is expected to fail. Don't show a scary "Unable to decrypt"
+    // error bubble for the sender.
+    if (senderId == uid) {
+      final fallbackText = '$indicator encrypted message';
+      final projection = DecryptedConversationMessage(
+        conversationId: conversationId,
+        messageKey: cacheKey,
+        messageId: messageId,
+        clientMessageId: clientMessageId,
+        senderId: senderId,
+        receiverId: receiverId,
+        messageType: messageType,
+        algorithm: algorithm,
+        cipherTextPresent: true,
+        decryptedText: fallbackText,
+        previewText: fallbackText,
+        decryptionStatus: ConversationDecryptionStatus.success,
+        failureReason: null,
+        timestamp: timestamp,
+        isOutgoing: true,
+        isDeleted: false,
+        isSuspicious: isSuspicious,
+        safetyStatus: isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        riskScore: remoteRiskScore,
+      );
+      await _persistProjection(projection);
+      return projection;
     }
 
     final projection = DecryptedConversationMessage(
@@ -1145,17 +783,19 @@ class ChatEncryptionRepository {
       algorithm: algorithm,
       cipherTextPresent: true,
       decryptedText: null,
-      previewText: 'Encrypted message',
+      previewText: '$indicator encrypted message',
       decryptionStatus: ConversationDecryptionStatus.failed,
-      failureReason: shouldRetry
-          ? 'Unable to decrypt message'
-          : 'Unable to decrypt older message',
+      failureReason: 'Unable to decrypt message',
       timestamp: timestamp,
       isOutgoing: senderId == uid,
       isDeleted: false,
       isSuspicious: senderId == uid
           ? isSuspicious
           : false, // Un-decryptable incoming is not marked suspicious
+      safetyStatus: senderId == uid
+          ? (isSuspicious ? SafetyStatus.malicious : SafetyStatus.safe)
+          : SafetyStatus.safe,
+      riskScore: senderId == uid ? remoteRiskScore : null,
     );
     await _persistProjection(projection);
     return projection;
@@ -1170,6 +810,12 @@ class ChatEncryptionRepository {
       return projection;
     }
 
+    // If this message was already flagged remotely (persisted to Firestore),
+    // don’t spend cycles re-scanning it just to re-derive the same label.
+    if (projection.isSuspicious && projection.riskScore != null) {
+      return projection.copyWith(safetyStatus: SafetyStatus.malicious);
+    }
+
     final plaintext = projection.decryptedText?.trim().isNotEmpty == true
         ? projection.decryptedText!.trim()
         : projection.previewText.trim();
@@ -1177,16 +823,14 @@ class ChatEncryptionRepository {
       return projection;
     }
 
-    final detectionKey =
-        projection.clientMessageId?.trim().isNotEmpty == true
-            ? projection.clientMessageId!.trim()
-            : projection.messageId ?? projection.messageKey;
+    final detectionKey = projection.clientMessageId?.trim().isNotEmpty == true
+        ? projection.clientMessageId!.trim()
+        : projection.messageId ?? projection.messageKey;
     if (_detectionCache.containsKey(detectionKey)) {
       final suspicious = _detectionCache[detectionKey]!;
       return projection.copyWith(
         isSuspicious: suspicious,
-        safetyStatus:
-            suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
+        safetyStatus: suspicious ? SafetyStatus.malicious : SafetyStatus.safe,
       );
     }
 
@@ -1207,7 +851,18 @@ class ChatEncryptionRepository {
       final verdict = await _smishingPipeline.quickScan(screenedMessage);
       if (verdict.result != null) {
         _detectionCache[detectionKey] = verdict.result!.isSuspicious;
-        return _projectionWithDetectionResult(projection, verdict.result!);
+        final updated =
+            _projectionWithDetectionResult(projection, verdict.result!);
+        unawaited(_persistQuarantineVaultEntryIfNeeded(
+          projection: updated,
+          result: verdict.result!,
+          plaintext: plaintext,
+        ));
+        unawaited(_persistDetectionToRemoteIfNeeded(
+          projection: updated,
+          result: verdict.result!,
+        ));
+        return updated;
       }
 
       final scanningProjection = projection.copyWith(
@@ -1224,6 +879,15 @@ class ChatEncryptionRepository {
               _projectionWithDetectionResult(scanningProjection, result);
           await _persistProjection(updatedProjection);
           await _emitConversationFromCache(projection.conversationId);
+          unawaited(_persistQuarantineVaultEntryIfNeeded(
+            projection: updatedProjection,
+            result: result,
+            plaintext: plaintext,
+          ));
+          unawaited(_persistDetectionToRemoteIfNeeded(
+            projection: updatedProjection,
+            result: result,
+          ));
         },
       );
       return scanningProjection;
@@ -1248,6 +912,166 @@ class ChatEncryptionRepository {
     );
   }
 
+  double? _extractRemoteRiskScore(Map<String, dynamic> data) {
+    final direct = data['riskScore'];
+    final parsed = _coerceDouble(direct);
+    if (parsed != null) {
+      return parsed;
+    }
+
+    final smishing = data['smishing'];
+    if (smishing is Map) {
+      return _coerceDouble(smishing['riskScore'] ?? smishing['modelScore']);
+    }
+    return null;
+  }
+
+  double? _coerceDouble(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is double) return raw;
+    if (raw is int) return raw.toDouble();
+    if (raw is num) return raw.toDouble();
+    if (raw is String) {
+      return double.tryParse(raw.trim());
+    }
+    return null;
+  }
+
+  Future<void> _persistDetectionToRemoteIfNeeded({
+    required DecryptedConversationMessage projection,
+    required DetectionResultModel result,
+  }) async {
+    if (projection.isOutgoing || projection.isDeleted) return;
+    if (!result.isSuspicious && !result.shouldQuarantine) return;
+
+    final conversationId = projection.conversationId.trim();
+    if (conversationId.isEmpty) return;
+
+    final docId = (projection.messageId ?? '').trim().isNotEmpty
+        ? projection.messageId!.trim()
+        : (projection.clientMessageId ?? '').trim();
+    if (docId.isEmpty) return;
+
+    try {
+      final messageRef = FirebaseFirestore.instance
+          .collection('chats')
+          .doc(conversationId)
+          .collection('messages')
+          .doc(docId);
+
+      await messageRef.set(<String, dynamic>{
+        'isSuspicious': true,
+        'riskScore': result.riskScore,
+        'smishing': result.toSmsMetadataMap(),
+        'smishingUpdatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      final chatRef =
+          FirebaseFirestore.instance.collection('chats').doc(conversationId);
+      await FirebaseFirestore.instance.runTransaction((txn) async {
+        final snap = await txn.get(chatRef);
+        final data = snap.data() ?? const <String, dynamic>{};
+        final lastId =
+            data['lastMessageClientMessageId']?.toString().trim() ?? '';
+        if (lastId == docId) {
+          txn.set(
+              chatRef,
+              <String, dynamic>{
+                'lastMessageIsSuspicious': true,
+              },
+              SetOptions(merge: true));
+        }
+      });
+    } catch (e) {
+      // Non-fatal: local labeling still works; this just makes it persist
+      // across devices/re-logins.
+      debugPrint('[ChatEncryptRepo] Remote smishing persist failed: $e');
+    }
+  }
+
+  Future<void> _persistQuarantineVaultEntryIfNeeded({
+    required DecryptedConversationMessage projection,
+    required DetectionResultModel result,
+    required String plaintext,
+  }) async {
+    if (projection.isOutgoing || projection.isDeleted) return;
+    if (!result.isSuspicious) return;
+
+    final uid = currentUserId;
+    if (uid.isEmpty) return;
+
+    final conversationId = projection.conversationId.trim();
+    if (conversationId.isEmpty) return;
+
+    final messageDocId = (projection.messageId ?? '').trim().isNotEmpty
+        ? projection.messageId!.trim()
+        : (projection.clientMessageId ?? '').trim();
+    if (messageDocId.isEmpty) return;
+
+    final entryId = 'online_${conversationId}_$messageDocId';
+    final quarantineRef = FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .collection('quarantine')
+        .doc(entryId);
+
+    bool existed = _quarantineEntryCache.contains(entryId);
+    if (!existed) {
+      try {
+        final snap = await quarantineRef.get();
+        existed = snap.exists;
+      } catch (_) {
+        // If Firestore read fails (offline), still proceed with a best-effort write.
+      }
+    }
+
+    final messageDocPath =
+        'chats/$conversationId/messages/${projection.messageId?.trim().isNotEmpty == true ? projection.messageId!.trim() : messageDocId}';
+
+    try {
+      await quarantineRef.set(<String, dynamic>{
+        'sender': projection.senderId,
+        'message': plaintext,
+        'source': 'online',
+        'messageDocPath': messageDocPath,
+        'restoreMode': 'messageDoc',
+        'reportedAt': FieldValue.serverTimestamp(),
+        'riskScore': result.riskScore,
+        'riskLevel': result.riskLevel,
+        'detectionReasons': result.explanations,
+        'detectionSource': result.detectionSource,
+        'pipelineStage': result.pipelineStage,
+        'detectionDecision': result.decision,
+        'smishing': result.toSmsMetadataMap(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('[ChatEncryptRepo] Quarantine vault persist failed: $e');
+      return;
+    }
+
+    _quarantineEntryCache.add(entryId);
+
+    // Mark the underlying message doc as reported if we can. This is optional
+    // (rules may deny recipients from mutating chat messages).
+    try {
+      await FirebaseFirestore.instance.doc(messageDocPath).set(
+        <String, dynamic>{'isReported': true},
+        SetOptions(merge: true),
+      );
+    } catch (_) {}
+
+    // Counter / contribution hub: only increment once per message.
+    if (!existed) {
+      try {
+        await _feedbackDb.saveConfirmedSmishing(
+          message: plaintext,
+          source: 'online',
+          sender: projection.senderId,
+        );
+      } catch (_) {}
+    }
+  }
+
   String buildMessageCacheKey(Map<String, dynamic> data) {
     final explicit = data['e2eeCacheKey']?.toString().trim() ?? '';
     if (explicit.isNotEmpty) {
@@ -1261,12 +1085,6 @@ class ChatEncryptionRepository {
       return '$senderId|$receiverId|$shortCipher';
     }
     return '${data['messageId'] ?? data['clientMessageId'] ?? _uuid.v4()}';
-  }
-
-  bool isLegacyEnvelope(Map<String, dynamic> data) {
-    return (data['cipherText']?.toString().isNotEmpty ?? false) &&
-        (data['e2eeNonce']?.toString().isNotEmpty ?? false) &&
-        (data['e2eeMac']?.toString().isNotEmpty ?? false);
   }
 
   Future<void> prewarmConversation(String peerUserId) async {
@@ -1284,9 +1102,8 @@ class ChatEncryptionRepository {
     final future = () async {
       try {
         await ensureReady();
-        await _ensureSignalContext(trimmedPeerUserId);
       } catch (e) {
-        debugPrint('[ChatEncryptRepo] Signal prewarm failed (non-fatal): $e');
+        debugPrint('[ChatEncryptRepo] Prewarm failed (non-fatal): $e');
       }
     }();
     _conversationPrewarmFutures[trimmedPeerUserId] = future;
@@ -1423,7 +1240,7 @@ class ChatEncryptionRepository {
 
     var processedAny = false;
     for (final doc in docs) {
-      // YIELD: Prevent UI freezing during heavy libsignal decryption math
+      // YIELD: Prevent UI freezing during decryption work.
       await Future<void>.delayed(const Duration(milliseconds: 4));
 
       final rawData = Map<String, dynamic>.from(doc.data())
@@ -1626,85 +1443,6 @@ class ChatEncryptionRepository {
     controller.add(previewModel);
   }
 
-  _ProjectionRowIndexes _buildProjectionRowIndexes(
-    List<Map<String, dynamic>> rows,
-  ) {
-    final byMessageId = <String, Map<String, dynamic>>{};
-    final byClientMessageId = <String, Map<String, dynamic>>{};
-    final byMessageKey = <String, Map<String, dynamic>>{};
-    for (final row in rows) {
-      final messageId = row['message_id']?.toString().trim() ?? '';
-      if (messageId.isNotEmpty) {
-        byMessageId[messageId] = row;
-      }
-      final clientMessageId = row['client_message_id']?.toString().trim() ?? '';
-      if (clientMessageId.isNotEmpty) {
-        byClientMessageId[clientMessageId] = row;
-      }
-      final messageKey = row['message_key']?.toString().trim() ?? '';
-      if (messageKey.isNotEmpty) {
-        byMessageKey[messageKey] = row;
-      }
-    }
-    return _ProjectionRowIndexes(
-      byMessageId: byMessageId,
-      byClientMessageId: byClientMessageId,
-      byMessageKey: byMessageKey,
-    );
-  }
-
-  bool _hasReusableSuccessfulProjection({
-    required String docId,
-    required Map<String, dynamic> normalized,
-    required _ProjectionRowIndexes cachedIndexes,
-  }) {
-    final uid = currentUserId;
-    if (uid.isEmpty) return false;
-
-    final currentClientMessageId =
-        normalized['clientMessageId']?.toString().trim() ?? '';
-    final currentMessageKey = buildMessageCacheKey(normalized).trim();
-    final currentIsDeleted = normalized['isDeleted'] == true ||
-        (normalized['type']?.toString() ?? '') == 'deleted';
-
-    Map<String, dynamic>? row = cachedIndexes.byMessageId[docId];
-    if (row != null) {
-      final rowClientMessageId =
-          row['client_message_id']?.toString().trim() ?? '';
-      final rowMessageKey = row['message_key']?.toString().trim() ?? '';
-      final sameClient = currentClientMessageId.isNotEmpty &&
-          rowClientMessageId == currentClientMessageId;
-      final sameKey =
-          currentMessageKey.isNotEmpty && rowMessageKey == currentMessageKey;
-      if (!sameClient && !sameKey) {
-        row = null;
-      }
-    }
-    row ??= currentClientMessageId.isNotEmpty
-        ? cachedIndexes.byClientMessageId[currentClientMessageId]
-        : null;
-    row ??= currentMessageKey.isNotEmpty
-        ? cachedIndexes.byMessageKey[currentMessageKey]
-        : null;
-    if (row == null) {
-      return false;
-    }
-
-    final projection = DecryptedConversationMessage.fromCacheRow(
-      row,
-      currentUserId: uid,
-    );
-    return projection.decryptionStatus ==
-            ConversationDecryptionStatus.success &&
-        projection.isDeleted == currentIsDeleted;
-  }
-
-  int _nextConversationHydrationGeneration(String conversationId) {
-    final next = (_conversationHydrationGenerations[conversationId] ?? 0) + 1;
-    _conversationHydrationGenerations[conversationId] = next;
-    return next;
-  }
-
   String _messageIdentityFromDoc(
       QueryDocumentSnapshot<Map<String, dynamic>> doc) {
     final clientMessageId =
@@ -1757,34 +1495,34 @@ class ChatEncryptionRepository {
     final cipherText = readString(const <String>[
       'cipherText',
       'ciphertext',
+      'cipher_text',
       'encryptedPayload',
       'encryptedText',
       'encrypted_payload',
       'cipher',
     ]);
-    final nonce = readString(const <String>[
-      'e2eeNonce',
-      'nonce',
-      'iv',
+    final encryptedAesKey = readString(const <String>[
+      'encrypted_aes_key',
+      'encryptedAesKey',
+      'encrypted_aesKey',
+      'encryptedAesKeyBase64',
+      'encrypted_key',
+      'encryptedKey',
+      'e2eeEncryptedAesKey',
+      'lastMessageEncryptedAesKey',
     ]);
-    final mac = readString(const <String>[
-      'e2eeMac',
-      'mac',
-      'tag',
+    final iv = readString(const <String>[
+      'iv',
     ]);
 
     if (cipherText.isNotEmpty) {
       data['cipherText'] = cipherText;
-    } else if ((data['e2ee'] == true || nonce.isNotEmpty || mac.isNotEmpty) &&
-        (data['text']?.toString().trim().isNotEmpty ?? false)) {
-      data['cipherText'] = data['text']?.toString().trim();
-      data['text'] = '';
     }
-    if (nonce.isNotEmpty) {
-      data['e2eeNonce'] = nonce;
+    if (encryptedAesKey.isNotEmpty) {
+      data['encrypted_aes_key'] = encryptedAesKey;
     }
-    if (mac.isNotEmpty) {
-      data['e2eeMac'] = mac;
+    if (iv.isNotEmpty) {
+      data['iv'] = iv;
     }
 
     final version = readString(const <String>[
@@ -1804,9 +1542,9 @@ class ChatEncryptionRepository {
     if (algorithm.isNotEmpty) {
       data['e2eeAlgorithm'] = algorithm;
     } else if ((data['cipherText']?.toString().isNotEmpty ?? false) &&
-        (data['e2eeNonce']?.toString().isNotEmpty ?? false) &&
-        (data['e2eeMac']?.toString().isNotEmpty ?? false)) {
-      data['e2eeAlgorithm'] = 'x25519-aesgcm-v1';
+        (data['encrypted_aes_key']?.toString().isNotEmpty ?? false) &&
+        (data['iv']?.toString().isNotEmpty ?? false)) {
+      data['e2eeAlgorithm'] = 'rsa-aes-cbc-v1';
     }
 
     final normalizedType = readString(const <String>[
@@ -1888,67 +1626,6 @@ class ChatEncryptionRepository {
       data['receiverPublicKey'] = receiverPublicKey;
     }
 
-    final sessionLocalPublicKey = readString(const <String>[
-      'e2eeSessionLocalPublicKey',
-      'sessionLocalPublicKey',
-      'session_local_public_key',
-      'sessionLocalKey',
-      'localPublicKey',
-      'local_public_key',
-    ]);
-    if (sessionLocalPublicKey.isNotEmpty) {
-      data['e2eeSessionLocalPublicKey'] = sessionLocalPublicKey;
-    }
-
-    final sessionPeerPublicKey = readString(const <String>[
-      'e2eeSessionPeerPublicKey',
-      'sessionPeerPublicKey',
-      'session_peer_public_key',
-      'sessionPeerKey',
-      'peerPublicKey',
-      'peer_public_key',
-    ]);
-    if (sessionPeerPublicKey.isNotEmpty) {
-      data['e2eeSessionPeerPublicKey'] = sessionPeerPublicKey;
-    }
-
-    final sessionId = readString(const <String>[
-      'e2eeSessionId',
-      'sessionId',
-      'session_id',
-    ]);
-    if (sessionId.isNotEmpty) {
-      data['e2eeSessionId'] = sessionId;
-    }
-
-    final sessionAlgorithm = readString(const <String>[
-      'e2eeSessionAlgorithm',
-      'sessionAlgorithm',
-      'session_algorithm',
-    ]);
-    if (sessionAlgorithm.isNotEmpty) {
-      data['e2eeSessionAlgorithm'] = sessionAlgorithm;
-    }
-
-    final sessionVersion = readString(const <String>[
-      'e2eeSessionVersion',
-      'sessionVersion',
-      'session_version',
-    ]);
-    if (sessionVersion.isNotEmpty) {
-      data['e2eeSessionVersion'] =
-          int.tryParse(sessionVersion) ?? data['e2eeSessionVersion'];
-    }
-
-    final sessionPeerId = readString(const <String>[
-      'e2eeSessionPeerId',
-      'sessionPeerId',
-      'session_peer_id',
-    ]);
-    if (sessionPeerId.isNotEmpty) {
-      data['e2eeSessionPeerId'] = sessionPeerId;
-    }
-
     final clientMessageId = readString(const <String>[
       'clientMessageId',
       'lastMessageClientMessageId',
@@ -1960,7 +1637,9 @@ class ChatEncryptionRepository {
     }
 
     final looksEncrypted = (data['e2ee'] == true) ||
-        (data['cipherText']?.toString().isNotEmpty ?? false);
+        ((data['cipherText']?.toString().isNotEmpty ?? false) &&
+            (data['encrypted_aes_key']?.toString().isNotEmpty ?? false) &&
+            (data['iv']?.toString().isNotEmpty ?? false));
     if (looksEncrypted) {
       data['e2ee'] = true;
     }
@@ -2006,19 +1685,6 @@ class ChatEncryptionRepository {
     return DateTime.fromMillisecondsSinceEpoch(0);
   }
 
-  bool _isFreshEncryptedMessage(DateTime timestamp) {
-    final now = DateTime.now();
-    final age = now.isAfter(timestamp)
-        ? now.difference(timestamp)
-        : timestamp.difference(now);
-    return age <= const Duration(hours: 1);
-  }
-
-  bool _isUnavailablePlaceholder(String text) {
-    final trimmed = text.trim();
-    return trimmed.startsWith('[') && trimmed.endsWith(']');
-  }
-
   String _deriveOtherParticipant(dynamic rawParticipants, String senderId) {
     final participants = List<String>.from(rawParticipants ?? const <String>[]);
     return participants.firstWhere(
@@ -2027,324 +1693,8 @@ class ChatEncryptionRepository {
     );
   }
 
-  SessionCipher _buildCipher(LibsignalStoreService store) {
-    return SessionCipher(
-      sessionStore: store,
-      identityKeyStore: store,
-      preKeyStore: store,
-      signedPreKeyStore: store,
-      kyberPreKeyStore: store,
-    );
-  }
-
-  Future<_PreparedSignalContext> _ensureSignalContext(String peerUserId) async {
-    final contexts = await _ensureSignalContexts(peerUserId);
-    if (contexts.isEmpty) {
-      throw Exception('Recipient has not enabled secure messaging yet.');
-    }
-    return contexts.first;
-  }
-
-  Future<List<_PreparedSignalContext>> _ensureSignalContexts(
-    String peerUserId, {
-    Set<String> excludedDeviceDocIds = const <String>{},
-  }) {
-    // Coalesce concurrent builds for the same peer so racing sendMessage()
-    // calls share one in-flight Firestore fetch + session build instead of
-    // racing and overwriting each other's sessions.
-    final pending = _pendingContextBuilds[peerUserId];
-    if (pending != null) return pending;
-
-    final future = () async {
-      try {
-        return await _doEnsureSignalContexts(
-          peerUserId,
-          excludedDeviceDocIds: excludedDeviceDocIds,
-        );
-      } finally {
-        _pendingContextBuilds.remove(peerUserId);
-      }
-    }();
-    _pendingContextBuilds[peerUserId] = future;
-    return future;
-  }
-
-  Future<List<_PreparedSignalContext>> _doEnsureSignalContexts(
-    String peerUserId, {
-    Set<String> excludedDeviceDocIds = const <String>{},
-  }) async {
-    final uid = currentUserId;
-    if (uid.isEmpty) {
-      throw Exception('No logged-in user found.');
-    }
-    await _keyManagementService.ensureDeviceIdentity(userId: uid);
-    final store = await _keyManagementService.getStore(uid);
-    final localDeviceDocId = await store.getDeviceDocId();
-    final localSignalDeviceId = await store.getSignalDeviceId();
-    final localIdentityPublicKeyBase64 =
-        await _keyManagementService.getCurrentIdentityPublicKeyBase64(uid);
-
-    final liveBundles = await _keyManagementService.fetchPeerBundles(
-      peerUserId,
-      consumeOneTimePreKey: false,
-    );
-    if (liveBundles.isEmpty) {
-      throw Exception('Recipient has not enabled secure messaging yet.');
-    }
-
-    final excluded = excludedDeviceDocIds
-        .map((value) => value.trim())
-        .where((value) => value.isNotEmpty)
-        .toSet();
-    final contexts = <_PreparedSignalContext>[];
-    for (final initialBundle in liveBundles) {
-      if (excluded.contains(initialBundle.deviceDocId)) {
-        continue;
-      }
-      var liveBundle = initialBundle;
-      final remoteAddress = liveBundle.toProtocolAddress();
-      final hasSession = await store.containsSession(remoteAddress);
-
-      if (!hasSession) {
-        final debounceKey = '$peerUserId:${liveBundle.signalDeviceId}';
-        final lastRebuild = _sessionRebuildDebounce[debounceKey];
-        if (lastRebuild != null &&
-            DateTime.now().difference(lastRebuild) <
-                const Duration(seconds: 30)) {
-          // A rebuild was just attempted for this peer+device. Skip to avoid
-          // a rebuild storm while the session is being established.
-          continue;
-        }
-        _sessionRebuildDebounce[debounceKey] = DateTime.now();
-        try {
-          liveBundle = await _keyManagementService.fetchPeerBundleForDevice(
-                peerUserId,
-                deviceDocId: liveBundle.deviceDocId,
-                consumeOneTimePreKey: true,
-              ) ??
-              liveBundle;
-          final PreKeyBundle signalBundle;
-          try {
-            signalBundle = liveBundle.toSignalPreKeyBundle();
-          } catch (bundleError) {
-            debugPrint(
-              '[SignalRepo] Bundle construction failed peer=$peerUserId '
-              'device=${liveBundle.signalDeviceId} error=$bundleError — skipping device',
-            );
-            _sessionRebuildDebounce.remove(debounceKey);
-            continue;
-          }
-          final sessionBuilder = SessionBuilder(
-            sessionStore: store,
-            identityKeyStore: store,
-          );
-          await sessionBuilder.processPreKeyBundle(
-            liveBundle.toProtocolAddress(),
-            signalBundle,
-          );
-          debugPrint(
-            '[SignalRepo] Session ready peer=$peerUserId '
-            'device=${liveBundle.signalDeviceId} preKey=${liveBundle.oneTimePreKeyId}',
-          );
-        } catch (e) {
-          // The bundle for this device is corrupted or has a mismatched
-          // signature (e.g. stale Firestore doc from a previous registration).
-          // Log and skip — other devices may still succeed. Reset the debounce
-          // so the next send can retry this device after new keys are published.
-          debugPrint(
-            '[SignalRepo] Session build failed peer=$peerUserId '
-            'device=${liveBundle.signalDeviceId} error=$e — skipping device',
-          );
-          _sessionRebuildDebounce.remove(debounceKey);
-          continue;
-        }
-      }
-
-      contexts.add(
-        _PreparedSignalContext(
-          store: store,
-          remoteAddress: liveBundle.toProtocolAddress(),
-          bundle: liveBundle,
-          localDeviceDocId: localDeviceDocId,
-          localSignalDeviceId: localSignalDeviceId,
-          localIdentityPublicKeyBase64: localIdentityPublicKeyBase64,
-        ),
-      );
-    }
-
-    return contexts;
-  }
-
-  Map<String, dynamic> _buildSignalEnvelopeFields({
-    required _PreparedSignalContext context,
-    required CiphertextMessage encrypted,
-  }) {
-    return <String, dynamic>{
-      'cipherText': base64Encode(encrypted.ciphertext),
-      'e2eeMessageType': encrypted.type.value,
-      'senderDeviceDocId': context.localDeviceDocId,
-      'receiverDeviceDocId': context.bundle.deviceDocId,
-      'senderSignalDeviceId': context.localSignalDeviceId,
-      'receiverSignalDeviceId': context.bundle.signalDeviceId,
-      'senderPublicKey': context.localIdentityPublicKeyBase64,
-      'receiverPublicKey': context.bundle.identityPublicKeyBase64,
-      'e2eeSessionId':
-          '${context.bundle.userId}_${context.bundle.deviceDocId}_${context.bundle.signalDeviceId}',
-      'e2eePreKeyIdUsed': context.bundle.oneTimePreKeyId,
-      'e2eeSignedPreKeyIdUsed': context.bundle.signedPreKeyId,
-    };
-  }
-
-  List<_PreparedSignalContext> _dedupeSignalContexts(
-    List<_PreparedSignalContext> contexts,
-  ) {
-    final deduped = <String, _PreparedSignalContext>{};
-    for (final context in contexts) {
-      deduped.putIfAbsent(context.bundle.deviceDocId, () => context);
-    }
-    return deduped.values.toList(growable: false);
-  }
-
-  bool _hasSignalEnvelopeForDevice(
-    Map<String, dynamic> data, {
-    required String localDeviceDocId,
-  }) {
-    final raw = data['e2eeDeviceEnvelopes'];
-    if (raw is! Map) {
-      return false;
-    }
-    final selected = raw[localDeviceDocId];
-    return selected is Map && selected.isNotEmpty;
-  }
-
-  Map<String, dynamic> _resolveSignalEnvelopeForDevice(
-    Map<String, dynamic> data, {
-    required String localDeviceDocId,
-  }) {
-    final raw = data['e2eeDeviceEnvelopes'];
-    if (raw is! Map) {
-      return data;
-    }
-    final selected = raw[localDeviceDocId];
-    if (selected is! Map) {
-      return data;
-    }
-    final resolved = Map<String, dynamic>.from(data);
-    resolved.addAll(
-      selected.map(
-        (key, value) => MapEntry(key.toString(), value),
-      ),
-    );
-    return resolved;
-  }
-
-  Future<void> _cacheOutgoingPlaintext({
-    required String cacheKey,
-    required String clientMessageId,
-    required String senderId,
-    required String receiverId,
-    required String plaintext,
-    required String messageType,
-  }) async {
-    await cachePlaintext(
-      cacheKey: cacheKey,
-      conversationId: _conversationId(senderId, receiverId),
-      messageId: null,
-      clientMessageId: clientMessageId,
-      senderId: senderId,
-      receiverId: receiverId,
-      plaintext: plaintext,
-      messageType: messageType,
-      updateConversationPreview: true,
-    );
-  }
-
-  Future<void> _cacheIncomingPlaintext({
-    required String cacheKey,
-    required String? messageId,
-    required String? clientMessageId,
-    required String senderId,
-    required String receiverId,
-    required String plaintext,
-    required String messageType,
-  }) async {
-    await cachePlaintext(
-      cacheKey: cacheKey,
-      conversationId: _conversationId(senderId, receiverId),
-      messageId: messageId,
-      clientMessageId: clientMessageId,
-      senderId: senderId,
-      receiverId: receiverId,
-      plaintext: plaintext,
-      messageType: messageType,
-      updateConversationPreview: false,
-    );
-  }
-
-  bool _canAttemptRepair(String peerUserId) {
-    final lastAttempt = _missingSessionCooldown[peerUserId];
-    if (lastAttempt != null &&
-        DateTime.now().difference(lastAttempt) < const Duration(seconds: 5)) {
-      return false;
-    }
-    _missingSessionCooldown[peerUserId] = DateTime.now();
-    return true;
-  }
-
-  /// Deletes all local Signal sessions for [peerUserId] and clears the bundle
-  /// cache. The next outgoing message to that peer will produce a fresh
-  /// PreKeyMessage (new X3DH exchange), allowing the receiver to re-establish
-  /// their session automatically.
-  Future<void> resetPeerSession(String peerUserId) async {
-    final trimmed = peerUserId.trim();
-    if (trimmed.isEmpty) return;
-    await ensureReady();
-    final store = await _keyManagementService.getStore(currentUserId);
-    final bundles = await _keyManagementService.fetchPeerBundles(
-      trimmed,
-      consumeOneTimePreKey: false,
-    );
-    for (final bundle in bundles) {
-      try {
-        await store.deleteSession(bundle.toProtocolAddress());
-      } catch (_) {}
-    }
-    _keyManagementService.invalidateBundleCache(trimmed);
-    _missingSessionCooldown.remove(trimmed);
-  }
-
   String _conversationId(String a, String b) {
     final ids = [a, b]..sort();
     return ids.join('_');
   }
-}
-
-class _PreparedSignalContext {
-  final LibsignalStoreService store;
-  final ProtocolAddress remoteAddress;
-  final PreKeyBundleModel bundle;
-  final String localDeviceDocId;
-  final int localSignalDeviceId;
-  final String localIdentityPublicKeyBase64;
-
-  const _PreparedSignalContext({
-    required this.store,
-    required this.remoteAddress,
-    required this.bundle,
-    required this.localDeviceDocId,
-    required this.localSignalDeviceId,
-    required this.localIdentityPublicKeyBase64,
-  });
-}
-
-class _ProjectionRowIndexes {
-  final Map<String, Map<String, dynamic>> byMessageId;
-  final Map<String, Map<String, dynamic>> byClientMessageId;
-  final Map<String, Map<String, dynamic>> byMessageKey;
-
-  const _ProjectionRowIndexes({
-    required this.byMessageId,
-    required this.byClientMessageId,
-    required this.byMessageKey,
-  });
 }

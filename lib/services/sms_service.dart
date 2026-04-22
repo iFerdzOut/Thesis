@@ -12,6 +12,7 @@ import '../models/safety_status.dart';
 import '../models/screened_message_model.dart';
 import 'native_channel_router.dart';
 import 'notification_service.dart';
+import 'feedback_database_service.dart';
 import 'local_detection_repository.dart';
 import 'message_routing_service.dart';
 import 'message_screening_service.dart';
@@ -121,6 +122,7 @@ class SmsService {
   static Map<String, dynamic>? _pendingSmsComposeIntent;
   static int _smsExperienceDepth = 0;
   static final LinkedHashSet<String> _handledEventIds = LinkedHashSet<String>();
+  static final Set<String> _confirmedSmishingFeedbackKeys = <String>{};
   static const Duration _maintenanceDelay = Duration(milliseconds: 650);
   static const Duration _threadPrimeCooldown = Duration(seconds: 12);
   static const Duration _urlExtractorUpgradeLookback = Duration(days: 120);

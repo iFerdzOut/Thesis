@@ -9,146 +9,33 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-import 'chat_encryption_repository.dart';
-import 'key_management_service.dart';
 import 'local_message_cache_service.dart';
-
-class EncryptedTextPayload {
-  final String cipherText;
-  final String nonce;
-  final String mac;
-  final int version;
-  final String algorithm;
-
-  const EncryptedTextPayload({
-    required this.cipherText,
-    required this.nonce,
-    required this.mac,
-    this.version = 1,
-    this.algorithm = 'x25519-aesgcm-v1',
-  });
-
-  Map<String, dynamic> toMap() {
-    return {
-      'e2ee': true,
-      'e2eeVersion': version,
-      'e2eeAlgorithm': algorithm,
-      'cipherText': cipherText,
-      'e2eeNonce': nonce,
-      'e2eeMac': mac,
-    };
-  }
-}
-
-class EncryptedBinaryPayload {
-  final Uint8List cipherBytes;
-  final String nonce;
-  final String mac;
-  final int version;
-  final String algorithm;
-
-  const EncryptedBinaryPayload({
-    required this.cipherBytes,
-    required this.nonce,
-    required this.mac,
-    this.version = 1,
-    this.algorithm = 'x25519-aesgcm-v1',
-  });
-
-  Map<String, dynamic> toMap() {
-    return {
-      'e2ee': true,
-      'e2eeVersion': version,
-      'e2eeAlgorithm': algorithm,
-      'e2eeNonce': nonce,
-      'e2eeMac': mac,
-    };
-  }
-}
-
-class E2eeSessionContext {
-  final String peerId;
-  final String chatId;
-  final String sessionId;
-  final String localPublicKeyBase64;
-  final String peerPublicKeyBase64;
-  final SimpleKeyPairData localKeyPair;
-  final SimplePublicKey peerPublicKey;
-  final int sessionVersion;
-  final String algorithm;
-
-  const E2eeSessionContext({
-    required this.peerId,
-    required this.chatId,
-    required this.sessionId,
-    required this.localPublicKeyBase64,
-    required this.peerPublicKeyBase64,
-    required this.localKeyPair,
-    required this.peerPublicKey,
-    this.sessionVersion = 1,
-    this.algorithm = 'x25519-aesgcm-v1',
-  });
-
-  Map<String, dynamic> toMetadataMap() {
-    return {
-      'senderPublicKey': localPublicKeyBase64,
-      'receiverPublicKey': peerPublicKeyBase64,
-      'e2eeSessionChatId': chatId,
-      'e2eeSessionLocalPublicKey': localPublicKeyBase64,
-      'e2eeSessionPeerPublicKey': peerPublicKeyBase64,
-      'e2eeSessionId': sessionId,
-      'e2eeSessionVersion': sessionVersion,
-      'e2eeSessionPeerId': peerId,
-      'e2eeSessionAlgorithm': algorithm,
-      'e2eeKeyType': 'static_x25519',
-    };
-  }
-}
-
-class _PeerPublicKeyCandidates {
-  final List<SimplePublicKey> exact;
-  final List<SimplePublicKey> fallback;
-
-  const _PeerPublicKeyCandidates({
-    required this.exact,
-    required this.fallback,
-  });
-}
+import 'chat_encryption_repository.dart';
+import 'security_service.dart';
 
 class E2eeService {
-  E2eeService._internal() {
-    _signalRepository.registerLegacyDecryptors(
-      textDecryptor: _decryptTextMessageLegacy,
-    );
-  }
+  E2eeService._internal();
 
   static final E2eeService _instance = E2eeService._internal();
   factory E2eeService() => _instance;
 
   static const FlutterSecureStorage _secureStorage = FlutterSecureStorage();
-  static const String _privateKeyPrefix = 'e2ee_private_';
-  static const String _publicKeyPrefix = 'e2ee_public_';
-  static const String _localKeyHistoryPrefix = 'e2ee_key_history_';
-  static const String _accountBackupPassphrasePrefix =
-      'e2ee_account_backup_passphrase_';
   static const String _bootstrappedMarkerPrefix = 'e2ee_bootstrapped_v1_';
   static const String _zeroKnowledgePassphrasePrefix =
       'e2ee_zero_knowledge_passphrase_';
-  static const String _algorithm = 'x25519-aesgcm-v1';
+  static const String _accountBackupPassphrasePrefix =
+      'e2ee_account_backup_passphrase_';
+  static const String _algorithm = 'rsa-aes-cbc-v1';
   static const String _recoveryAlgorithm = 'pbkdf2-aesgcm-v1';
   static const int _recoveryVersion = 1;
   static const int _recoveryIterations = 150000;
-  static const int _maxStoredLocalKeyHistoryEntries = 6;
-  static const Duration _autoRepairFreshWindow = Duration(hours: 1);
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final ChatEncryptionRepository _signalRepository = ChatEncryptionRepository();
-  final KeyManagementService _keyManagementService = KeyManagementService();
   final LocalMessageCacheService _localCache = LocalMessageCacheService();
-  final X25519 _keyExchange = X25519();
+  final ChatEncryptionRepository _chatEncryptionRepository =
+      ChatEncryptionRepository();
   final AesGcm _cipher = AesGcm.with256bits();
-  final Hkdf _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
   final Pbkdf2 _pbkdf2 = Pbkdf2(
     macAlgorithm: Hmac.sha256(),
     iterations: _recoveryIterations,
@@ -161,30 +48,19 @@ class E2eeService {
   String? _syncedRemoteIdentityPublicKey;
   Future<void>? _remoteIdentitySyncFuture;
   String? _cachedKeyPairUserId;
-  SimpleKeyPairData? _cachedCurrentUserKeyPair;
-  Future<SimpleKeyPairData>? _keyPairFuture;
-  final Map<String, SimplePublicKey> _publicKeyCache =
-      <String, SimplePublicKey>{};
-  final Map<String, Future<SimplePublicKey?>> _publicKeyFutureCache =
-      <String, Future<SimplePublicKey?>>{};
-  final Map<String, List<SimplePublicKey>> _previousPublicKeysCache =
-      <String, List<SimplePublicKey>>{};
-  final Map<String, Future<List<SimplePublicKey>>>
-      _previousPublicKeysFutureCache =
-      <String, Future<List<SimplePublicKey>>>{};
-  final Map<String, SecretKey> _conversationKeyCache = <String, SecretKey>{};
-  final Map<String, String> _decryptedTextCache = <String, String>{};
-  final Map<String, E2eeSessionContext> _sessionCache =
-      <String, E2eeSessionContext>{};
-  List<SimpleKeyPairData>? _cachedLocalKeyHistory;
-  String? _cachedLocalKeyHistoryUserId;
-  final Map<String, Future<void>> _peerRepairFutureCache =
-      <String, Future<void>>{};
-  final Map<String, DateTime> _peerRepairTimestamps = <String, DateTime>{};
+  RSAKeyPairData? _cachedCurrentUserKeyPair;
+  Future<RSAKeyPairData>? _keyPairFuture;
+  final Map<String, String> _publicKeyCache = <String, String>{};
+  final Map<String, Future<String?>> _publicKeyFutureCache =
+      <String, Future<String?>>{};
   Future<void>? _automaticBackupSyncFuture;
   Future<bool>? _automaticBackupBootstrapFuture;
-
-  static const Duration _repairCooldown = Duration(seconds: 5);
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
+      _onlineChatHydrationSubscription;
+  String? _onlineChatHydrationUserId;
+  Future<void>? _onlineChatInitialHydrationFuture;
+  String? _onlineChatInitialHydrationUserId;
+  final Set<String> _onlineChatSeenLatestMessageKeys = <String>{};
 
   String get currentUserId => _auth.currentUser?.uid ?? '';
 
@@ -196,206 +72,10 @@ class E2eeService {
     return await _hasRemoteRecoveryBackup(currentUserId);
   }
 
-  Future<E2eeSessionContext> ensureSessionForPeer({
-    required String peerId,
-    String? preferredPeerPublicKeyBase64,
-  }) async {
-    final trimmedPeerId = peerId.trim();
-    if (trimmedPeerId.isEmpty) {
-      throw Exception('Peer ID is required for encrypted chat.');
-    }
-
-    await ensureIdentityForCurrentUser();
-    final userId = currentUserId;
-    final localKeyPair = await _readCurrentUserKeyPair();
-    final localPublicKeyB64 = base64Encode(localKeyPair.publicKey.bytes);
-
-    SimplePublicKey? peerPublicKey;
-    String peerPublicKeyB64 = preferredPeerPublicKeyBase64?.trim() ?? '';
-    if (peerPublicKeyB64.isNotEmpty) {
-      try {
-        peerPublicKey = SimplePublicKey(
-          base64Decode(peerPublicKeyB64),
-          type: KeyPairType.x25519,
-        );
-      } catch (_) {
-        peerPublicKey = null;
-        peerPublicKeyB64 = '';
-      }
-    }
-
-    peerPublicKey ??= await _readUserPublicKey(
-      trimmedPeerId,
-      forceRefresh: true,
-    );
-    if (peerPublicKey == null) {
-      throw Exception('Recipient has not enabled encrypted chat yet.');
-    }
-    if (peerPublicKeyB64.isEmpty) {
-      peerPublicKeyB64 = base64Encode(peerPublicKey.bytes);
-    }
-
-    final chatId = _chatId(userId, trimmedPeerId);
-    final sessionCacheKey = _buildSessionCacheKey(
-      chatId: chatId,
-      localPublicKeyBase64: localPublicKeyB64,
-      peerPublicKeyBase64: peerPublicKeyB64,
-    );
-    final cachedSession = _sessionCache[sessionCacheKey];
-    if (cachedSession != null) {
-      return cachedSession;
-    }
-
-    final session = E2eeSessionContext(
-      peerId: trimmedPeerId,
-      chatId: chatId,
-      sessionId: _buildSessionId(
-        chatId: chatId,
-        localPublicKeyBase64: localPublicKeyB64,
-        peerPublicKeyBase64: peerPublicKeyB64,
-      ),
-      localPublicKeyBase64: localPublicKeyB64,
-      peerPublicKeyBase64: peerPublicKeyB64,
-      localKeyPair: localKeyPair,
-      peerPublicKey: peerPublicKey,
-      sessionVersion: 1,
-      algorithm: _algorithm,
-    );
-
-    _sessionCache[sessionCacheKey] = session;
-    await _persistSessionSnapshot(session);
-    return session;
-  }
-
-  Future<Map<String, dynamic>> encryptTextEnvelope({
-    required String receiverId,
-    required String plaintext,
-    String? clientMessageId,
-  }) async {
-    try {
-      // FIRE AND FORGET: Do not await network round-trip on every message send!
-      unawaited(_keyManagementService.ensureDeviceIdentity(
-        userId: currentUserId,
-        forceRepublish: false,
-      ));
-      final envelope = await _signalRepository.encryptTextEnvelope(
-        receiverId: receiverId,
-        plaintext: plaintext,
-        clientMessageId: clientMessageId,
-      );
-      // PERF: Disabling automatic backup on every message send. This is a
-      // major performance bottleneck. Backups should be periodic or user-initiated.
-      // unawaited(syncAutomaticAccountBackupIfAvailable());
-      return envelope;
-    } catch (error) {
-      debugPrint('[E2eeService] Signal text encrypt fallback: $error');
-    }
-
-    final envelope = await _encryptTextEnvelopeLegacy(
-      receiverId: receiverId,
-      plaintext: plaintext,
-    );
-    // PERF: Disabling automatic backup on every message send.
-    // unawaited(syncAutomaticAccountBackupIfAvailable());
-    return envelope;
-  }
-
-  Future<Map<String, dynamic>> encryptBinaryEnvelope({
-    required String receiverId,
-    required List<int> bytes,
-  }) async {
-    try {
-      // FIRE AND FORGET: Do not await network round-trip on every upload!
-      unawaited(_keyManagementService.ensureDeviceIdentity(
-        userId: currentUserId,
-        forceRepublish: false,
-      ));
-      final envelope = await _signalRepository.encryptBinaryEnvelope(
-        receiverId: receiverId,
-        bytes: bytes,
-      );
-      // PERF: Disabling automatic backup on every message send. This is a
-      // major performance bottleneck. Backups should be periodic or user-initiated.
-      // unawaited(syncAutomaticAccountBackupIfAvailable());
-      return envelope;
-    } catch (error) {
-      debugPrint('[E2eeService] Signal media encrypt fallback: $error');
-    }
-
-    final envelope = await _encryptBinaryEnvelopeLegacy(
-      receiverId: receiverId,
-      bytes: bytes,
-    );
-    // PERF: Disabling automatic backup on every message send.
-    // unawaited(syncAutomaticAccountBackupIfAvailable());
-    return envelope;
-  }
-
-  Future<Map<String, dynamic>> _encryptTextEnvelopeLegacy({
-    required String receiverId,
-    required String plaintext,
-  }) async {
-    await ensureIdentityForCurrentUser(syncRemote: true);
-    final session = await ensureSessionForPeer(peerId: receiverId);
-    final conversationKey = await _deriveConversationKey(
-      keyPair: session.localKeyPair,
-      peerPublicKey: session.peerPublicKey,
-      otherUserId: receiverId,
-    );
-    final nonce = _randomBytes(12);
-    final secretBox = await _cipher.encrypt(
-      utf8.encode(plaintext),
-      secretKey: conversationKey,
-      nonce: nonce,
-    );
-
-    return {
-      ...EncryptedTextPayload(
-        cipherText: base64Encode(secretBox.cipherText),
-        nonce: base64Encode(secretBox.nonce),
-        mac: base64Encode(secretBox.mac.bytes),
-        version: session.sessionVersion,
-        algorithm: session.algorithm,
-      ).toMap(),
-      ...session.toMetadataMap(),
-    };
-  }
-
-  Future<Map<String, dynamic>> _encryptBinaryEnvelopeLegacy({
-    required String receiverId,
-    required List<int> bytes,
-  }) async {
-    await ensureIdentityForCurrentUser(syncRemote: true);
-    final session = await ensureSessionForPeer(peerId: receiverId);
-    final conversationKey = await _deriveConversationKey(
-      keyPair: session.localKeyPair,
-      peerPublicKey: session.peerPublicKey,
-      otherUserId: receiverId,
-    );
-    final nonce = _randomBytes(12);
-    final secretBox = await _cipher.encrypt(
-      bytes,
-      secretKey: conversationKey,
-      nonce: nonce,
-    );
-
-    return {
-      ...EncryptedBinaryPayload(
-        cipherBytes: Uint8List.fromList(secretBox.cipherText),
-        nonce: base64Encode(secretBox.nonce),
-        mac: base64Encode(secretBox.mac.bytes),
-        version: session.sessionVersion,
-        algorithm: session.algorithm,
-      ).toMap(),
-      ...session.toMetadataMap(),
-      'cipherBytes': Uint8List.fromList(secretBox.cipherText),
-    };
-  }
-
   Future<String> getCurrentUserPublicKeyBase64() async {
     await ensureIdentityForCurrentUser();
     final keyPair = await _readCurrentUserKeyPair();
-    return base64Encode(keyPair.publicKey.bytes);
+    return keyPair.publicKeyPem;
   }
 
   Future<String?> getUserPublicKeyBase64(
@@ -404,7 +84,15 @@ class E2eeService {
   }) async {
     final publicKey = await _readUserPublicKey(uid, forceRefresh: forceRefresh);
     if (publicKey == null) return null;
-    return base64Encode(publicKey.bytes);
+
+    // Ensure it's actually an RSA PEM key. If not, it's a legacy account.
+    if (!publicKey.contains('PUBLIC KEY')) {
+      if (!forceRefresh) {
+        return getUserPublicKeyBase64(uid, forceRefresh: true);
+      }
+      return null;
+    }
+    return publicKey;
   }
 
   Future<String> setupZeroKnowledgePin({
@@ -609,32 +297,23 @@ class E2eeService {
       throw Exception('No logged-in user found.');
     }
 
-    final privateKeyB64 =
-        await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-    final publicKeyB64 =
-        await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+    final privateKeyPEM =
+        await _secureStorage.read(key: 'hybrid_rsa_private_key');
+    final publicKeyPEM =
+        await _secureStorage.read(key: 'hybrid_rsa_public_key');
 
-    if (privateKeyB64 == null ||
-        privateKeyB64.isEmpty ||
-        publicKeyB64 == null ||
-        publicKeyB64.isEmpty) {
+    if (privateKeyPEM == null ||
+        privateKeyPEM.isEmpty ||
+        publicKeyPEM == null ||
+        publicKeyPEM.isEmpty) {
       throw Exception('Encrypted identity is not ready yet.');
-    }
-
-    Map<String, dynamic>? signalBackup;
-    try {
-      await _keyManagementService.ensureDeviceIdentity(userId: uid);
-      signalBackup = await _keyManagementService.exportSignalBackupPayload();
-    } catch (error) {
-      debugPrint('[E2eeService] Signal backup export skipped: $error');
     }
 
     final payloadJson = jsonEncode({
       'version': _recoveryVersion,
       'algorithm': _algorithm,
-      'privateKey': privateKeyB64,
-      'publicKey': publicKeyB64,
-      'signalBackup': signalBackup,
+      'privateKey': privateKeyPEM,
+      'publicKey': publicKeyPEM,
       'savedAt': DateTime.now().toUtc().toIso8601String(),
     });
 
@@ -736,9 +415,8 @@ class E2eeService {
       mac: Mac(base64Decode(macB64)),
     );
 
-    late final String privateKeyB64;
-    late final String publicKeyB64;
-    Map<String, dynamic>? signalBackup;
+    late final String privateKeyPEM;
+    late final String publicKeyPEM;
     try {
       final clearBytes = await _cipher.decrypt(
         secretBox,
@@ -746,59 +424,33 @@ class E2eeService {
       );
       final payload =
           jsonDecode(utf8.decode(clearBytes)) as Map<String, dynamic>;
-      privateKeyB64 = payload['privateKey']?.toString() ?? '';
-      publicKeyB64 = payload['publicKey']?.toString() ?? '';
-      final rawSignalBackup = payload['signalBackup'];
-      if (rawSignalBackup is Map<String, dynamic>) {
-        signalBackup = rawSignalBackup;
-      } else if (rawSignalBackup is Map) {
-        signalBackup = rawSignalBackup.map(
-          (key, value) => MapEntry(key.toString(), value),
-        );
-      }
+      privateKeyPEM = payload['privateKey']?.toString() ?? '';
+      publicKeyPEM = payload['publicKey']?.toString() ?? '';
     } catch (_) {
       throw Exception('Recovery key is incorrect.');
     }
 
-    if (privateKeyB64.isEmpty || publicKeyB64.isEmpty) {
-      throw Exception('Recovery backup is incomplete.');
+    if (privateKeyPEM.isEmpty || publicKeyPEM.isEmpty) {
+      throw Exception('Recovery key backup is corrupt.');
     }
-
-    final existingRemotePublicKey =
-        data['e2eePublicKey']?.toString().trim() ?? '';
-    final previousPublicKeys =
-        (data['e2eePreviousPublicKeys'] as List<dynamic>? ?? const <dynamic>[])
-            .map((entry) => entry.toString())
-            .where((value) => value.trim().isNotEmpty)
-            .toSet();
 
     await _rememberCurrentLocalIdentity(
       uid: uid,
-      replacingWithPublicKeyB64: publicKeyB64,
-    );
-
-    await _secureStorage.write(
-      key: '$_privateKeyPrefix$uid',
-      value: privateKeyB64,
+      replacingWithPublicKeyPEM: publicKeyPEM,
     );
     await _secureStorage.write(
-      key: '$_publicKeyPrefix$uid',
-      value: publicKeyB64,
+      key: 'hybrid_rsa_private_key',
+      value: privateKeyPEM,
     );
-
+    await _secureStorage.write(
+      key: 'hybrid_rsa_public_key',
+      value: publicKeyPEM,
+    );
     await _firestore.collection('users').doc(uid).set({
       'e2eeEnabled': true,
       'e2eeVersion': 1,
       'e2eeAlgorithm': _algorithm,
-      'e2eePublicKey': publicKeyB64,
-      'e2eePreviousPublicKeys': [
-        ...{
-          ...previousPublicKeys,
-          if (existingRemotePublicKey.isNotEmpty &&
-              existingRemotePublicKey != publicKeyB64)
-            existingRemotePublicKey,
-        },
-      ],
+      'e2eePublicKey': publicKeyPEM,
       'e2eeRecoveryRestoredAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
 
@@ -812,23 +464,6 @@ class E2eeService {
     _remoteIdentitySyncFuture = null;
     _publicKeyCache.clear();
     _publicKeyFutureCache.clear();
-    _previousPublicKeysCache.clear();
-    _previousPublicKeysFutureCache.clear();
-    _conversationKeyCache.clear();
-    _decryptedTextCache.clear();
-    _sessionCache.clear();
-    _cachedLocalKeyHistory = null;
-    _cachedLocalKeyHistoryUserId = null;
-    _peerRepairFutureCache.clear();
-    _peerRepairTimestamps.clear();
-
-    if (signalBackup != null) {
-      try {
-        await _keyManagementService.restoreSignalBackupPayload(signalBackup);
-      } catch (error) {
-        debugPrint('[E2eeService] Signal backup restore skipped: $error');
-      }
-    }
 
     await ensureIdentityForCurrentUser();
 
@@ -973,9 +608,8 @@ class E2eeService {
   /// identity can be generated without the corrupted data blocking startup.
   Future<void> _deleteAllSecureStorageKeysForUser(String uid) async {
     final keys = [
-      '$_privateKeyPrefix$uid',
-      '$_publicKeyPrefix$uid',
-      '$_localKeyHistoryPrefix$uid',
+      'hybrid_rsa_private_key',
+      'hybrid_rsa_public_key',
       '$_accountBackupPassphrasePrefix$uid',
       '$_bootstrappedMarkerPrefix$uid',
     ];
@@ -990,8 +624,6 @@ class E2eeService {
     _keyPairFuture = null;
     _ensuredUserId = null;
     _ensureIdentityFuture = null;
-    _cachedLocalKeyHistory = null;
-    _cachedLocalKeyHistoryUserId = null;
     debugPrint('[E2eeService] Wiped corrupted Keystore entries for $uid');
   }
 
@@ -1125,13 +757,6 @@ class E2eeService {
     final hasLocalIdentity = await _hasLocalIdentity(uid);
     final hasRemoteBackup = await _hasRemoteRecoveryBackup(uid);
     if (!hasLocalIdentity && hasRemoteBackup) {
-      final hasActiveDeviceDocs =
-          await _keyManagementService.hasActiveDeviceDocuments(uid);
-      if (hasActiveDeviceDocs) {
-        await ensureIdentityForCurrentUser(forceRepublish: true);
-        await syncAutomaticAccountBackupIfAvailable();
-        return true;
-      }
       try {
         await restoreIdentityFromRecoveryKey(passphrase: passphrase);
         await syncAutomaticAccountBackupIfAvailable();
@@ -1155,8 +780,12 @@ class E2eeService {
       return;
     }
 
-    final passphrase = await _secureStorage.read(
+    String? passphrase = await _secureStorage.read(
       key: '$_accountBackupPassphrasePrefix$uid',
+    );
+    // PIN-based backup stores a derived passphrase under the ZK prefix.
+    passphrase ??= await _secureStorage.read(
+      key: '$_zeroKnowledgePassphrasePrefix$uid',
     );
     if (passphrase == null || passphrase.isEmpty) {
       return;
@@ -1196,9 +825,7 @@ class E2eeService {
     await _secureStorage.delete(key: '$_bootstrappedMarkerPrefix$uid');
   }
 
-  Future<void> deactivateCurrentDevice([String? userId]) async {
-    await _keyManagementService.deactivateCurrentDevice(userId: userId);
-  }
+  Future<void> deactivateCurrentDevice([String? userId]) async {}
 
   Future<void> ensureReady({
     bool syncRemote = true,
@@ -1223,127 +850,170 @@ class E2eeService {
         value: 'true',
       );
     }
+
+    // Background: hydrate + keep chat cache up-to-date even if the user
+    // doesn’t open each conversation. This is how a fresh device ends up with
+    // locally cached plaintext after restoring message_backups.
+    _startOnlineChatHydration(uid);
+    unawaited(_hydrateRecentOnlineChatsOnce(uid));
   }
 
-  bool isEncryptedTextMessage(Map<String, dynamic> data) {
-    return data['type'] == 'text' &&
-        data['e2ee'] == true &&
-        (data['cipherText']?.toString().isNotEmpty ?? false);
-  }
+  void _startOnlineChatHydration(String uid) {
+    final trimmedUid = uid.trim();
+    if (trimmedUid.isEmpty) return;
 
-  Future<void> seedDecryptedTextCache({
-    required String senderId,
-    required String receiverId,
-    required String plaintext,
-    String? nonce,
-    String? mac,
-    String? cacheKey,
-    String? clientMessageId,
-  }) async {
-    final trimmedText = plaintext.trim();
-    if (senderId.trim().isEmpty ||
-        receiverId.trim().isEmpty ||
-        trimmedText.isEmpty) {
+    if (_onlineChatHydrationSubscription != null &&
+        _onlineChatHydrationUserId == trimmedUid) {
       return;
     }
 
-    final explicitCacheKey = cacheKey?.trim() ?? '';
-    if (explicitCacheKey.isNotEmpty) {
-      _decryptedTextCache[explicitCacheKey] = plaintext;
-      final userId = currentUserId;
-      if (userId.isNotEmpty) {
-        final conversationId = _chatId(senderId.trim(), receiverId.trim());
-        await _signalRepository.seedPlaintextCache(
-          cacheKey: explicitCacheKey,
-          conversationId: conversationId,
-          messageId: null,
-          clientMessageId: clientMessageId,
-          senderId: senderId.trim(),
-          receiverId: receiverId.trim(),
-          plaintext: plaintext,
-          messageType: 'text',
-        );
+    unawaited(_onlineChatHydrationSubscription?.cancel());
+    _onlineChatHydrationSubscription = null;
+    _onlineChatHydrationUserId = trimmedUid;
+    _onlineChatSeenLatestMessageKeys.clear();
+
+    // Listen to chat summaries. When a new lastMessage appears, decrypt it
+    // via ChatEncryptionRepository.refreshConversationPreview(), which also
+    // persists the message projection + plaintext to local cache.
+    _onlineChatHydrationSubscription = _firestore
+        .collection('chats')
+        .where('participants', arrayContains: trimmedUid)
+        .snapshots()
+        .listen((snapshot) {
+      final changes = snapshot.docChanges.isNotEmpty
+          ? snapshot.docChanges
+              .where((change) => change.type != DocumentChangeType.removed)
+              .map((change) => change.doc)
+              .toList(growable: false)
+          : snapshot.docs;
+
+      for (final doc in changes) {
+        final chatId = doc.id.trim();
+        if (chatId.isEmpty) continue;
+        final data = doc.data() ?? const <String, dynamic>{};
+        final lastMessageId =
+            data['lastMessageClientMessageId']?.toString().trim() ?? '';
+        if (lastMessageId.isEmpty) continue;
+
+        // Dedupe: chatId + message id is enough to know if we’ve already
+        // hydrated this message on this run.
+        final hydrateKey = '$chatId|$lastMessageId';
+        if (_onlineChatSeenLatestMessageKeys.contains(hydrateKey)) {
+          continue;
+        }
+        _onlineChatSeenLatestMessageKeys.add(hydrateKey);
+        if (_onlineChatSeenLatestMessageKeys.length > 800) {
+          // Prevent unbounded growth on long sessions.
+          _onlineChatSeenLatestMessageKeys.clear();
+        }
+
+        unawaited(() async {
+          try {
+            await _chatEncryptionRepository.refreshConversationPreview(
+              conversationId: chatId,
+              chatData: data,
+            );
+            // After cache is updated, push an incremental encrypted backup
+            // (no-op if the user hasn’t enabled backup PIN on this device).
+            await syncAutomaticAccountBackupIfAvailable();
+          } catch (e) {
+            debugPrint('[E2eeService] Chat hydration skipped: $e');
+          }
+        }());
       }
-      return;
+    }, onError: (Object e) {
+      debugPrint('[E2eeService] Chat hydration listener failed: $e');
+    });
+  }
+
+  Future<void> _hydrateRecentOnlineChatsOnce(String uid) async {
+    final trimmedUid = uid.trim();
+    if (trimmedUid.isEmpty) return;
+
+    if (_onlineChatInitialHydrationFuture != null &&
+        _onlineChatInitialHydrationUserId == trimmedUid) {
+      return _onlineChatInitialHydrationFuture!;
     }
 
-    final trimmedNonce = nonce?.trim() ?? '';
-    final trimmedMac = mac?.trim() ?? '';
-    if (trimmedNonce.isEmpty || trimmedMac.isEmpty) {
-      return;
-    }
-
-    final legacyCacheKey = [
-      senderId.trim(),
-      receiverId.trim(),
-      trimmedNonce,
-      trimmedMac,
-    ].join('|');
-    _decryptedTextCache[legacyCacheKey] = plaintext;
-    final userId = currentUserId;
-    if (userId.isNotEmpty) {
-      final conversationId = _chatId(senderId.trim(), receiverId.trim());
-      await _signalRepository.seedPlaintextCache(
-        cacheKey: legacyCacheKey,
-        conversationId: conversationId,
-        messageId: null,
-        clientMessageId: clientMessageId,
-        senderId: senderId.trim(),
-        receiverId: receiverId.trim(),
-        plaintext: plaintext,
-        messageType: 'text',
-      );
+    final future = _hydrateRecentOnlineChats(uid: trimmedUid);
+    _onlineChatInitialHydrationFuture = future;
+    _onlineChatInitialHydrationUserId = trimmedUid;
+    try {
+      return await future;
+    } finally {
+      if (identical(_onlineChatInitialHydrationFuture, future)) {
+        _onlineChatInitialHydrationFuture = null;
+        _onlineChatInitialHydrationUserId = null;
+      }
     }
   }
 
-  Future<void> finalizeOutgoingTextProjection({
-    required String senderId,
-    required String receiverId,
-    required String messageId,
-    required String plaintext,
-    String? clientMessageId,
-    String? cacheKey,
-    String? nonce,
-    String? mac,
-    String messageType = 'text',
-    int? timestampMs,
-    String? algorithm,
+  Future<void> _hydrateRecentOnlineChats({
+    required String uid,
+    int perChatLimit = 40,
   }) async {
-    final trimmedText = plaintext.trim();
-    if (senderId.trim().isEmpty ||
-        receiverId.trim().isEmpty ||
-        messageId.trim().isEmpty ||
-        trimmedText.isEmpty) {
-      return;
-    }
+    try {
+      final chatsSnapshot = await _firestore
+          .collection('chats')
+          .where('participants', arrayContains: uid)
+          .get();
 
-    final explicitCacheKey = cacheKey?.trim() ?? '';
-    if (explicitCacheKey.isNotEmpty) {
-      await _signalRepository.finalizeOutgoingTextProjection(
-        conversationId: _chatId(senderId.trim(), receiverId.trim()),
-        messageId: messageId.trim(),
-        clientMessageId: clientMessageId,
-        cacheKey: explicitCacheKey,
-        senderId: senderId.trim(),
-        receiverId: receiverId.trim(),
-        plaintext: trimmedText,
-        messageType: messageType,
-        timestampMs: timestampMs,
-        algorithm: algorithm?.trim().isNotEmpty == true
-            ? algorithm!.trim()
-            : ChatEncryptionRepository.signalAlgorithm,
-      );
-      return;
-    }
+      for (final chatDoc in chatsSnapshot.docs) {
+        try {
+          final chatId = chatDoc.id.trim();
+          final chatData = chatDoc.data();
+          final rawParticipants = chatData['participants'];
+          final participants = (rawParticipants is Iterable)
+              ? rawParticipants
+                  .map((value) => value?.toString().trim() ?? '')
+                  .where((value) => value.isNotEmpty)
+                  .toList(growable: false)
+              : const <String>[];
+          final otherUserId = participants.firstWhere(
+            (id) => id != uid,
+            orElse: () => '',
+          );
+          if (otherUserId.isEmpty) {
+            continue;
+          }
 
-    await seedDecryptedTextCache(
-      senderId: senderId,
-      receiverId: receiverId,
-      plaintext: plaintext,
-      nonce: nonce,
-      mac: mac,
-      clientMessageId: clientMessageId,
-    );
+          QuerySnapshot<Map<String, dynamic>> messageSnapshot;
+          try {
+            messageSnapshot = await _firestore
+                .collection('chats')
+                .doc(chatId)
+                .collection('messages')
+                .orderBy('timestamp', descending: true)
+                .limit(perChatLimit)
+                .get();
+          } catch (_) {
+            // Fallback: for legacy messages that might not have 'timestamp'.
+            messageSnapshot = await _firestore
+                .collection('chats')
+                .doc(chatId)
+                .collection('messages')
+                .limit(perChatLimit)
+                .get();
+          }
+          if (messageSnapshot.docs.isEmpty) {
+            continue;
+          }
+
+          await _chatEncryptionRepository.syncConversationSnapshot(
+            otherUserId: otherUserId,
+            docs: messageSnapshot.docs,
+          );
+        } catch (e) {
+          debugPrint('[E2eeService] Chat hydration skipped for one chat: $e');
+        }
+      }
+
+      // After initial hydration, attempt to push an incremental backup (safe no-op
+      // when backup PIN isn’t available).
+      await syncAutomaticAccountBackupIfAvailable();
+    } catch (e) {
+      debugPrint('[E2eeService] Initial chat hydration skipped: $e');
+    }
   }
 
   Future<String> createPendingOutgoingMessageProjection({
@@ -1351,7 +1021,7 @@ class E2eeService {
     required String receiverId,
     required String plaintext,
   }) {
-    return _signalRepository.createPendingOutgoingMessageProjection(
+    return _chatEncryptionRepository.createPendingOutgoingMessageProjection(
       conversationId: conversationId,
       receiverId: receiverId,
       plaintext: plaintext,
@@ -1364,7 +1034,7 @@ class E2eeService {
     required String conversationId,
     required String reason,
   }) {
-    return _signalRepository.failOutgoingMessageProjection(
+    return _chatEncryptionRepository.failOutgoingMessageProjection(
       clientMessageId: clientMessageId,
       conversationId: conversationId,
       reason: reason,
@@ -1385,7 +1055,7 @@ class E2eeService {
       return;
     }
 
-    await _signalRepository.cacheOutgoingMediaBytes(
+    await _chatEncryptionRepository.cacheOutgoingMediaBytes(
       conversationId: _chatId(senderId.trim(), receiverId.trim()),
       messageId: messageId,
       clientMessageId: clientMessageId,
@@ -1412,7 +1082,7 @@ class E2eeService {
       return;
     }
 
-    await _signalRepository.cacheIncomingMediaBytes(
+    await _chatEncryptionRepository.cacheIncomingMediaBytes(
       conversationId: _chatId(senderId.trim(), receiverId.trim()),
       messageId: messageId,
       clientMessageId: clientMessageId,
@@ -1431,7 +1101,7 @@ class E2eeService {
     String? messageId,
     String? fileName,
   }) async {
-    return _signalRepository.getCachedMediaBytes(
+    return _chatEncryptionRepository.getCachedMediaBytes(
       cacheKey: cacheKey,
       clientMessageId: clientMessageId,
       messageId: messageId,
@@ -1440,37 +1110,14 @@ class E2eeService {
   }
 
   String? getSeededDecryptedText(Map<String, dynamic> data) {
-    final signalCacheKey = data['e2eeCacheKey']?.toString().trim() ?? '';
-    if (signalCacheKey.isNotEmpty) {
-      final signalCached =
-          _signalRepository.peekCachedPlaintext(signalCacheKey);
-      if (signalCached != null && signalCached.trim().isNotEmpty) {
-        return signalCached;
-      }
-      final legacySignalCached = _decryptedTextCache[signalCacheKey];
-      if (legacySignalCached != null && legacySignalCached.trim().isNotEmpty) {
-        return legacySignalCached;
+    final cacheKey = data['e2eeCacheKey']?.toString().trim() ?? '';
+    if (cacheKey.isNotEmpty) {
+      final cached = _chatEncryptionRepository.peekCachedPlaintext(cacheKey);
+      if (cached != null && cached.trim().isNotEmpty) {
+        return cached;
       }
     }
-
-    final senderId = data['senderId']?.toString().trim() ?? '';
-    final receiverId = data['receiverId']?.toString().trim() ?? '';
-    final nonce = data['e2eeNonce']?.toString().trim() ?? '';
-    final mac = data['e2eeMac']?.toString().trim() ?? '';
-    if (senderId.isEmpty ||
-        receiverId.isEmpty ||
-        nonce.isEmpty ||
-        mac.isEmpty) {
-      return null;
-    }
-
-    final cacheKey = [
-      senderId,
-      receiverId,
-      nonce,
-      mac,
-    ].join('|');
-    return _decryptedTextCache[cacheKey];
+    return null;
   }
 
   bool isUnavailablePlaceholder(String text) {
@@ -1484,28 +1131,6 @@ class E2eeService {
   }) async {
     final uid = currentUserId;
     if (uid.isEmpty) return;
-    try {
-      await _keyManagementService.ensureDeviceIdentity(
-        userId: uid,
-        forceRepublish: forceRepublish,
-      );
-    } catch (error) {
-      debugPrint(
-          '[E2eeService] Signal identity bootstrap failed: $error — scheduling retry in 10s');
-      // Schedule a single retry so a transient Firestore/network error at
-      // startup doesn't permanently prevent the user's bundle from being
-      // published (which would block peers from messaging them).
-      Future<void>.delayed(const Duration(seconds: 10)).then((_) async {
-        if (currentUserId == uid) {
-          try {
-            await _keyManagementService.ensureDeviceIdentity(userId: uid);
-          } catch (retryError) {
-            debugPrint(
-                '[E2eeService] Signal identity retry also failed: $retryError');
-          }
-        }
-      });
-    }
     await _ensureLocalIdentityForCurrentUser(uid);
     if (!syncRemote) {
       return;
@@ -1530,42 +1155,14 @@ class E2eeService {
     }
 
     final future = () async {
-      final privateStorageKey = '$_privateKeyPrefix$uid';
-      final publicStorageKey = '$_publicKeyPrefix$uid';
+      // Delegate all key generation and storage to the centralized SecurityService
+      await SecurityService().ensureKeysUploaded();
 
-      var privateKeyB64 = await _secureStorage.read(key: privateStorageKey);
-      var publicKeyB64 = await _secureStorage.read(key: publicStorageKey);
+      final publicKeyPEM =
+          await _secureStorage.read(key: 'hybrid_rsa_public_key') ?? '';
 
-      if (privateKeyB64 == null ||
-          privateKeyB64.isEmpty ||
-          publicKeyB64 == null ||
-          publicKeyB64.isEmpty) {
-        final keyPair = await _keyExchange.newKeyPair();
-        final simpleKeyPair = await keyPair.extract();
-
-        privateKeyB64 = base64Encode(simpleKeyPair.bytes);
-        publicKeyB64 = base64Encode(simpleKeyPair.publicKey.bytes);
-
-        await _secureStorage.write(
-          key: privateStorageKey,
-          value: privateKeyB64,
-        );
-        await _secureStorage.write(
-          key: publicStorageKey,
-          value: publicKeyB64,
-        );
-      }
-
-      _cachedCurrentUserKeyPair = SimpleKeyPairData(
-        base64Decode(privateKeyB64),
-        type: KeyPairType.x25519,
-        publicKey: SimplePublicKey(
-          base64Decode(publicKeyB64),
-          type: KeyPairType.x25519,
-        ),
-      );
       _cachedKeyPairUserId = uid;
-      _publicKeyCache[uid] = _cachedCurrentUserKeyPair!.publicKey;
+      _publicKeyCache[uid] = publicKeyPEM;
       _ensuredUserId = uid;
     }();
 
@@ -1584,20 +1181,20 @@ class E2eeService {
     required bool forceRepublish,
   }) async {
     final keyPair = await _readCurrentUserKeyPair();
-    final publicKeyB64 = base64Encode(keyPair.publicKey.bytes);
+    final publicKeyPEM = keyPair.publicKeyPem;
 
     final inFlight = _remoteIdentitySyncFuture;
     if (inFlight != null) {
       await inFlight;
       if (_syncedRemoteIdentityUserId == uid &&
-          _syncedRemoteIdentityPublicKey == publicKeyB64 &&
+          _syncedRemoteIdentityPublicKey == publicKeyPEM &&
           !forceRepublish) {
         return;
       }
     }
 
     if (_syncedRemoteIdentityUserId == uid &&
-        _syncedRemoteIdentityPublicKey == publicKeyB64 &&
+        _syncedRemoteIdentityPublicKey == publicKeyPEM &&
         !forceRepublish) {
       return;
     }
@@ -1607,26 +1204,19 @@ class E2eeService {
       final data = userDoc.data() ?? const <String, dynamic>{};
       final existingRemotePublicKey =
           data['e2eePublicKey']?.toString().trim() ?? '';
-      final previousPublicKeys =
-          (data['e2eePreviousPublicKeys'] as List<dynamic>? ??
-                  const <dynamic>[])
-              .map((entry) => entry.toString())
-              .where((value) => value.trim().isNotEmpty)
-              .toList();
-      final alreadyPublished = existingRemotePublicKey == publicKeyB64 &&
+      final alreadyPublished = existingRemotePublicKey == publicKeyPEM &&
           data['e2eeEnabled'] == true;
 
       if (forceRepublish || !alreadyPublished) {
         await _publishIdentityDocument(
           uid: uid,
-          publicKeyB64: publicKeyB64,
-          existingRemotePublicKey: existingRemotePublicKey,
-          previousPublicKeys: previousPublicKeys,
+          publicKeyPEM: publicKeyPEM,
         );
+        await SecurityService().ensureKeysUploaded();
       }
 
       _syncedRemoteIdentityUserId = uid;
-      _syncedRemoteIdentityPublicKey = publicKeyB64;
+      _syncedRemoteIdentityPublicKey = publicKeyPEM;
     }();
 
     _remoteIdentitySyncFuture = future;
@@ -1641,569 +1231,18 @@ class E2eeService {
 
   Future<void> _publishIdentityDocument({
     required String uid,
-    required String publicKeyB64,
-    required String existingRemotePublicKey,
-    required Iterable<String> previousPublicKeys,
+    required String publicKeyPEM,
   }) async {
     await _firestore.collection('users').doc(uid).set({
       'e2eeEnabled': true,
       'e2eeVersion': 1,
       'e2eeAlgorithm': _algorithm,
-      'e2eePublicKey': publicKeyB64,
-      'e2eePreviousPublicKeys': [
-        ...{
-          ...previousPublicKeys,
-          if (existingRemotePublicKey.isNotEmpty &&
-              existingRemotePublicKey != publicKeyB64)
-            existingRemotePublicKey,
-        },
-      ],
+      'e2eePublicKey': publicKeyPEM,
       'e2eeUpdatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
 
-  Future<EncryptedTextPayload> encryptTextForPeer({
-    required String receiverId,
-    required String plaintext,
-  }) async {
-    final envelope = await encryptTextEnvelope(
-      receiverId: receiverId,
-      plaintext: plaintext,
-    );
-    return EncryptedTextPayload(
-      cipherText: envelope['cipherText']?.toString() ?? '',
-      nonce: envelope['e2eeNonce']?.toString() ?? '',
-      mac: envelope['e2eeMac']?.toString() ?? '',
-      version: (envelope['e2eeVersion'] as num?)?.toInt() ?? 1,
-      algorithm: envelope['e2eeAlgorithm']?.toString() ?? _algorithm,
-    );
-  }
-
-  Future<EncryptedBinaryPayload> encryptBytesForPeer({
-    required String receiverId,
-    required List<int> bytes,
-  }) async {
-    final envelope = await encryptBinaryEnvelope(
-      receiverId: receiverId,
-      bytes: bytes,
-    );
-    return EncryptedBinaryPayload(
-      cipherBytes: envelope['cipherBytes'] as Uint8List? ?? Uint8List(0),
-      nonce: envelope['e2eeNonce']?.toString() ?? '',
-      mac: envelope['e2eeMac']?.toString() ?? '',
-      version: (envelope['e2eeVersion'] as num?)?.toInt() ?? 1,
-      algorithm: envelope['e2eeAlgorithm']?.toString() ?? _algorithm,
-    );
-  }
-
-  Future<String> decryptTextMessage(
-    Map<String, dynamic> data, {
-    bool allowRepair = false,
-  }) async {
-    final signalEnvelope = _signalRepository.isSignalEnvelope(data);
-    final legacyEnvelope = isEncryptedTextMessage(data) && !signalEnvelope;
-
-    if (signalEnvelope) {
-      try {
-        final plaintext = await _signalRepository.decryptTextMessage(
-          data,
-          allowRepair: allowRepair,
-        );
-        // PERF: Disabling automatic backup on every message decryption. This is a
-        // major performance bottleneck. Backups should be periodic or user-initiated.
-        // unawaited(syncAutomaticAccountBackupIfAvailable());
-        return plaintext;
-      } catch (error) {
-        debugPrint('[E2eeService] Signal text decrypt fallback: $error');
-        return '[Encrypted message unavailable]';
-      }
-    }
-
-    if (legacyEnvelope) {
-      return _decryptTextMessageLegacy(
-        data,
-        allowRepair: allowRepair,
-      );
-    }
-
-    final clearText = data['text']?.toString() ?? '';
-    final looksEncrypted = data['e2ee'] == true ||
-        (data['cipherText']?.toString().isNotEmpty ?? false);
-    if (looksEncrypted && clearText.trim().isEmpty) {
-      return '[Encrypted message unavailable]';
-    }
-    return clearText;
-  }
-
-  Future<String> _decryptTextMessageLegacy(
-    Map<String, dynamic> data, {
-    bool allowRepair = false,
-  }) async {
-    final legacyText = data['text']?.toString() ?? '';
-    if (!isEncryptedTextMessage(data)) {
-      return legacyText;
-    }
-
-    final uid = currentUserId;
-    if (uid.isEmpty) {
-      return '[Encrypted message unavailable]';
-    }
-
-    await ensureIdentityForCurrentUser(syncRemote: false);
-
-    final senderId = data['senderId']?.toString() ?? '';
-    final receiverId = data['receiverId']?.toString() ?? '';
-    final peerId = senderId == uid ? receiverId : senderId;
-    if (peerId.isEmpty) {
-      return legacyText.isNotEmpty
-          ? legacyText
-          : '[Encrypted message unavailable]';
-    }
-    final cacheKey = [
-      senderId,
-      receiverId,
-      data['e2eeNonce']?.toString() ?? '',
-      data['e2eeMac']?.toString() ?? '',
-    ].join('|');
-    final cachedText = _decryptedTextCache[cacheKey];
-    if (cachedText != null) return cachedText;
-
-    final clearText = await _tryDecryptTextWithCurrentCandidates(
-      data: data,
-      uid: uid,
-      senderId: senderId,
-      peerId: peerId,
-      cacheKey: cacheKey,
-    );
-    if (clearText != null) {
-      return clearText;
-    }
-
-    if (allowRepair && _shouldAttemptAutoRepair(data)) {
-      await _repairConversationStateForPeer(peerId);
-      final repairedText = await _tryDecryptTextWithCurrentCandidates(
-        data: data,
-        uid: uid,
-        senderId: senderId,
-        peerId: peerId,
-        cacheKey: cacheKey,
-        forceRefreshPeer: true,
-      );
-      if (repairedText != null) {
-        return repairedText;
-      }
-    }
-
-    return legacyText.isNotEmpty
-        ? legacyText
-        : '[Encrypted message from previous key unavailable]';
-  }
-
-  Future<void> prewarmConversation(String otherUserId) async {
-    if (otherUserId.trim().isEmpty) return;
-    try {
-      await _signalRepository.prewarmConversation(otherUserId);
-      return;
-    } catch (error) {
-      debugPrint('[E2eeService] Signal prewarm fallback: $error');
-    }
-
-    await ensureIdentityForCurrentUser(syncRemote: false);
-    final keyPair = await _readCurrentUserKeyPair();
-    final peerPublicKey = await _readUserPublicKey(otherUserId);
-    if (peerPublicKey == null) return;
-    await _deriveConversationKey(
-      keyPair: keyPair,
-      peerPublicKey: peerPublicKey,
-      otherUserId: otherUserId,
-    );
-  }
-
-  Future<String?> _tryDecryptTextWithCurrentCandidates({
-    required Map<String, dynamic> data,
-    required String uid,
-    required String senderId,
-    required String peerId,
-    required String cacheKey,
-    bool forceRefreshPeer = false,
-  }) async {
-    final localKeyPairs = await _resolveLocalKeyPairsForMessage(
-      data: data,
-      senderId: senderId,
-    );
-    final peerPublicKeys = await _resolvePeerPublicKeysForMessage(
-      data: data,
-      peerId: peerId,
-      senderId: senderId,
-      forceRefreshLive: forceRefreshPeer,
-    );
-    if (localKeyPairs.isEmpty ||
-        (peerPublicKeys.exact.isEmpty && peerPublicKeys.fallback.isEmpty)) {
-      return null;
-    }
-
-    final cipherText = base64Decode(data['cipherText'].toString());
-    final nonce = base64Decode(data['e2eeNonce'].toString());
-    final mac = base64Decode(data['e2eeMac'].toString());
-    final secretBox = SecretBox(
-      cipherText,
-      nonce: nonce,
-      mac: Mac(mac),
-    );
-    final chatId = _chatId(uid, peerId);
-
-    for (final peerGroup in <List<SimplePublicKey>>[
-      peerPublicKeys.exact,
-      peerPublicKeys.fallback,
-    ]) {
-      for (final localKeyPair in localKeyPairs) {
-        for (final peerPublicKey in peerGroup) {
-          final derivationKeys = _buildConversationDerivationKeys(
-            chatId: chatId,
-            localPublicKeyBase64: base64Encode(localKeyPair.publicKey.bytes),
-            peerPublicKeyBase64: base64Encode(peerPublicKey.bytes),
-          );
-          for (final derivationKey in derivationKeys) {
-            try {
-              final conversationKey = await _deriveConversationKey(
-                keyPair: localKeyPair,
-                peerPublicKey: peerPublicKey,
-                otherUserId: peerId,
-                derivationKeyOverride: derivationKey,
-              );
-
-              final clearBytes = await _cipher.decrypt(
-                secretBox,
-                secretKey: conversationKey,
-              );
-              final clearText = utf8.decode(clearBytes);
-              _decryptedTextCache[cacheKey] = clearText;
-              return clearText;
-            } catch (_) {
-              continue;
-            }
-          }
-        }
-      }
-    }
-
-    return null;
-  }
-
-  Future<Uint8List?> _tryDecryptBytesWithCurrentCandidates({
-    required Map<String, dynamic> data,
-    required String uid,
-    required String senderId,
-    required String peerId,
-    required List<int> cipherBytes,
-    bool forceRefreshPeer = false,
-  }) async {
-    final localKeyPairs = await _resolveLocalKeyPairsForMessage(
-      data: data,
-      senderId: senderId,
-    );
-    final peerPublicKeys = await _resolvePeerPublicKeysForMessage(
-      data: data,
-      peerId: peerId,
-      senderId: senderId,
-      forceRefreshLive: forceRefreshPeer,
-    );
-    if (localKeyPairs.isEmpty ||
-        (peerPublicKeys.exact.isEmpty && peerPublicKeys.fallback.isEmpty)) {
-      return null;
-    }
-
-    final nonce = base64Decode(data['e2eeNonce'].toString());
-    final mac = base64Decode(data['e2eeMac'].toString());
-    final secretBox = SecretBox(
-      cipherBytes,
-      nonce: nonce,
-      mac: Mac(mac),
-    );
-    final chatId = _chatId(uid, peerId);
-
-    for (final peerGroup in <List<SimplePublicKey>>[
-      peerPublicKeys.exact,
-      peerPublicKeys.fallback,
-    ]) {
-      for (final localKeyPair in localKeyPairs) {
-        for (final peerPublicKey in peerGroup) {
-          final derivationKeys = _buildConversationDerivationKeys(
-            chatId: chatId,
-            localPublicKeyBase64: base64Encode(localKeyPair.publicKey.bytes),
-            peerPublicKeyBase64: base64Encode(peerPublicKey.bytes),
-          );
-          for (final derivationKey in derivationKeys) {
-            try {
-              final conversationKey = await _deriveConversationKey(
-                keyPair: localKeyPair,
-                peerPublicKey: peerPublicKey,
-                otherUserId: peerId,
-                derivationKeyOverride: derivationKey,
-              );
-
-              final clearBytes = await _cipher.decrypt(
-                secretBox,
-                secretKey: conversationKey,
-              );
-              return Uint8List.fromList(clearBytes);
-            } catch (_) {
-              continue;
-            }
-          }
-        }
-      }
-    }
-
-    return null;
-  }
-
-  Future<void> _repairConversationStateForPeer(String peerId) async {
-    final trimmedPeerId = peerId.trim();
-    if (trimmedPeerId.isEmpty) return;
-
-    final uid = currentUserId;
-    if (uid.isEmpty) return;
-
-    final existing = _peerRepairFutureCache[trimmedPeerId];
-    if (existing != null) {
-      await existing;
-      return;
-    }
-
-    final lastRepair = _peerRepairTimestamps[trimmedPeerId];
-    if (lastRepair != null &&
-        DateTime.now().difference(lastRepair) < _repairCooldown) {
-      return;
-    }
-
-    final future = () async {
-      final chatId = _chatId(uid, trimmedPeerId);
-      _conversationKeyCache.removeWhere((key, _) => key.startsWith('$chatId|'));
-      _sessionCache.removeWhere(
-        (_, session) =>
-            session.chatId == chatId || session.peerId == trimmedPeerId,
-      );
-      _publicKeyCache.remove(trimmedPeerId);
-      _publicKeyFutureCache.remove(trimmedPeerId);
-      _previousPublicKeysCache.remove(trimmedPeerId);
-      _previousPublicKeysFutureCache.remove(trimmedPeerId);
-
-      await ensureIdentityForCurrentUser(syncRemote: false);
-      await _syncCurrentIdentityDocumentIfNeeded(
-        uid: uid,
-        forceRepublish: true,
-      );
-      await _readUserPublicKey(trimmedPeerId, forceRefresh: true);
-      await _readUserPreviousPublicKeys(trimmedPeerId, forceRefresh: true);
-      await prewarmConversation(trimmedPeerId);
-      _peerRepairTimestamps[trimmedPeerId] = DateTime.now();
-    }();
-
-    _peerRepairFutureCache[trimmedPeerId] = future;
-    try {
-      await future;
-    } finally {
-      _peerRepairFutureCache.remove(trimmedPeerId);
-    }
-  }
-
-  bool _shouldAttemptAutoRepair(Map<String, dynamic> data) {
-    final timestamp = _extractMessageTime(data['timestamp']);
-    if (timestamp == null) {
-      return false;
-    }
-
-    final now = DateTime.now();
-    final age = now.isAfter(timestamp)
-        ? now.difference(timestamp)
-        : timestamp.difference(now);
-    return age <= _autoRepairFreshWindow;
-  }
-
-  DateTime? _extractMessageTime(dynamic raw) {
-    if (raw is Timestamp) return raw.toDate();
-    if (raw is DateTime) return raw;
-    if (raw is String) return DateTime.tryParse(raw);
-    return null;
-  }
-
-  Future<List<SimpleKeyPairData>> _resolveLocalKeyPairsForMessage({
-    required Map<String, dynamic> data,
-    required String senderId,
-  }) async {
-    final currentKeyPair = await _readCurrentUserKeyPair();
-    final historyKeyPairs = await _readLocalKeyHistory();
-    final byPublicKey = <String, SimpleKeyPairData>{};
-
-    void addKeyPair(SimpleKeyPairData keyPair) {
-      final publicKeyB64 = base64Encode(keyPair.publicKey.bytes);
-      byPublicKey.putIfAbsent(publicKeyB64, () => keyPair);
-    }
-
-    addKeyPair(currentKeyPair);
-    for (final keyPair in historyKeyPairs) {
-      addKeyPair(keyPair);
-    }
-
-    final ordered = <SimpleKeyPairData>[];
-    final used = <String>{};
-
-    void addMatching(String? publicKeyB64) {
-      final trimmed = publicKeyB64?.trim() ?? '';
-      if (trimmed.isEmpty) return;
-      final keyPair = byPublicKey[trimmed];
-      if (keyPair == null || !used.add(trimmed)) return;
-      ordered.add(keyPair);
-    }
-
-    for (final exactLocalKey in _exactLocalPublicKeyCandidates(
-      data: data,
-      senderId: senderId,
-    )) {
-      addMatching(exactLocalKey);
-    }
-
-    addMatching(base64Encode(currentKeyPair.publicKey.bytes));
-
-    for (final entry in byPublicKey.entries) {
-      if (!used.add(entry.key)) continue;
-      ordered.add(entry.value);
-    }
-
-    return ordered;
-  }
-
-  Future<_PeerPublicKeyCandidates> _resolvePeerPublicKeysForMessage({
-    required Map<String, dynamic> data,
-    required String peerId,
-    required String senderId,
-    bool forceRefreshLive = false,
-  }) async {
-    final exact = <SimplePublicKey>[];
-    final fallback = <SimplePublicKey>[];
-    final seen = <String>{};
-
-    void addKeyBytes(List<SimplePublicKey> target, List<int>? bytes) {
-      if (bytes == null || bytes.isEmpty) return;
-      final encoded = base64Encode(bytes);
-      if (!seen.add(encoded)) return;
-      target.add(SimplePublicKey(bytes, type: KeyPairType.x25519));
-    }
-
-    void addKeyB64(List<SimplePublicKey> target, String? value) {
-      final trimmed = value?.trim() ?? '';
-      if (trimmed.isEmpty) return;
-      try {
-        addKeyBytes(target, base64Decode(trimmed));
-      } catch (_) {
-        return;
-      }
-    }
-
-    for (final exactPeerKey in _exactPeerPublicKeyCandidates(
-      data: data,
-      senderId: senderId,
-    )) {
-      addKeyB64(exact, exactPeerKey);
-    }
-
-    final liveKey = await _readUserPublicKey(
-      peerId,
-      forceRefresh: forceRefreshLive,
-    );
-    if (liveKey != null) {
-      addKeyBytes(fallback, liveKey.bytes);
-    }
-
-    final previousKeys = await _readUserPreviousPublicKeys(
-      peerId,
-      forceRefresh: forceRefreshLive,
-    );
-    for (final key in previousKeys) {
-      addKeyBytes(fallback, key.bytes);
-    }
-
-    return _PeerPublicKeyCandidates(exact: exact, fallback: fallback);
-  }
-
-  Future<Uint8List> decryptBytesMessage({
-    required Map<String, dynamic> data,
-    required List<int> cipherBytes,
-    bool allowRepair = false,
-  }) async {
-    if (_signalRepository.isSignalEnvelope(data)) {
-      try {
-        final clearBytes = await _signalRepository.decryptBytesMessage(
-          data: data,
-          cipherBytes: cipherBytes,
-          allowRepair: allowRepair,
-        );
-        // PERF: Disabling automatic backup on every message decryption. This is a
-        // major performance bottleneck. Backups should be periodic or user-initiated.
-        // unawaited(syncAutomaticAccountBackupIfAvailable());
-        return clearBytes;
-      } catch (error) {
-        debugPrint('[E2eeService] Signal media decrypt fallback: $error');
-      }
-    }
-
-    return _decryptBytesMessageLegacy(
-      data: data,
-      cipherBytes: cipherBytes,
-      allowRepair: allowRepair,
-    );
-  }
-
-  Future<Uint8List> _decryptBytesMessageLegacy({
-    required Map<String, dynamic> data,
-    required List<int> cipherBytes,
-    bool allowRepair = false,
-  }) async {
-    final uid = currentUserId;
-    if (uid.isEmpty) {
-      throw Exception('No logged-in user found.');
-    }
-
-    await ensureIdentityForCurrentUser(syncRemote: false);
-
-    final senderId = data['senderId']?.toString() ?? '';
-    final receiverId = data['receiverId']?.toString() ?? '';
-    final peerId = senderId == uid ? receiverId : senderId;
-    if (peerId.isEmpty) {
-      throw Exception('Encrypted media peer is missing.');
-    }
-
-    final clearBytes = await _tryDecryptBytesWithCurrentCandidates(
-      data: data,
-      uid: uid,
-      senderId: senderId,
-      peerId: peerId,
-      cipherBytes: cipherBytes,
-    );
-    if (clearBytes != null) {
-      return clearBytes;
-    }
-
-    if (allowRepair && _shouldAttemptAutoRepair(data)) {
-      await _repairConversationStateForPeer(peerId);
-      final repairedBytes = await _tryDecryptBytesWithCurrentCandidates(
-        data: data,
-        uid: uid,
-        senderId: senderId,
-        peerId: peerId,
-        cipherBytes: cipherBytes,
-        forceRefreshPeer: true,
-      );
-      if (repairedBytes != null) {
-        return repairedBytes;
-      }
-    }
-
-    throw Exception('Encrypted media key is unavailable.');
-  }
-
-  Future<SimpleKeyPairData> _readCurrentUserKeyPair() async {
+  Future<RSAKeyPairData> _readCurrentUserKeyPair() async {
     final uid = currentUserId;
     if (uid.isEmpty) {
       throw Exception('No logged-in user found.');
@@ -2217,28 +1256,24 @@ class E2eeService {
     }
 
     _keyPairFuture = () async {
-      final privateKeyB64 =
-          await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-      final publicKeyB64 =
-          await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+      final privateKeyPEM =
+          await _secureStorage.read(key: 'hybrid_rsa_private_key');
+      final publicKeyPEM =
+          await _secureStorage.read(key: 'hybrid_rsa_public_key');
 
-      if (privateKeyB64 == null ||
-          privateKeyB64.isEmpty ||
-          publicKeyB64 == null ||
-          publicKeyB64.isEmpty) {
+      if (privateKeyPEM == null ||
+          privateKeyPEM.isEmpty ||
+          publicKeyPEM == null ||
+          publicKeyPEM.isEmpty) {
         throw Exception('Encrypted identity is not ready.');
       }
 
-      _cachedCurrentUserKeyPair = SimpleKeyPairData(
-        base64Decode(privateKeyB64),
-        type: KeyPairType.x25519,
-        publicKey: SimplePublicKey(
-          base64Decode(publicKeyB64),
-          type: KeyPairType.x25519,
-        ),
+      _cachedCurrentUserKeyPair = RSAKeyPairData(
+        privateKeyPEM,
+        publicKeyPEM,
       );
       _cachedKeyPairUserId = uid;
-      _publicKeyCache[uid] = _cachedCurrentUserKeyPair!.publicKey;
+      _publicKeyCache[uid] = publicKeyPEM;
       return _cachedCurrentUserKeyPair!;
     }();
 
@@ -2247,407 +1282,6 @@ class E2eeService {
     } finally {
       _keyPairFuture = null;
     }
-  }
-
-  Future<void> _rememberCurrentLocalIdentity({
-    required String uid,
-    required String replacingWithPublicKeyB64,
-  }) async {
-    final currentPrivateKeyB64 =
-        await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-    final currentPublicKeyB64 =
-        await _secureStorage.read(key: '$_publicKeyPrefix$uid');
-    if (currentPrivateKeyB64 == null ||
-        currentPrivateKeyB64.isEmpty ||
-        currentPublicKeyB64 == null ||
-        currentPublicKeyB64.isEmpty ||
-        currentPublicKeyB64 == replacingWithPublicKeyB64) {
-      return;
-    }
-
-    await _appendLocalKeyHistory(
-      uid: uid,
-      privateKeyB64: currentPrivateKeyB64,
-      publicKeyB64: currentPublicKeyB64,
-    );
-  }
-
-  Future<void> _appendLocalKeyHistory({
-    required String uid,
-    required String privateKeyB64,
-    required String publicKeyB64,
-  }) async {
-    if (uid.isEmpty ||
-        privateKeyB64.trim().isEmpty ||
-        publicKeyB64.trim().isEmpty) {
-      return;
-    }
-
-    final storageKey = '$_localKeyHistoryPrefix$uid';
-    final raw = await _secureStorage.read(key: storageKey);
-    List<dynamic> decoded = const <dynamic>[];
-    if (raw != null && raw.trim().isNotEmpty) {
-      try {
-        decoded = jsonDecode(raw) as List<dynamic>;
-      } catch (_) {
-        decoded = const <dynamic>[];
-      }
-    }
-
-    final entries = <Map<String, String>>[
-      <String, String>{
-        'privateKey': privateKeyB64,
-        'publicKey': publicKeyB64,
-      },
-    ];
-
-    for (final entry in decoded) {
-      if (entry is! Map) continue;
-      final privateKey = entry['privateKey']?.toString() ?? '';
-      final publicKey = entry['publicKey']?.toString() ?? '';
-      if (privateKey.isEmpty ||
-          publicKey.isEmpty ||
-          publicKey == publicKeyB64) {
-        continue;
-      }
-      entries.add(<String, String>{
-        'privateKey': privateKey,
-        'publicKey': publicKey,
-      });
-      if (entries.length >= _maxStoredLocalKeyHistoryEntries) {
-        break;
-      }
-    }
-
-    await _secureStorage.write(
-      key: storageKey,
-      value: jsonEncode(entries),
-    );
-    _cachedLocalKeyHistoryUserId = uid;
-    _cachedLocalKeyHistory = null;
-  }
-
-  Future<List<SimpleKeyPairData>> _readLocalKeyHistory() async {
-    final uid = currentUserId;
-    if (uid.isEmpty) {
-      return const <SimpleKeyPairData>[];
-    }
-
-    if (_cachedLocalKeyHistoryUserId == uid && _cachedLocalKeyHistory != null) {
-      return _cachedLocalKeyHistory!;
-    }
-
-    final raw = await _secureStorage.read(key: '$_localKeyHistoryPrefix$uid');
-    if (raw == null || raw.trim().isEmpty) {
-      _cachedLocalKeyHistoryUserId = uid;
-      _cachedLocalKeyHistory = const <SimpleKeyPairData>[];
-      return const <SimpleKeyPairData>[];
-    }
-
-    try {
-      final decoded = jsonDecode(raw) as List<dynamic>;
-      final history = <SimpleKeyPairData>[];
-      for (final entry in decoded) {
-        if (entry is! Map) continue;
-        final privateKeyB64 = entry['privateKey']?.toString() ?? '';
-        final publicKeyB64 = entry['publicKey']?.toString() ?? '';
-        if (privateKeyB64.isEmpty || publicKeyB64.isEmpty) {
-          continue;
-        }
-        history.add(
-          SimpleKeyPairData(
-            base64Decode(privateKeyB64),
-            type: KeyPairType.x25519,
-            publicKey: SimplePublicKey(
-              base64Decode(publicKeyB64),
-              type: KeyPairType.x25519,
-            ),
-          ),
-        );
-      }
-      _cachedLocalKeyHistoryUserId = uid;
-      _cachedLocalKeyHistory = history;
-      return history;
-    } catch (_) {
-      _cachedLocalKeyHistoryUserId = uid;
-      _cachedLocalKeyHistory = const <SimpleKeyPairData>[];
-      return const <SimpleKeyPairData>[];
-    }
-  }
-
-  Future<List<SimplePublicKey>> _readUserPreviousPublicKeys(
-    String uid, {
-    bool forceRefresh = false,
-  }) async {
-    if (uid.isEmpty) {
-      return const <SimplePublicKey>[];
-    }
-
-    if (!forceRefresh) {
-      final cached = _previousPublicKeysCache[uid];
-      if (cached != null) {
-        return cached;
-      }
-      final inFlight = _previousPublicKeysFutureCache[uid];
-      if (inFlight != null) {
-        return inFlight;
-      }
-    } else {
-      _previousPublicKeysCache.remove(uid);
-      _previousPublicKeysFutureCache.remove(uid);
-    }
-
-    final future = () async {
-      final userDoc = await _firestore.collection('users').doc(uid).get();
-      final previousKeys =
-          (userDoc.data()?['e2eePreviousPublicKeys'] as List<dynamic>? ??
-                  const <dynamic>[])
-              .map((entry) => entry.toString())
-              .where((entry) => entry.trim().isNotEmpty)
-              .toList(growable: false);
-      final keys = <SimplePublicKey>[];
-      final seen = <String>{};
-      for (final key in previousKeys) {
-        try {
-          final bytes = base64Decode(key);
-          final encoded = base64Encode(bytes);
-          if (!seen.add(encoded)) {
-            continue;
-          }
-          keys.add(SimplePublicKey(bytes, type: KeyPairType.x25519));
-        } catch (_) {
-          continue;
-        }
-      }
-      _previousPublicKeysCache[uid] = keys;
-      return keys;
-    }();
-
-    _previousPublicKeysFutureCache[uid] = future;
-    try {
-      return await future;
-    } finally {
-      _previousPublicKeysFutureCache.remove(uid);
-    }
-  }
-
-  List<String> _exactLocalPublicKeyCandidates({
-    required Map<String, dynamic> data,
-    required String senderId,
-  }) {
-    final isSender = senderId == currentUserId;
-    return _orderedUniquePublicKeyStrings(<String?>[
-      if (isSender)
-        data['e2eeSessionLocalPublicKey']?.toString()
-      else
-        data['e2eeSessionPeerPublicKey']?.toString(),
-      if (isSender)
-        data['senderPublicKey']?.toString()
-      else
-        data['receiverPublicKey']?.toString(),
-    ]);
-  }
-
-  List<String> _exactPeerPublicKeyCandidates({
-    required Map<String, dynamic> data,
-    required String senderId,
-  }) {
-    final isSender = senderId == currentUserId;
-    return _orderedUniquePublicKeyStrings(<String?>[
-      if (isSender)
-        data['e2eeSessionPeerPublicKey']?.toString()
-      else
-        data['e2eeSessionLocalPublicKey']?.toString(),
-      if (isSender)
-        data['receiverPublicKey']?.toString()
-      else
-        data['senderPublicKey']?.toString(),
-    ]);
-  }
-
-  List<String> _orderedUniquePublicKeyStrings(List<String?> rawValues) {
-    final seen = <String>{};
-    final values = <String>[];
-    for (final raw in rawValues) {
-      final trimmed = raw?.trim() ?? '';
-      if (trimmed.isEmpty || !seen.add(trimmed)) {
-        continue;
-      }
-      values.add(trimmed);
-    }
-    return values;
-  }
-
-  Future<SimplePublicKey?> _readUserPublicKey(
-    String uid, {
-    bool forceRefresh = false,
-  }) async {
-    if (uid.isEmpty) return null;
-    final currentUid = currentUserId;
-    if (currentUid.isNotEmpty) {
-      _resetCachesIfUserChanged(currentUid);
-    }
-
-    if (!forceRefresh) {
-      final cached = _publicKeyCache[uid];
-      if (cached != null) return cached;
-      final inFlight = _publicKeyFutureCache[uid];
-      if (inFlight != null) return inFlight;
-    } else {
-      _publicKeyCache.remove(uid);
-      _publicKeyFutureCache.remove(uid);
-    }
-
-    if (uid == currentUserId) {
-      final localPublicB64 =
-          await _secureStorage.read(key: '$_publicKeyPrefix$uid');
-      if (localPublicB64 != null && localPublicB64.isNotEmpty) {
-        final localKey = SimplePublicKey(
-          base64Decode(localPublicB64),
-          type: KeyPairType.x25519,
-        );
-        _publicKeyCache[uid] = localKey;
-        return localKey;
-      }
-    }
-
-    final future = () async {
-      final userDoc = await _firestore.collection('users').doc(uid).get();
-      final publicKeyB64 = userDoc.data()?['e2eePublicKey']?.toString() ?? '';
-      if (publicKeyB64.isEmpty) return null;
-
-      final publicKey = SimplePublicKey(
-        base64Decode(publicKeyB64),
-        type: KeyPairType.x25519,
-      );
-      _publicKeyCache[uid] = publicKey;
-      return publicKey;
-    }();
-
-    _publicKeyFutureCache[uid] = future;
-    try {
-      return await future;
-    } finally {
-      _publicKeyFutureCache.remove(uid);
-    }
-  }
-
-  Future<SecretKey> _deriveConversationKey({
-    required SimpleKeyPairData keyPair,
-    required SimplePublicKey peerPublicKey,
-    required String otherUserId,
-    String? derivationKeyOverride,
-  }) async {
-    final localPublicKeyB64 = base64Encode(keyPair.publicKey.bytes);
-    final peerPublicKeyB64 = base64Encode(peerPublicKey.bytes);
-    final chatId = _chatId(currentUserId, otherUserId);
-    final cacheKey = derivationKeyOverride ??
-        _buildSymmetricConversationDerivationKey(
-          chatId: chatId,
-          localPublicKeyBase64: localPublicKeyB64,
-          peerPublicKeyBase64: peerPublicKeyB64,
-        );
-    final cached = _conversationKeyCache[cacheKey];
-    if (cached != null) return cached;
-
-    final sharedSecret = await _keyExchange.sharedSecretKey(
-      keyPair: keyPair,
-      remotePublicKey: peerPublicKey,
-    );
-
-    final derivedKey = await _hkdf.deriveKey(
-      secretKey: sharedSecret,
-      nonce: utf8.encode(cacheKey),
-      info: utf8.encode('smishing_shield_ph:$_algorithm'),
-    );
-    _conversationKeyCache[cacheKey] = derivedKey;
-    return derivedKey;
-  }
-
-  String _chatId(String userA, String userB) {
-    final ids = [userA, userB]..sort();
-    return ids.join('_');
-  }
-
-  String _buildSessionCacheKey({
-    required String chatId,
-    required String localPublicKeyBase64,
-    required String peerPublicKeyBase64,
-  }) {
-    return '$chatId|$localPublicKeyBase64|$peerPublicKeyBase64';
-  }
-
-  String _buildSymmetricConversationDerivationKey({
-    required String chatId,
-    required String localPublicKeyBase64,
-    required String peerPublicKeyBase64,
-  }) {
-    final ordered = <String>[
-      localPublicKeyBase64.trim(),
-      peerPublicKeyBase64.trim(),
-    ]..sort();
-    return '$chatId|${ordered.first}|${ordered.last}';
-  }
-
-  List<String> _buildConversationDerivationKeys({
-    required String chatId,
-    required String localPublicKeyBase64,
-    required String peerPublicKeyBase64,
-  }) {
-    final candidates = <String>[
-      _buildSymmetricConversationDerivationKey(
-        chatId: chatId,
-        localPublicKeyBase64: localPublicKeyBase64,
-        peerPublicKeyBase64: peerPublicKeyBase64,
-      ),
-      '$chatId|$localPublicKeyBase64|$peerPublicKeyBase64',
-      '$chatId|$peerPublicKeyBase64|$localPublicKeyBase64',
-    ];
-    final seen = <String>{};
-    return candidates.where(seen.add).toList(growable: false);
-  }
-
-  String _buildSessionId({
-    required String chatId,
-    required String localPublicKeyBase64,
-    required String peerPublicKeyBase64,
-  }) {
-    final normalizedKeys = <String>[
-      localPublicKeyBase64.trim(),
-      peerPublicKeyBase64.trim(),
-    ]..sort();
-    final keyA = _shortKeyFingerprint(normalizedKeys.first);
-    final keyB = _shortKeyFingerprint(normalizedKeys.last);
-    return '${chatId}_$keyA$keyB';
-  }
-
-  String _shortKeyFingerprint(String base64Key) {
-    final normalized =
-        base64Key.replaceAll('=', '').replaceAll('+', '-').replaceAll('/', '_');
-    final safe = normalized.isEmpty ? 'unknown' : normalized;
-    return safe.substring(0, min(16, safe.length));
-  }
-
-  Future<void> _persistSessionSnapshot(E2eeSessionContext session) async {
-    final uid = currentUserId;
-    if (uid.isEmpty) return;
-
-    await _firestore
-        .collection('users')
-        .doc(uid)
-        .collection('e2ee_sessions')
-        .doc(session.sessionId)
-        .set({
-      'peerId': session.peerId,
-      'chatId': session.chatId,
-      'sessionId': session.sessionId,
-      'algorithm': session.algorithm,
-      'sessionVersion': session.sessionVersion,
-      'localPublicKey': session.localPublicKeyBase64,
-      'peerPublicKey': session.peerPublicKeyBase64,
-      'keyType': 'static_x25519',
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
   }
 
   List<int> _randomBytes(int length) {
@@ -2930,11 +1564,11 @@ class E2eeService {
   }
 
   Future<bool> _hasLocalIdentity(String uid) async {
-    String? privateKeyB64;
-    String? publicKeyB64;
+    String? privateKeyPEM;
+    String? publicKeyPEM;
     try {
-      privateKeyB64 = await _secureStorage.read(key: '$_privateKeyPrefix$uid');
-      publicKeyB64 = await _secureStorage.read(key: '$_publicKeyPrefix$uid');
+      privateKeyPEM = await _secureStorage.read(key: 'hybrid_rsa_private_key');
+      publicKeyPEM = await _secureStorage.read(key: 'hybrid_rsa_public_key');
     } catch (error) {
       if (_isKeystoreCorruptionError(error)) {
         // Keystore is corrupted — treat as no local identity so bootstrap
@@ -2946,22 +1580,10 @@ class E2eeService {
         return false;
       }
     }
-    final hasLegacyIdentity = privateKeyB64 != null &&
-        privateKeyB64.isNotEmpty &&
-        publicKeyB64 != null &&
-        publicKeyB64.isNotEmpty;
-    if (hasLegacyIdentity) {
-      return true;
-    }
-
-    try {
-      await _keyManagementService.initialize();
-      final store = await _keyManagementService.getStore(uid);
-      final deviceDocId = await store.getDeviceDocId();
-      return deviceDocId.trim().isNotEmpty;
-    } catch (_) {
-      return false;
-    }
+    return privateKeyPEM != null &&
+        privateKeyPEM.isNotEmpty &&
+        publicKeyPEM != null &&
+        publicKeyPEM.isNotEmpty;
   }
 
   Future<bool> _hasRemoteRecoveryBackup(String uid) async {
@@ -2994,15 +1616,70 @@ class E2eeService {
     _remoteIdentitySyncFuture = null;
     _publicKeyCache.clear();
     _publicKeyFutureCache.clear();
-    _previousPublicKeysCache.clear();
-    _previousPublicKeysFutureCache.clear();
-    _conversationKeyCache.clear();
-    _decryptedTextCache.clear();
-    _sessionCache.clear();
-    _cachedLocalKeyHistory = null;
-    _cachedLocalKeyHistoryUserId = null;
-    _peerRepairFutureCache.clear();
-    _peerRepairTimestamps.clear();
     _automaticBackupBootstrapFuture = null;
   }
+
+  Future<String?> _readUserPublicKey(String uid,
+      {bool forceRefresh = false}) async {
+    if (!forceRefresh && _publicKeyCache.containsKey(uid)) {
+      final cached = _publicKeyCache[uid];
+      // Reject stale cached keys and force a refresh to get the RSA PEM.
+      if (cached != null && cached.contains('PUBLIC KEY')) {
+        return cached;
+      }
+      forceRefresh = true;
+    }
+    if (!forceRefresh && _publicKeyFutureCache.containsKey(uid)) {
+      return await _publicKeyFutureCache[uid];
+    }
+
+    final future = () async {
+      try {
+        final doc = await _firestore.collection('users').doc(uid).get();
+        final data = doc.data();
+        if (data != null && data['e2eePublicKey'] != null) {
+          final key = data['e2eePublicKey'].toString();
+          _publicKeyCache[uid] = key;
+          // Only cache valid RSA keys to prevent poisoning the cache with legacy keys
+          if (key.contains('PUBLIC KEY')) {
+            _publicKeyCache[uid] = key;
+          }
+          return key;
+        }
+        return null;
+      } catch (e) {
+        debugPrint('[E2eeService] Error reading public key for $uid: $e');
+        return null;
+      }
+    }();
+
+    _publicKeyFutureCache[uid] = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_publicKeyFutureCache[uid], future)) {
+        _publicKeyFutureCache.remove(uid);
+      }
+    }
+  }
+
+  Future<void> _rememberCurrentLocalIdentity({
+    required String uid,
+    required String replacingWithPublicKeyPEM,
+  }) async {
+    _cachedKeyPairUserId = uid;
+    _publicKeyCache[uid] = replacingWithPublicKeyPEM;
+  }
+
+  String _chatId(String a, String b) {
+    final ids = [a, b]..sort();
+    return ids.join('_');
+  }
+}
+
+class RSAKeyPairData {
+  final String privateKeyPem;
+  final String publicKeyPem;
+
+  RSAKeyPairData(this.privateKeyPem, this.publicKeyPem);
 }

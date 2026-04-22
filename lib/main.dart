@@ -2,9 +2,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'firebase_options.dart';
@@ -15,11 +13,10 @@ import 'screens/home_screen.dart';
 import 'services/auth_service.dart';
 import 'services/call_notification_service.dart';
 import 'services/chat_notification_service.dart';
-import 'services/e2ee_service.dart';
-import 'services/chat_encryption_repository.dart';
 import 'services/fcm_call_service.dart';
 import 'services/fcm_chat_service.dart';
 import 'services/message_screening_service.dart';
+import 'services/security_service.dart';
 import 'services/friend_request_notification_service.dart';
 import 'services/session_identity_service.dart';
 import 'services/sms_service.dart';
@@ -51,14 +48,18 @@ Future<void> main() async {
   );
 
   // Activate App Check with Play Integrity as per the Master Blueprint
-  await FirebaseAppCheck.instance.activate(
-    androidProvider: kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
-  );
+  // TEMPORARILY DISABLED FOR EMULATOR TESTING
+  // await FirebaseAppCheck.instance.activate(
+  //   androidProvider: kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+  // );
 
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   // Rule 3: Initialize SMS background batching
   SmsBackgroundWorker.initialize();
+
+  // TEMPORARY: Run the local crypto pipeline test on app launch
+  SecurityService().testCryptoPipeline();
 
   runApp(const SmishingShieldApp());
 }
@@ -354,6 +355,7 @@ class _AuthGateState extends State<AuthGate> {
         unawaited(AuthService.persistSessionMarker(user));
       }
       _startCallServicesOnce();
+      SecurityService().ensureKeysUploaded();
       return;
     }
 
@@ -653,26 +655,9 @@ class _AuthGateState extends State<AuthGate> {
         debugPrint('$stackTrace');
       }
 
-      // Phase 2 (600 ms later): heavy I/O — E2EE key DB, Signal bootstrap,
-      // FCM token. Enough headroom for the UI to draw its first frames first.
+  
       await Future<void>.delayed(const Duration(milliseconds: 600));
       if (!mounted || !_callServicesStarted) return;
-
-      // FIX: This is a background safety-net for app resume (e.g. killed and
-      // reopened without going through login). It intentionally stays
-      // fire-and-forget here because login_screen.dart and
-      // register_screen.dart now both await bootstrapIfNeeded() before
-      // navigating, so by the time the user opens a chat the bootstrap is
-      // already complete. This call only catches edge cases (token refresh,
-      // cold resume) and bootstrapIfNeeded() is idempotent — it will skip
-      // silently if bootstrap already ran this session.
-      E2eeService().scheduleAutomaticAccountBootstrapIfPossible();
-
-      try {
-        await ChatEncryptionRepository().ensureReady();
-      } catch (error) {
-        debugPrint('[AuthGate] E2EE ensureReady failed: $error');
-      }
 
       if (!mounted || !_callServicesStarted) return;
       try {

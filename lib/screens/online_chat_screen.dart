@@ -704,17 +704,11 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           lastMessageType: lastMessageType,
           lastMessageE2ee: lastMessageE2ee,
           lastMessageCipherText: data['lastMessageCipherText']?.toString(),
-          lastMessageDeviceEnvelopes: data['lastMessageDeviceEnvelopes'] is Map
-              ? Map<String, dynamic>.from(
-                  data['lastMessageDeviceEnvelopes'] as Map,
-                )
-              : null,
+          lastMessageEncryptedAesKey:
+              data['lastMessageEncryptedAesKey']?.toString(),
+          lastMessageIv: data['lastMessageIv']?.toString(),
           lastMessageCacheKey: data['lastMessageCacheKey']?.toString(),
           lastMessageAlgorithm: data['lastMessageAlgorithm']?.toString(),
-          lastMessageE2eeMessageType:
-              _parseInt(data['lastMessageE2eeMessageType']),
-          lastMessageNonce: data['lastMessageNonce']?.toString(),
-          lastMessageMac: data['lastMessageMac']?.toString(),
           lastMessageClientMessageId:
               data['lastMessageClientMessageId']?.toString(),
           lastMessageSenderId: lastMessageSenderId,
@@ -722,17 +716,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
               data['lastMessageSenderPublicKey']?.toString(),
           lastMessageReceiverPublicKey:
               data['lastMessageReceiverPublicKey']?.toString(),
-          lastMessageSessionId: data['lastMessageSessionId']?.toString(),
-          lastMessageSessionVersion:
-              _parseInt(data['lastMessageSessionVersion']),
-          lastMessageSessionPeerId:
-              data['lastMessageSessionPeerId']?.toString(),
-          lastMessageSessionAlgorithm:
-              data['lastMessageSessionAlgorithm']?.toString(),
-          lastMessageSessionLocalPublicKey:
-              data['lastMessageSessionLocalPublicKey']?.toString(),
-          lastMessageSessionPeerPublicKey:
-              data['lastMessageSessionPeerPublicKey']?.toString(),
           lastMessageAt: lastMessageAt,
           lastMessageAtClientMs: lastMessageAtClientMs,
           updatedAt: updatedAt,
@@ -768,22 +751,14 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           lastMessageType: 'text',
           lastMessageE2ee: false,
           lastMessageCipherText: null,
-          lastMessageDeviceEnvelopes: null,
+          lastMessageEncryptedAesKey: null,
+          lastMessageIv: null,
           lastMessageCacheKey: null,
           lastMessageAlgorithm: null,
-          lastMessageE2eeMessageType: null,
-          lastMessageNonce: null,
-          lastMessageMac: null,
           lastMessageClientMessageId: null,
           lastMessageSenderId: '',
           lastMessageSenderPublicKey: null,
           lastMessageReceiverPublicKey: null,
-          lastMessageSessionId: null,
-          lastMessageSessionVersion: null,
-          lastMessageSessionPeerId: null,
-          lastMessageSessionAlgorithm: null,
-          lastMessageSessionLocalPublicKey: null,
-          lastMessageSessionPeerPublicKey: null,
           lastMessageAt: null,
           lastMessageAtClientMs: null,
           updatedAt: null,
@@ -855,12 +830,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
             'lastMessageType': entry.lastMessageType,
             'lastMessageE2ee': entry.lastMessageE2ee,
             'lastMessageCipherText': entry.lastMessageCipherText,
-            'lastMessageDeviceEnvelopes': entry.lastMessageDeviceEnvelopes,
+            'lastMessageEncryptedAesKey': entry.lastMessageEncryptedAesKey,
+            'lastMessageIv': entry.lastMessageIv,
             'lastMessageCacheKey': entry.lastMessageCacheKey,
             'lastMessageAlgorithm': entry.lastMessageAlgorithm,
-            'lastMessageE2eeMessageType': entry.lastMessageE2eeMessageType,
-            'lastMessageNonce': entry.lastMessageNonce,
-            'lastMessageMac': entry.lastMessageMac,
             'lastMessageClientMessageId': entry.lastMessageClientMessageId,
             'lastMessageSenderId': entry.lastMessageSenderId,
             'lastMessageReceiverId':
@@ -869,14 +842,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                     : onlineChatService.currentUserId,
             'lastMessageSenderPublicKey': entry.lastMessageSenderPublicKey,
             'lastMessageReceiverPublicKey': entry.lastMessageReceiverPublicKey,
-            'lastMessageSessionId': entry.lastMessageSessionId,
-            'lastMessageSessionVersion': entry.lastMessageSessionVersion,
-            'lastMessageSessionPeerId': entry.lastMessageSessionPeerId,
-            'lastMessageSessionAlgorithm': entry.lastMessageSessionAlgorithm,
-            'lastMessageSessionLocalPublicKey':
-                entry.lastMessageSessionLocalPublicKey,
-            'lastMessageSessionPeerPublicKey':
-                entry.lastMessageSessionPeerPublicKey,
             'lastMessageAt': entry.lastMessageAt,
             'updatedAt': entry.updatedAt,
             'lastMessageIsSuspicious': false,
@@ -1374,14 +1339,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                       lastMessageType: entry.lastMessageType,
                       lastMessageE2ee: entry.lastMessageE2ee,
                       lastMessageCipherText: entry.lastMessageCipherText,
-                      lastMessageDeviceEnvelopes:
-                          entry.lastMessageDeviceEnvelopes,
+                      lastMessageEncryptedAesKey: entry.lastMessageEncryptedAesKey,
+                      lastMessageIv: entry.lastMessageIv,
                       lastMessageCacheKey: entry.lastMessageCacheKey,
                       lastMessageAlgorithm: entry.lastMessageAlgorithm,
-                      lastMessageE2eeMessageType:
-                          entry.lastMessageE2eeMessageType,
-                      lastMessageNonce: entry.lastMessageNonce,
-                      lastMessageMac: entry.lastMessageMac,
                       lastMessageClientMessageId:
                           entry.lastMessageClientMessageId,
                       lastMessageSenderId: entry.lastMessageSenderId,
@@ -1389,16 +1350,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                           entry.lastMessageSenderPublicKey,
                       lastMessageReceiverPublicKey:
                           entry.lastMessageReceiverPublicKey,
-                      lastMessageSessionId: entry.lastMessageSessionId,
-                      lastMessageSessionVersion:
-                          entry.lastMessageSessionVersion,
-                      lastMessageSessionPeerId: entry.lastMessageSessionPeerId,
-                      lastMessageSessionAlgorithm:
-                          entry.lastMessageSessionAlgorithm,
-                      lastMessageSessionLocalPublicKey:
-                          entry.lastMessageSessionLocalPublicKey,
-                      lastMessageSessionPeerPublicKey:
-                          entry.lastMessageSessionPeerPublicKey,
                       lastMessageAt: entry.lastMessageAt,
                       lastMessageAtClientMs: entry.lastMessageAtClientMs,
                       updatedAt: entry.updatedAt,
@@ -1654,22 +1605,14 @@ class _ConversationEntry {
   final String lastMessageType;
   final bool lastMessageE2ee;
   final String? lastMessageCipherText;
-  final Map<String, dynamic>? lastMessageDeviceEnvelopes;
+  final String? lastMessageEncryptedAesKey;
+  final String? lastMessageIv;
   final String? lastMessageCacheKey;
   final String? lastMessageAlgorithm;
-  final int? lastMessageE2eeMessageType;
-  final String? lastMessageNonce;
-  final String? lastMessageMac;
   final String? lastMessageClientMessageId;
   final String lastMessageSenderId;
   final String? lastMessageSenderPublicKey;
   final String? lastMessageReceiverPublicKey;
-  final String? lastMessageSessionId;
-  final int? lastMessageSessionVersion;
-  final String? lastMessageSessionPeerId;
-  final String? lastMessageSessionAlgorithm;
-  final String? lastMessageSessionLocalPublicKey;
-  final String? lastMessageSessionPeerPublicKey;
   final DateTime? lastMessageAt;
   final int? lastMessageAtClientMs;
   final DateTime? updatedAt;
@@ -1684,22 +1627,14 @@ class _ConversationEntry {
     required this.lastMessageType,
     required this.lastMessageE2ee,
     required this.lastMessageCipherText,
-    required this.lastMessageDeviceEnvelopes,
+    required this.lastMessageEncryptedAesKey,
+    required this.lastMessageIv,
     required this.lastMessageCacheKey,
     required this.lastMessageAlgorithm,
-    required this.lastMessageE2eeMessageType,
-    required this.lastMessageNonce,
-    required this.lastMessageMac,
     this.lastMessageClientMessageId,
     this.lastMessageSenderId = '',
     this.lastMessageSenderPublicKey,
     this.lastMessageReceiverPublicKey,
-    this.lastMessageSessionId,
-    this.lastMessageSessionVersion,
-    this.lastMessageSessionPeerId,
-    this.lastMessageSessionAlgorithm,
-    this.lastMessageSessionLocalPublicKey,
-    this.lastMessageSessionPeerPublicKey,
     required this.lastMessageAt,
     required this.lastMessageAtClientMs,
     required this.updatedAt,

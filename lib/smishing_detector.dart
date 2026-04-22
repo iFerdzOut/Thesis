@@ -8,7 +8,7 @@ import 'wordpiece_tokenizer.dart';
 
 class SmishingDetector {
   // Rule 3: DistilBERT threshold
-  static const double _smishingThreshold = 0.75;
+  static const double _smishingThreshold = 0.60;
   static const int _maxSeqLength = 256;
 
   /// Layer 1: Local Heuristics / Whitelist Bypass

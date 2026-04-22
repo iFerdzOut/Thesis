@@ -8,9 +8,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:http/http.dart' as http;
 
-import 'chat_encryption_repository.dart';
 import 'chat_notification_service.dart';
-import 'e2ee_service.dart';
+import 'security_service.dart';
 
 class FcmChatService {
   static final FcmChatService _instance = FcmChatService._internal();
@@ -18,9 +17,7 @@ class FcmChatService {
   FcmChatService._internal();
 
   final FirebaseFirestore _db = FirebaseFirestore.instance;
-  final E2eeService _e2eeService = E2eeService();
-  final ChatEncryptionRepository _chatEncryptionRepository =
-      ChatEncryptionRepository();
+  final SecurityService _securityService = SecurityService();
   bool _foregroundListenerRegistered = false;
 
   String get currentUserId => FirebaseAuth.instance.currentUser?.uid ?? '';
@@ -70,8 +67,7 @@ class FcmChatService {
   }) async {
     if (messageType != 'text' ||
         (fallbackPreview.isNotEmpty &&
-            fallbackPreview != 'Encrypted message' &&
-            fallbackPreview != 'New encrypted message')) {
+            !fallbackPreview.toLowerCase().contains('encrypted message'))) {
       return fallbackPreview;
     }
 
@@ -84,32 +80,12 @@ class FcmChatService {
           .get();
       final data = doc.data();
       if (data == null) return fallbackPreview;
-      if (_e2eeService.isEncryptedTextMessage(data)) {
-        final cacheKey = data['e2eeCacheKey']?.toString().trim() ?? '';
-        if (cacheKey.isNotEmpty) {
-          final cached =
-              await _chatEncryptionRepository.getCachedPlaintext(cacheKey);
-          if (cached != null && cached.trim().isNotEmpty) {
-            return cached;
-          }
-        }
-        final decrypted = await _e2eeService.decryptTextMessage(data);
-        if (!decrypted.startsWith('[') || !decrypted.endsWith(']')) {
-          // Persist a full projection row so that when the Firestore stream
-          // fires it finds the message already decrypted — eliminating the
-          // "Decrypting…" flash on the receiver's screen.
-          final senderId = data['senderId']?.toString().trim() ?? '';
-          if (senderId.isNotEmpty) {
-            unawaited(_chatEncryptionRepository.mapRemoteMessage(
-              conversationId: chatId,
-              messageId: messageId,
-              data: Map<String, dynamic>.from(data)
-                ..putIfAbsent('messageId', () => messageId),
-              otherUserId: senderId,
-              ensureInitialized: false,
-            ));
-          }
+      if (data['e2ee'] == true) {
+        try {
+          final decrypted = await _securityService.decryptMessage(data);
           return decrypted;
+        } catch (_) {
+          return 'RSA encrypted message';
         }
       }
       final text = data['text']?.toString().trim() ?? '';

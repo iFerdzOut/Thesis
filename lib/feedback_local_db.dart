@@ -57,4 +57,25 @@ class FeedbackLocalDb {
       whereArgs: ids,
     );
   }
+
+  static Future<Map<String, int>> getFeedbackCounts() async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT label, COUNT(*) AS total
+      FROM $_tableName
+      GROUP BY label
+    ''');
+    final stats = <String, int>{
+      'false_positive': 0,
+      'false_negative': 0,
+      'confirmed_smishing': 0,
+    };
+    for (final row in rows) {
+      final label = row['label']?.toString() ?? '';
+      if (stats.containsKey(label)) {
+        stats[label] = (row['total'] as num?)?.toInt() ?? 0;
+      }
+    }
+    return stats;
+  }
 }

@@ -8,10 +8,9 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import 'chat_encryption_repository.dart';
-import 'e2ee_service.dart';
 import 'notification_service.dart';
 import 'online_chat_service.dart';
+import 'security_service.dart';
 
 class ChatNotificationService {
   ChatNotificationService._internal();
@@ -26,10 +25,8 @@ class ChatNotificationService {
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final E2eeService _e2eeService = E2eeService();
-  final ChatEncryptionRepository _chatEncryptionRepository =
-      ChatEncryptionRepository();
   final OnlineChatService _onlineChatService = OnlineChatService();
+  final SecurityService _securityService = SecurityService();
 
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _messageSubscription;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _settingsSubscription;
@@ -350,31 +347,15 @@ class ChatNotificationService {
             ? 'Sent a file: $fileName'
             : 'Sent a file';
       case 'text':
-        if (_e2eeService.isEncryptedTextMessage(data)) {
-          final cacheKey =
-              data['e2eeCacheKey']?.toString().trim().isNotEmpty == true
-                  ? data['e2eeCacheKey'].toString().trim()
-                  : [
-                      messageId,
-                      data['e2eeNonce']?.toString() ?? '',
-                      data['e2eeMac']?.toString() ?? '',
-                    ].join('|');
-          final cached = _previewCache[cacheKey];
-          if (cached != null) return cached;
-
-          final repoCached =
-              await _chatEncryptionRepository.getCachedPlaintext(cacheKey);
-          if (repoCached != null && repoCached.trim().isNotEmpty) {
-            _previewCache[cacheKey] = repoCached;
-            return repoCached;
+        if (data['e2ee'] == true) {
+          try {
+            final decrypted = await _securityService.decryptMessage(data);
+            return decrypted;
+          } catch (_) {
+            final algo = data['e2eeAlgorithm']?.toString().toLowerCase() ?? '';
+            final indicator = algo.contains('rsa') ? 'RSA' : 'E2EE';
+            return '$indicator encrypted message';
           }
-
-          final decrypted = await _e2eeService.decryptTextMessage(data);
-          if (decrypted.startsWith('[') && decrypted.endsWith(']')) {
-            return 'Encrypted message';
-          }
-          _previewCache[cacheKey] = decrypted;
-          return decrypted;
         }
         return (data['text'] as String?)?.trim() ?? '';
       default:

@@ -22,6 +22,7 @@ class LocalDetectionRepository {
   static const FlutterSecureStorage _secureStorage = FlutterSecureStorage();
   static const String _dbPasswordKey = 'smishing_detection_db_password_v1';
   static const int _schemaVersion = 1;
+  static const String _singleThresholdKey = 'smishing_threshold';
   static const String _warningThresholdKey = 'warning_threshold';
   static const String _quarantineThresholdKey = 'quarantine_threshold';
 
@@ -34,12 +35,15 @@ class LocalDetectionRepository {
       <String, _MemoryScreeningRecord>{};
   final List<FeedbackLogModel> _memoryFeedbackLogs = <FeedbackLogModel>[];
   final Map<String, String> _memorySettings = <String, String>{
-    _warningThresholdKey: '0.42',
-    _quarantineThresholdKey: '0.72',
+    _singleThresholdKey: '0.60',
+    // Kept for backward compatibility; both map to the single threshold.
+    _warningThresholdKey: '0.60',
+    _quarantineThresholdKey: '0.60',
   };
 
   Future<void> initialize() async {
-    await _maybeOpenDatabase();
+    final db = await _maybeOpenDatabase();
+    await _ensureSingleThresholdSeed(db);
     await _seedTrustedDomainsIfNeeded();
   }
 
@@ -189,8 +193,17 @@ class LocalDetectionRepository {
     await db.insert(
       'detection_settings',
       <String, Object>{
+        'key': _singleThresholdKey,
+        'value': '0.60',
+        'updated_at': now,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    await db.insert(
+      'detection_settings',
+      <String, Object>{
         'key': _warningThresholdKey,
-        'value': '0.42',
+        'value': '0.60',
         'updated_at': now,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -199,7 +212,7 @@ class LocalDetectionRepository {
       'detection_settings',
       <String, Object>{
         'key': _quarantineThresholdKey,
-        'value': '0.72',
+        'value': '0.60',
         'updated_at': now,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -285,15 +298,21 @@ class LocalDetectionRepository {
   }
 
   Future<double> getWarningThreshold({
-    double fallback = 0.42,
+    double fallback = 0.60,
   }) async {
-    return _getDoubleSetting(_warningThresholdKey, fallback);
+    return getSingleThreshold(fallback: fallback);
   }
 
   Future<double> getQuarantineThreshold({
-    double fallback = 0.72,
+    double fallback = 0.60,
   }) async {
-    return _getDoubleSetting(_quarantineThresholdKey, fallback);
+    return getSingleThreshold(fallback: fallback);
+  }
+
+  Future<double> getSingleThreshold({
+    double fallback = 0.60,
+  }) async {
+    return _getDoubleSetting(_singleThresholdKey, fallback);
   }
 
   Future<String?> getSetting(String key) async {
@@ -321,6 +340,10 @@ class LocalDetectionRepository {
     final db = await _maybeOpenDatabase();
     if (db == null) {
       _memorySettings[key] = value;
+      if (key == _singleThresholdKey) {
+        _memorySettings[_warningThresholdKey] = value;
+        _memorySettings[_quarantineThresholdKey] = value;
+      }
       return;
     }
     await db.insert(
@@ -332,6 +355,49 @@ class LocalDetectionRepository {
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+    if (key == _singleThresholdKey) {
+      await db.insert(
+        'detection_settings',
+        <String, Object>{
+          'key': _warningThresholdKey,
+          'value': value,
+          'updated_at': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await db.insert(
+        'detection_settings',
+        <String, Object>{
+          'key': _quarantineThresholdKey,
+          'value': value,
+          'updated_at': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+  }
+
+  Future<void> _ensureSingleThresholdSeed(Database? db) async {
+    // If the DB couldn't be opened, the in-memory defaults already apply.
+    if (db == null) {
+      _memorySettings.putIfAbsent(_singleThresholdKey, () => '0.60');
+      _memorySettings[_warningThresholdKey] =
+          _memorySettings[_singleThresholdKey] ?? '0.60';
+      _memorySettings[_quarantineThresholdKey] =
+          _memorySettings[_singleThresholdKey] ?? '0.60';
+      return;
+    }
+
+    final existing = await getSetting(_singleThresholdKey);
+    if (existing != null && existing.trim().isNotEmpty) {
+      return;
+    }
+
+    // Migrate from older two-threshold settings if present.
+    final legacy =
+        await getSetting(_quarantineThresholdKey) ?? await getSetting(_warningThresholdKey);
+    final seed = (legacy != null && legacy.trim().isNotEmpty) ? legacy.trim() : '0.60';
+    await setSetting(key: _singleThresholdKey, value: seed);
   }
 
   Future<double> _getDoubleSetting(String key, double fallback) async {

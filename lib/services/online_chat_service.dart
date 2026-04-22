@@ -7,9 +7,10 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
 import 'ai_detection_service.dart';
-import 'e2ee_service.dart';
+import 'chat_encryption_repository.dart';
 import 'feedback_database_service.dart';
 import 'fcm_chat_service.dart';
+import 'security_service.dart';
 import 'sms_storage_service.dart';
 import 'user_profile_service.dart';
 
@@ -23,8 +24,10 @@ class OnlineChatService {
   final FeedbackDatabaseService _feedbackDb = FeedbackDatabaseService();
   final FcmChatService _fcmChatService = FcmChatService();
   final SmsStorageService _smsStorageService = SmsStorageService();
-  final E2eeService _e2eeService = E2eeService();
+  final SecurityService _securityService = SecurityService();
   final UserProfileService _userProfileService = UserProfileService();
+  final ChatEncryptionRepository _chatEncryptionRepository =
+      ChatEncryptionRepository();
   final Set<String> _legacySummaryRepairCache = <String>{};
   Future<void>? _conversationActivityBackfillFuture;
   String? _conversationActivityBackfillUserId;
@@ -241,20 +244,10 @@ class OnlineChatService {
   Map<String, dynamic> _clearedEncryptedSummaryFields() {
     return <String, dynamic>{
       'lastMessageCipherText': FieldValue.delete(),
-      'lastMessageDeviceEnvelopes': FieldValue.delete(),
       'lastMessageCacheKey': FieldValue.delete(),
+      'lastMessageEncryptedAesKey': FieldValue.delete(),
+      'lastMessageIv': FieldValue.delete(),
       'lastMessageAlgorithm': FieldValue.delete(),
-      'lastMessageE2eeMessageType': FieldValue.delete(),
-      'lastMessageNonce': FieldValue.delete(),
-      'lastMessageMac': FieldValue.delete(),
-      'lastMessageSenderPublicKey': FieldValue.delete(),
-      'lastMessageReceiverPublicKey': FieldValue.delete(),
-      'lastMessageSessionId': FieldValue.delete(),
-      'lastMessageSessionVersion': FieldValue.delete(),
-      'lastMessageSessionPeerId': FieldValue.delete(),
-      'lastMessageSessionAlgorithm': FieldValue.delete(),
-      'lastMessageSessionLocalPublicKey': FieldValue.delete(),
-      'lastMessageSessionPeerPublicKey': FieldValue.delete(),
       'lastMessageIsSuspicious': FieldValue.delete(),
     };
   }
@@ -265,9 +258,11 @@ class OnlineChatService {
     final isEncryptedText = type == 'text' && messageData['e2ee'] == true;
 
     if (isEncryptedText) {
+      final algo = messageData['e2eeAlgorithm']?.toString().toLowerCase() ?? '';
+      final indicator = algo.contains('rsa') ? 'RSA' : 'E2EE';
       return isSuspicious
-          ? 'Suspicious encrypted message'
-          : 'Encrypted message';
+          ? 'Suspicious $indicator encrypted message'
+          : '$indicator encrypted message';
     }
 
     switch (type) {
@@ -341,15 +336,30 @@ class OnlineChatService {
     String? clientMessageId,
   }) async {
     try {
-      // ensureReady() is called here (inside the try-catch) so any failure
-      // during bootstrap or device-identity setup is converted to a friendly
-      // user-visible message instead of a raw exception string.
-      await _e2eeService.ensureReady(syncRemote: false);
-      return await _e2eeService.encryptTextEnvelope(
-        receiverId: receiverId,
-        plaintext: plaintext,
-        clientMessageId: clientMessageId,
-      );
+      final userDoc =
+          await _firestore.collection('users').doc(receiverId).get();
+      final publicKey = userDoc.data()?['e2eePublicKey']?.toString();
+
+      if (publicKey == null ||
+          publicKey.trim().isEmpty ||
+          !publicKey.contains('PUBLIC KEY')) {
+        throw Exception('Recipient has not enabled encrypted chat yet.');
+      }
+      final payload =
+          await _securityService.encryptMessage(plaintext, publicKey);
+      final resolvedClientMessageId =
+          clientMessageId ?? _firestore.collection('chats').doc().id;
+      return {
+        'e2ee': true,
+        'e2eeAlgorithm': 'rsa-aes-cbc-v1',
+        'cipherText': payload['cipherText'] ?? payload['ciphertext'],
+        'encrypted_aes_key': payload['encrypted_aes_key'],
+        'iv': payload['iv'],
+        // Use a stable cache key so the sender can render plaintext without
+        // attempting to RSA-decrypt its own outgoing message.
+        'e2eeCacheKey': resolvedClientMessageId,
+        'clientMessageId': resolvedClientMessageId,
+      };
     } catch (error, stack) {
       debugPrint('[OnlineChatService] E2EE encrypt failed for '
           'receiver=$receiverId: $error\n$stack');
@@ -454,22 +464,10 @@ class OnlineChatService {
     if (isEncryptedText) {
       summary.addAll(<String, dynamic>{
         'lastMessageCipherText': messageData['cipherText'],
-        'lastMessageDeviceEnvelopes': messageData['e2eeDeviceEnvelopes'],
         'lastMessageCacheKey': messageData['e2eeCacheKey'],
+        'lastMessageEncryptedAesKey': messageData['encrypted_aes_key'],
+        'lastMessageIv': messageData['iv'],
         'lastMessageAlgorithm': messageData['e2eeAlgorithm'],
-        'lastMessageE2eeMessageType': messageData['e2eeMessageType'],
-        'lastMessageNonce': messageData['e2eeNonce'],
-        'lastMessageMac': messageData['e2eeMac'],
-        'lastMessageSenderPublicKey': messageData['senderPublicKey'],
-        'lastMessageReceiverPublicKey': messageData['receiverPublicKey'],
-        'lastMessageSessionId': messageData['e2eeSessionId'],
-        'lastMessageSessionVersion': messageData['e2eeSessionVersion'],
-        'lastMessageSessionPeerId': messageData['e2eeSessionPeerId'],
-        'lastMessageSessionAlgorithm': messageData['e2eeSessionAlgorithm'],
-        'lastMessageSessionLocalPublicKey':
-            messageData['e2eeSessionLocalPublicKey'],
-        'lastMessageSessionPeerPublicKey':
-            messageData['e2eeSessionPeerPublicKey'],
         'lastMessageIsSuspicious': messageData['isSuspicious'] == true,
       });
     }
@@ -718,14 +716,7 @@ class OnlineChatService {
     final trimmedText = text.trim();
     if (currentUserId.isEmpty || trimmedText.isEmpty) return;
 
-    // Optimistically create a pending message in the local cache.
-    // The UI will pick this up from the stream and show "sending...".
-    final clientMessageId =
-        await _e2eeService.createPendingOutgoingMessageProjection(
-      conversationId: chatId,
-      receiverId: receiverId,
-      plaintext: trimmedText,
-    );
+    final clientMessageId = _firestore.collection('chats').doc().id;
 
     try {
       await assertMessagingAllowed(receiverId);
@@ -738,17 +729,25 @@ class OnlineChatService {
             : receiverId,
       );
       // Detection failure is non-fatal — a model crash must never block sending.
-      bool isSuspicious = false;
-      try {
-        isSuspicious = await _aiDetectionService.detectSmishing(
-          trimmedText,
-          sender: currentUserId,
-          bypassOutgoing: false,
-        );
-      } catch (e) {
-        debugPrint(
-            '[OnlineChatService] Outgoing detection failed (non-fatal): $e');
-      }
+      const bool isSuspicious = false;
+
+      // Seed local plaintext cache so the sender can render what they typed
+      // without attempting to RSA-decrypt their own outgoing message.
+      //
+      // We intentionally avoid updating the conversation preview here: the chat
+      // list summary remains privacy-preserving ("RSA encrypted message").
+      unawaited(_chatEncryptionRepository.cachePlaintext(
+        cacheKey: clientMessageId,
+        conversationId: chatId,
+        messageId: clientMessageId,
+        clientMessageId: clientMessageId,
+        senderId: currentUserId,
+        receiverId: receiverId,
+        plaintext: trimmedText,
+        messageType: 'text',
+        updateConversationPreview: false,
+      ));
+
       final encryptedEnvelope = await _encryptSecureTextOrThrow(
         receiverId: receiverId,
         plaintext: trimmedText,
@@ -779,19 +778,23 @@ class OnlineChatService {
           .doc(clientMessageId);
       await messageRef.set(messageData, SetOptions(merge: true));
 
-      // This will now update the pending projection to a final "sent" state.
-      await _e2eeService.finalizeOutgoingTextProjection(
-        senderId: currentUserId,
-        receiverId: receiverId,
+      // Persist a final outgoing projection (ciphertext present, plaintext known).
+      // This prevents the sender bubble from ever falling back to
+      // "RSA encrypted message" for their own sent messages.
+      final cacheKey =
+          encryptedEnvelope['e2eeCacheKey']?.toString().trim() ?? '';
+      unawaited(_chatEncryptionRepository.finalizeOutgoingTextProjection(
+        conversationId: chatId,
         messageId: messageRef.id,
         clientMessageId: clientMessageId,
+        cacheKey: cacheKey.isNotEmpty ? cacheKey : clientMessageId,
+        senderId: currentUserId,
+        receiverId: receiverId,
         plaintext: trimmedText,
-        cacheKey:
-            encryptedEnvelope['e2eeCacheKey']?.toString() ?? clientMessageId,
         messageType: 'text',
         timestampMs: activityClientMs,
         algorithm: encryptedEnvelope['e2eeAlgorithm']?.toString(),
-      );
+      ));
 
       await upsertConversationSummaryFromMessage(
         otherUserId: receiverId,
@@ -813,13 +816,6 @@ class OnlineChatService {
         type: 'text',
       );
     } catch (e) {
-      // Mark the pending message as failed in the local cache.
-      await _e2eeService.failOutgoingMessageProjection(
-        clientMessageId: clientMessageId,
-        conversationId: chatId,
-        reason:
-            e is _UserVisibleMessagingException ? e.message : 'Failed to send',
-      );
       // Re-throw to allow the UI to show a snackbar or other error.
       rethrow;
     }
@@ -914,17 +910,7 @@ class OnlineChatService {
 
     final chatId = getChatId(otherUserId);
     // Detection failure is non-fatal — a model crash must never block editing.
-    bool isSuspicious = false;
-    try {
-      isSuspicious = await _aiDetectionService.detectSmishing(
-        newText.trim(),
-        sender: currentUserId,
-        bypassOutgoing: false,
-      );
-    } catch (e) {
-      debugPrint(
-          '[OnlineChatService] Outgoing detection failed on edit (non-fatal): $e');
-    }
+    const bool isSuspicious = false;
     final messageRef = _firestore
         .collection('chats')
         .doc(chatId)
@@ -943,15 +929,6 @@ class OnlineChatService {
                   true
               ? encryptedEnvelope['clientMessageId'].toString().trim()
               : existingData['clientMessageId']?.toString();
-      await _e2eeService.seedDecryptedTextCache(
-        senderId: currentUserId,
-        receiverId: otherUserId,
-        plaintext: newText.trim(),
-        nonce: encryptedEnvelope['e2eeNonce']?.toString(),
-        mac: encryptedEnvelope['e2eeMac']?.toString(),
-        cacheKey: encryptedEnvelope['e2eeCacheKey']?.toString(),
-        clientMessageId: refreshedClientMessageId,
-      );
 
       await messageRef.update({
         'text': '',
@@ -963,24 +940,6 @@ class OnlineChatService {
         'editedAt': FieldValue.serverTimestamp(),
         ...encryptedEnvelope,
       });
-      final existingTimestampMs = _resolveMessageActivityTime(
-        Map<String, dynamic>.from(existingData),
-      ).millisecondsSinceEpoch;
-      await _e2eeService.finalizeOutgoingTextProjection(
-        senderId: currentUserId,
-        receiverId: otherUserId,
-        messageId: messageId,
-        clientMessageId: refreshedClientMessageId,
-        plaintext: newText.trim(),
-        cacheKey: encryptedEnvelope['e2eeCacheKey']?.toString(),
-        nonce: encryptedEnvelope['e2eeNonce']?.toString(),
-        mac: encryptedEnvelope['e2eeMac']?.toString(),
-        messageType: 'text',
-        timestampMs: existingTimestampMs > 0
-            ? existingTimestampMs
-            : DateTime.now().millisecondsSinceEpoch,
-        algorithm: encryptedEnvelope['e2eeAlgorithm']?.toString(),
-      );
 
       final chatId = getChatId(otherUserId);
       final chatDoc = await _firestore.collection('chats').doc(chatId).get();
@@ -1030,14 +989,27 @@ class OnlineChatService {
   }) async {
     final chatId = getChatId(otherUserId);
 
-    await _firestore
+    final messageRef = _firestore
         .collection('chats')
         .doc(chatId)
         .collection('messages')
-        .doc(messageId)
-        .update({
-      'deletedFor': FieldValue.arrayUnion([currentUserId]),
-    });
+        .doc(messageId);
+
+    if (isMyMessage) {
+      await messageRef.set(<String, dynamic>{
+        'isDeleted': true,
+        'type': 'deleted',
+        'messageType': 'deleted',
+        'text': '',
+        'cipherText': '',
+        'deletedAt': FieldValue.serverTimestamp(),
+        'deletedBy': currentUserId,
+      }, SetOptions(merge: true));
+    } else {
+      await messageRef.set(<String, dynamic>{
+        'deletedFor': FieldValue.arrayUnion([currentUserId]),
+      }, SetOptions(merge: true));
+    }
 
     print('[OnlineChatService] Message deleted');
   }
@@ -1195,7 +1167,7 @@ class OnlineChatService {
   }) async {
     if (currentUserId.isEmpty) return;
     final chatId = getChatId(otherUserId);
-    
+
     try {
       await _firestore.collection('chats').doc(chatId).update({
         'typing.$currentUserId': isTyping,

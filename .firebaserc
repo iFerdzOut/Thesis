@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "distilbert-based-smishing"
-  }
+    "default": "shimishing-shield-ph"
+  },
+  "targets": {},
+  "etags": {}
 }

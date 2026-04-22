@@ -1,9 +1,9 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import '../services/local_detection_repository.dart';
 import '../services/sms_storage_service.dart';
 import '../services/sms_background_worker.dart';
+import '../feedback_local_db.dart';
 import 'contribution_hub_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -14,21 +14,19 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  late final LocalDetectionRepository _localDetectionRepository;
   late final SmsStorageService _smsStorageService;
   late Future<Map<String, int>> _feedbackStatsFuture;
 
   @override
   void initState() {
     super.initState();
-    _localDetectionRepository = LocalDetectionRepository();
     _smsStorageService = SmsStorageService();
-    _feedbackStatsFuture = _localDetectionRepository.getFeedbackStats();
+    _feedbackStatsFuture = FeedbackLocalDb.getFeedbackCounts();
   }
 
   void _refreshFeedbackStats() {
     setState(() {
-      _feedbackStatsFuture = _localDetectionRepository.getFeedbackStats();
+      _feedbackStatsFuture = FeedbackLocalDb.getFeedbackCounts();
     });
 
     // TEMPORARY TEST: Force background worker to scan immediately

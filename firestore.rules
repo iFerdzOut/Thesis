@@ -19,27 +19,80 @@ service cloud.firestore {
       );
     }
 
+    function isValidRsaPublicKeyPem(value) {
+      return value is string &&
+        value.size() > 64 &&
+        value.size() < 6000 &&
+        value.matches('(?s).*BEGIN PUBLIC KEY.*END PUBLIC KEY.*');
+    }
+
+    function isValidRsaMessage(data) {
+      // RSA+AES envelope fields written by the app.
+      return data.e2ee == true &&
+        data.e2eeAlgorithm == 'rsa-aes-cbc-v1' &&
+        data.cipherText is string && data.cipherText.size() > 0 && data.cipherText.size() < 1048000 &&
+        data.encrypted_aes_key is string && data.encrypted_aes_key.size() > 20 && data.encrypted_aes_key.size() < 6000 &&
+        data.iv is string && data.iv.size() > 10 && data.iv.size() < 80 &&
+        // Prevent reintroducing legacy Signal/double-ratchet metadata.
+        !('e2eeNonce' in data) &&
+        !('e2eeMac' in data) &&
+        !('e2eeSessionId' in data) &&
+        !('e2eeSessionVersion' in data) &&
+        !('e2eeSessionPeerId' in data) &&
+        !('e2eeSessionAlgorithm' in data) &&
+        !('e2eeSessionLocalPublicKey' in data) &&
+        !('e2eeSessionPeerPublicKey' in data) &&
+        !('e2eeDeviceEnvelopes' in data) &&
+        !('e2eeMessageType' in data) &&
+        !('e2eePreKeyIdUsed' in data) &&
+        !('e2eeSignedPreKeyIdUsed' in data);
+    }
+
+    function isValidChatMessageCommon(data) {
+      // Keep this permissive for non-text message types (files, gifs, call summaries),
+      // but strictly validate encrypted text envelopes.
+      return data.senderId is string && data.senderId.size() > 0 &&
+        data.receiverId is string && data.receiverId.size() > 0 &&
+        data.type is string && data.type.size() > 0 &&
+        data.isDeleted is bool &&
+        data.isRead is bool &&
+        data.editCount is int &&
+        data.timestamp is timestamp &&
+        (
+          data.e2ee == true
+            ? (data.type == 'text' &&
+               data.text is string && data.text.size() == 0 &&
+               isValidRsaMessage(data))
+            : (!('cipherText' in data) &&
+               !('encrypted_aes_key' in data) &&
+               !('iv' in data))
+        );
+    }
+
+    function isValidChatMessageCreate(data) {
+      return data.senderId == request.auth.uid &&
+        data.timestamp == request.time &&
+        isValidChatMessageCommon(data);
+    }
+
+    function isValidChatMessageUpdate(data) {
+      // Allow either party (sender or receiver) to update (read receipts, edits),
+      // but keep core identity fields immutable.
+      return (request.auth.uid == resource.data.senderId ||
+              request.auth.uid == resource.data.receiverId) &&
+        data.senderId == resource.data.senderId &&
+        data.receiverId == resource.data.receiverId &&
+        data.timestamp == resource.data.timestamp &&
+        isValidChatMessageCommon(data);
+    }
+
     match /users/{userId} {
       // The current app reads other user docs for names, email-based discovery,
       // E2EE public keys, and relationship state. Keep writes restricted.
       allow get, list: if isAuthenticated();
-      allow create, update: if isOwner(userId);
-
-      match /devices/{deviceId} {
-        allow read: if isAuthenticated();
-        allow write: if isOwner(userId);
-
-        match /one_time_prekeys/{preKeyId} {
-          allow read: if isAuthenticated();
-          allow create, update: if isOwner(userId);
-          // Peers consume one-time prekeys during X3DH session setup.
-          allow delete: if isAuthenticated();
-        }
-      }
-
-      match /e2ee_sessions/{sessionId} {
-        allow read, write: if isOwner(userId);
-      }
+      allow create, update: if isOwner(userId) &&
+        (!('e2eePublicKey' in request.resource.data) ||
+          isValidRsaPublicKeyPem(request.resource.data.e2eePublicKey));
 
       match /message_backups/{backupId} {
         allow read, delete: if isOwner(userId);
@@ -78,16 +131,22 @@ service cloud.firestore {
     }
 
     match /chats/{chatId} {
-      allow read, write: if isAuthenticated() && request.auth.uid in resource.data.participants;
+      allow read: if isAuthenticated() && (
+        request.auth.uid in chatId.split('_') ||
+        (resource != null && request.auth.uid in resource.data.get('participants', []))
+      );
+      allow write: if isAuthenticated() && request.auth.uid in chatId.split('_');
 
       match /messages/{messageId} {
-        allow read: if isAuthenticated() &&
-          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
-        allow create: if isAuthenticated() &&
-          request.resource.data.senderId == request.auth.uid &&
-          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow read: if isAuthenticated() && request.auth.uid in chatId.split('_');
+        allow create: if isAuthenticated() && 
+                      request.auth.uid in chatId.split('_') && 
+                      request.resource.data.senderId == request.auth.uid &&
+                      isValidChatMessageCreate(request.resource.data);
         allow update: if isAuthenticated() &&
-          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+                      request.auth.uid in chatId.split('_') &&
+                      // Apply the same validation to the post-update document.
+                      isValidChatMessageUpdate(request.resource.data);
         allow delete: if false;
       }
     }

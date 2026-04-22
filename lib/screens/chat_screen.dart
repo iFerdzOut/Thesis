@@ -1,16 +1,15 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:any_link_preview/any_link_preview.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:http/http.dart' as http;
-import 'package:open_filex/open_filex.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -37,6 +36,7 @@ import '../widgets/feedback_upload_consent_dialog.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/user_avatar.dart';
 import 'call_screen.dart';
+import 'quarantine_screen.dart';
 
 enum _ChatMenuAction {
   muteNotifications,
@@ -45,7 +45,6 @@ enum _ChatMenuAction {
   unblockUser,
   markUnread,
   markRead,
-  resetSecureSession,
 }
 
 class ChatScreen extends StatefulWidget {
@@ -86,21 +85,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final UserProfileService _userProfileService = UserProfileService();
   final TrustedDomainService _trustedDomainService = TrustedDomainService();
   final UrlExtractionService _urlExtractionService = UrlExtractionService();
-  final Map<String, Future<String>> _decryptedTextFutures =
-      <String, Future<String>>{};
-  final Map<String, Future<Uint8List>> _encryptedMediaFutures =
-      <String, Future<Uint8List>>{};
   final Map<String, Future<_LinkMeta>> _linkPreviewCache =
       <String, Future<_LinkMeta>>{};
-  final Map<String, DateTime> _decryptedTextFailureAt = <String, DateTime>{};
-  final Map<String, DateTime> _encryptedMediaFailureAt = <String, DateTime>{};
-  final Queue<Completer<void>> _textDecryptWaiters = Queue<Completer<void>>();
-  final Queue<Completer<void>> _mediaDecryptWaiters = Queue<Completer<void>>();
 
   static const int _maxFileSizeBytes = 25 * 1024 * 1024;
-  static const int _maxConcurrentTextDecrypts = 2;
-  static const int _maxConcurrentMediaDecrypts = 1;
-  static const Duration _decryptFailureCooldown = Duration(seconds: 5);
   static const Duration _externalLinkCountdown = Duration(seconds: 4);
 
   Timer? _typingTimer;
@@ -118,8 +106,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   int _selectedSmsSimSlot = 0;
   String? _smsResolvedContactName;
   bool _smsCanSendFromApp = false;
-  int _activeTextDecrypts = 0;
-  int _activeMediaDecrypts = 0;
 
   // Edit state
   String? _editingMessageId;
@@ -200,7 +186,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
     try {
       await _e2eeService.ensureReady(syncRemote: false);
-      await _e2eeService.prewarmConversation(otherUserId);
+      await _chatEncryptionRepository.prewarmConversation(otherUserId);
     } catch (error) {
       debugPrint(
         '[ChatScreen] Failed to prewarm encrypted conversation for $otherUserId: $error',
@@ -731,10 +717,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _manuallyUnread ? 'Mark as read' : 'Mark as unread',
                     ),
                   ),
-                  const PopupMenuItem<_ChatMenuAction>(
-                    value: _ChatMenuAction.resetSecureSession,
-                    child: Text('Reset secure session'),
-                  ),
                 ],
               ),
             ],
@@ -828,17 +810,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           setState(() => _manuallyUnread = false);
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Marked $_displayName as read')),
-          );
-          return;
-        case _ChatMenuAction.resetSecureSession:
-          await _chatEncryptionRepository.resetPeerSession(otherUserId);
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Secure session reset. Send a message to reconnect.',
-              ),
-            ),
           );
           return;
       }
@@ -2014,6 +1985,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 await _openLegitLink(urls.first);
               },
             ),
+          if (flagged)
+            ListTile(
+              leading: const Icon(Icons.lock_outline, color: Colors.orange),
+              title: const Text('View in Quarantine Vault'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const QuarantineScreen()),
+                );
+              },
+            ),
           if (!flagged && msg.isSuspicious)
             ListTile(
               leading:
@@ -2070,6 +2052,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final editCount = msg['editCount'] as int? ?? 0;
     final isDeleted = msg['isDeleted'] == true;
     final bool flagged = msg['isSuspicious'] == true;
+    final safetyStatus =
+        SafetyStatus.fromValue(msg['safetyStatus']?.toString());
+    final scanning = safetyStatus == SafetyStatus.scanning;
     final urls = _urlExtractionService.extractUrls(msgText);
 
     showModalBottomSheet(
@@ -2078,6 +2063,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (_) => SafeArea(
         child: Wrap(children: [
+          if (flagged && !isDeleted)
+            ListTile(
+              leading: const Icon(Icons.lock_outline, color: Colors.orange),
+              title: const Text('View in Quarantine Vault'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const QuarantineScreen()),
+                );
+              },
+            ),
           if (!flagged && !isDeleted && msgText.toString().trim().isNotEmpty)
             ListTile(
               leading: const Icon(Icons.copy_all_outlined),
@@ -2113,6 +2109,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               },
             ),
           if (!flagged &&
+              !scanning &&
               isMe &&
               msgType == 'text' &&
               !isDeleted &&
@@ -2131,24 +2128,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (!isDeleted)
             ListTile(
               leading: const Icon(Icons.delete_outline, color: Colors.red),
-              title: const Text('Delete for Me'),
-              subtitle: const Text('Only removes from your view'),
+              title: Text(isMe ? 'Delete for Everyone' : 'Delete for Me'),
+              subtitle: Text(isMe
+                  ? 'Replaces the message with “Message deleted” for both users'
+                  : 'Only removes from your view'),
               onTap: () {
                 Navigator.pop(context);
                 _confirmDeleteOnline(msgId, isMe);
               },
             ),
-          if (!flagged && !isMe && msg['isSuspicious'] == true && !isDeleted)
-            ListTile(
-              leading:
-                  const Icon(Icons.report_gmailerrorred, color: Colors.orange),
-              title: const Text('Report to Quarantine'),
-              onTap: () {
-                Navigator.pop(context);
-                reportOnlineMessage(msg);
-              },
-            ),
-          if (!flagged && !isMe && msg['isSuspicious'] != true && !isDeleted)
+          if (!flagged &&
+              !scanning &&
+              !isMe &&
+              msg['isSuspicious'] != true &&
+              !isDeleted)
             ListTile(
               leading:
                   const Icon(Icons.warning_amber_rounded, color: Colors.red),
@@ -2328,10 +2321,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required bool isMe,
     double? riskScore,
     VoidCallback? onDeleteForMe,
+    VoidCallback? onViewQuarantine,
     SafetyStatus safetyStatus = SafetyStatus.safe,
   }) {
     final bool showScanning = safetyStatus == SafetyStatus.scanning;
     if (!isSuspicious && !showScanning) return const SizedBox.shrink();
+    final double? clampedScore = riskScore?.clamp(0.0, 1.0);
+    final bool isHighRisk =
+        clampedScore == null ? safetyStatus == SafetyStatus.malicious : clampedScore >= 0.60;
+    final String label = showScanning
+        ? 'Scanning link in the background. The message stays disabled until the worker finishes.'
+        : '${isHighRisk ? 'Malicious message detected' : 'Suspicious message flagged'}'
+            '${clampedScore != null ? ' (${(clampedScore * 100).toStringAsFixed(0)}%)' : ''}. '
+            'Links and copy actions are disabled.';
     return Container(
       margin: EdgeInsets.only(
           left: isMe ? 60 : 10, right: isMe ? 10 : 60, bottom: 6),
@@ -2362,9 +2364,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  showScanning
-                      ? 'Scanning link in the background. The message stays disabled until the worker finishes.'
-                      : 'Malicious message detected${riskScore != null ? ' (${(riskScore * 100).toStringAsFixed(0)}%)' : ''}. Links and copy actions are disabled.',
+                  label,
                   style: TextStyle(
                     fontSize: 12,
                     color: showScanning
@@ -2384,6 +2384,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 child: const Text(
                   'Delete for Me',
                   style: TextStyle(color: Color(0xFFFFB6B6)),
+                ),
+              ),
+            ),
+          ],
+          if (isSuspicious && !showScanning && onViewQuarantine != null) ...[
+            const SizedBox(height: 2),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: onViewQuarantine,
+                child: const Text(
+                  'View in Quarantine Vault',
+                  style: TextStyle(color: Color(0xFFFFC266)),
                 ),
               ),
             ),
@@ -2450,6 +2463,66 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
                 color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final blocked =
+        msg.isSuspicious || msg.safetyStatus == SafetyStatus.malicious;
+    if (blocked) {
+      return Container(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.72,
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF3A1818),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: const Color(0xFFFF7A7A).withValues(alpha: 0.7),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded,
+                    size: 18, color: Color(0xFFFF8A8A)),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Suspicious message hidden',
+                    style: TextStyle(
+                      color: Color(0xFFFFD0D0),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'A malicious or suspicious message was detected.',
+              style: TextStyle(color: Color(0xFFFFD0D0), fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const QuarantineScreen()),
+                  );
+                },
+                child: const Text(
+                  'Open Quarantine Vault',
+                  style: TextStyle(color: Color(0xFFFFC266)),
+                ),
               ),
             ),
           ],
@@ -2669,6 +2742,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             domain: domain,
           );
         }
+      }
+
+      // Generic: use any_link_preview's metadata extraction (OG/Twitter/JSON-LD).
+      final meta = await AnyLinkPreview.getMetadata(
+        link: url,
+        cache: const Duration(days: 2),
+        userAgent:
+            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+      ).timeout(timeout);
+      if (meta != null && meta.hasData) {
+        return _LinkMeta(
+          title: meta.title?.toString(),
+          description: meta.desc?.toString(),
+          imageUrl: meta.image?.toString(),
+          domain: domain,
+        );
       }
 
       // Generic: fetch HTML and parse og: meta tags.
@@ -2984,6 +3073,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       isMe: isOutgoing,
                       riskScore: msg.riskScore,
                       safetyStatus: safetyStatus,
+                      onViewQuarantine: () {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => const QuarantineScreen(),
+                          ),
+                        );
+                      },
                       onDeleteForMe: safetyStatus == SafetyStatus.malicious
                           ? () {
                               unawaited(deleteLocalMessage(msg));
@@ -3059,6 +3155,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         (suspicious ? SafetyStatus.malicious : SafetyStatus.safe);
     final double? riskScore =
         projection?.riskScore ?? (data['riskScore'] as num?)?.toDouble();
+    final bool effectiveSuspicious =
+        riskScore != null ? riskScore >= 0.60 : suspicious;
     final e2eeIndicator = _buildE2eeIndicatorText(
       data,
       projection,
@@ -3079,9 +3177,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         text: resolvedText,
         isMe: isMe,
         time: time,
-        isSuspicious: suspicious,
+        isSuspicious: effectiveSuspicious,
         type: type,
-        safetyStatus: safetyStatus,
+        safetyStatus:
+            effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
         filePath: null,
       );
     } else if (type == 'file') {
@@ -3089,9 +3188,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         text: fileName.isNotEmpty ? fileName : resolvedText,
         isMe: isMe,
         time: time,
-        isSuspicious: suspicious,
+        isSuspicious: effectiveSuspicious,
         type: type,
-        safetyStatus: safetyStatus,
+        safetyStatus:
+            effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
         filePath: resolvedText,
       );
     } else {
@@ -3099,9 +3199,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         text: resolvedText,
         isMe: isMe,
         time: time,
-        isSuspicious: suspicious,
+        isSuspicious: effectiveSuspicious,
         type: type,
-        safetyStatus: safetyStatus,
+        safetyStatus:
+            effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
       );
     }
 
@@ -3109,13 +3210,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       'text': type == 'text' ? resolvedText : '',
       'isMe': isMe,
       'time': formatTime(time),
-      'isSuspicious': suspicious,
+      'isSuspicious': effectiveSuspicious,
       'type': type,
       'docPath': docPath,
       'messageId': doc.id,
       'editCount': editCount,
       'isDeleted': isDeleted,
       'riskScore': riskScore,
+      'safetyStatus': (effectiveSuspicious ? SafetyStatus.malicious : safetyStatus)
+          .value,
     };
 
     return RepaintBoundary(
@@ -3124,22 +3227,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
         children: [
           GestureDetector(
-            onLongPress: isDeleted || isCallSummary || suspicious
+            onLongPress: isDeleted ||
+                    isCallSummary ||
+                    safetyStatus == SafetyStatus.scanning
                 ? null
                 : () => showOnlineMessageOptions(onlineMsgMap),
             child: customContent ?? buildMessageContent(tempMessage),
           ),
           if (!isDeleted && !isCallSummary)
             buildSuspiciousWarningCard(
-              isSuspicious: suspicious,
+              isSuspicious: effectiveSuspicious,
               isMe: isMe,
               riskScore: riskScore,
-              onDeleteForMe: suspicious
+              onViewQuarantine: effectiveSuspicious
+                  ? () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => const QuarantineScreen(),
+                        ),
+                      );
+                    }
+                  : null,
+              onDeleteForMe: effectiveSuspicious
                   ? () {
                       _confirmDeleteOnline(doc.id, isMe);
                     }
                   : null,
-              safetyStatus: safetyStatus,
+              safetyStatus: effectiveSuspicious
+                  ? SafetyStatus.malicious
+                  : safetyStatus,
             ),
           Padding(
             padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
@@ -3181,7 +3297,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       formatTime(time),
                       style: const TextStyle(fontSize: 11, color: Colors.grey),
                     ),
-                    if (suspicious && !isDeleted && !isCallSummary) ...[
+                    if (effectiveSuspicious && !isDeleted && !isCallSummary) ...[
                       const SizedBox(width: 6),
                       const Icon(
                         Icons.warning_amber_rounded,
@@ -3290,6 +3406,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             isSuspicious: projection.isSuspicious,
             isMe: projection.isOutgoing,
             riskScore: projection.riskScore,
+            onViewQuarantine: projection.isSuspicious
+                ? () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const QuarantineScreen(),
+                      ),
+                    );
+                  }
+                : null,
             safetyStatus: projection.safetyStatus,
           ),
         Padding(
@@ -3354,268 +3479,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       default:
         return 'Encrypted message';
     }
-  }
-
-  bool _isEncryptedMediaMessage(Map<String, dynamic> data) {
-    final type = data['type']?.toString() ?? '';
-    return data['e2eeMedia'] == true &&
-        (type == 'image' || type == 'gif' || type == 'file') &&
-        (data['text']?.toString().isNotEmpty ?? false);
-  }
-
-  bool _isDecryptFailureCoolingDown(
-    Map<String, DateTime> failures,
-    String cacheKey,
-  ) {
-    final failedAt = failures[cacheKey];
-    if (failedAt == null) {
-      return false;
-    }
-    if (DateTime.now().difference(failedAt) >= _decryptFailureCooldown) {
-      failures.remove(cacheKey);
-      return false;
-    }
-    return true;
-  }
-
-  Future<void> _acquireDecryptSlot({required bool media}) {
-    final limit =
-        media ? _maxConcurrentMediaDecrypts : _maxConcurrentTextDecrypts;
-    final active = media ? _activeMediaDecrypts : _activeTextDecrypts;
-    if (active < limit) {
-      if (media) {
-        _activeMediaDecrypts++;
-      } else {
-        _activeTextDecrypts++;
-      }
-      return Future<void>.value();
-    }
-
-    final completer = Completer<void>();
-    if (media) {
-      _mediaDecryptWaiters.addLast(completer);
-    } else {
-      _textDecryptWaiters.addLast(completer);
-    }
-    return completer.future;
-  }
-
-  void _releaseDecryptSlot({required bool media}) {
-    final queue = media ? _mediaDecryptWaiters : _textDecryptWaiters;
-    if (queue.isNotEmpty) {
-      queue.removeFirst().complete();
-      return;
-    }
-
-    if (media) {
-      if (_activeMediaDecrypts > 0) {
-        _activeMediaDecrypts--;
-      }
-    } else {
-      if (_activeTextDecrypts > 0) {
-        _activeTextDecrypts--;
-      }
-    }
-  }
-
-  Future<T> _runWithDecryptSlot<T>({
-    required bool media,
-    required Future<T> Function() action,
-  }) async {
-    await _acquireDecryptSlot(media: media);
-    try {
-      return await action();
-    } finally {
-      _releaseDecryptSlot(media: media);
-    }
-  }
-
-  Future<Uint8List> _loadEncryptedMediaBytes(
-    String messageId,
-    Map<String, dynamic> data,
-  ) {
-    final cacheKey = data['e2eeCacheKey']?.toString().trim().isNotEmpty == true
-        ? data['e2eeCacheKey'].toString().trim()
-        : [
-            messageId,
-            data['e2eeNonce']?.toString() ?? '',
-            data['e2eeMac']?.toString() ?? '',
-          ].join('|');
-    final clientMessageId = data['clientMessageId']?.toString().trim();
-    final senderId = data['senderId']?.toString().trim() ?? '';
-    final receiverId = data['receiverId']?.toString().trim() ?? '';
-    final messageType =
-        (data['type'] ?? data['messageType'] ?? 'file').toString().trim();
-    final fileName = data['fileName']?.toString();
-
-    if (_isDecryptFailureCoolingDown(_encryptedMediaFailureAt, cacheKey)) {
-      return Future<Uint8List>.error(
-        Exception('Encrypted media unavailable.'),
-      );
-    }
-
-    return _encryptedMediaFutures.putIfAbsent(cacheKey, () async {
-      try {
-        final cachedBytes = await _e2eeService.getCachedMediaBytes(
-          cacheKey: cacheKey,
-          clientMessageId: clientMessageId,
-          messageId: messageId,
-          fileName: fileName,
-        );
-        if (cachedBytes != null && cachedBytes.isNotEmpty) {
-          _encryptedMediaFailureAt.remove(cacheKey);
-          return cachedBytes;
-        }
-
-        if (senderId == currentUserId) {
-          throw Exception('Encrypted media unavailable on this device.');
-        }
-
-        final url = data['text']?.toString() ?? '';
-        if (url.isEmpty) {
-          throw Exception('Encrypted media URL missing.');
-        }
-
-        final response = await http.get(Uri.parse(url));
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw Exception('Failed to download encrypted media.');
-        }
-
-        final shouldRetry = _shouldRetryEncryptedDecrypt(data);
-        final decryptedBytes = await _runWithDecryptSlot(
-          media: true,
-          action: () async {
-            try {
-              return await _e2eeService.decryptBytesMessage(
-                data: data,
-                cipherBytes: response.bodyBytes,
-                allowRepair: false,
-              );
-            } catch (_) {
-              if (!shouldRetry) {
-                rethrow;
-              }
-              await Future<void>.delayed(const Duration(milliseconds: 700));
-              return _e2eeService.decryptBytesMessage(
-                data: Map<String, dynamic>.from(data),
-                cipherBytes: response.bodyBytes,
-                allowRepair: true,
-              );
-            }
-          },
-        );
-        try {
-          await _e2eeService.cacheIncomingMediaBytes(
-            senderId: senderId,
-            receiverId: receiverId,
-            bytes: decryptedBytes,
-            messageId: messageId,
-            clientMessageId: clientMessageId,
-            cacheKey: cacheKey,
-            messageType: messageType,
-            fileName: fileName,
-          );
-        } catch (error) {
-          debugPrint(
-              '[ChatScreen] Failed to persist incoming encrypted media: $error');
-        }
-        _encryptedMediaFailureAt.remove(cacheKey);
-        return decryptedBytes;
-      } catch (_) {
-        _encryptedMediaFailureAt[cacheKey] = DateTime.now();
-        _encryptedMediaFutures.remove(cacheKey);
-        rethrow;
-      }
-    });
-  }
-
-  // ignore: unused_element
-  Future<String> _loadDecryptedText(
-    String messageId,
-    Map<String, dynamic> data,
-  ) {
-    final legacyText = data['text']?.toString() ?? '';
-    if (!_e2eeService.isEncryptedTextMessage(data)) {
-      return Future<String>.value(legacyText);
-    }
-
-    final seededText = _e2eeService.getSeededDecryptedText(data);
-    if (seededText != null && seededText.trim().isNotEmpty) {
-      return Future<String>.value(seededText);
-    }
-
-    final cacheKey = data['e2eeCacheKey']?.toString().trim().isNotEmpty == true
-        ? data['e2eeCacheKey'].toString().trim()
-        : [
-            messageId,
-            data['e2eeNonce']?.toString() ?? '',
-            data['e2eeMac']?.toString() ?? '',
-          ].join('|');
-
-    if (_isDecryptFailureCoolingDown(_decryptedTextFailureAt, cacheKey)) {
-      return Future<String>.value(
-        legacyText.isNotEmpty ? legacyText : '[Encrypted message unavailable]',
-      );
-    }
-
-    return _decryptedTextFutures.putIfAbsent(cacheKey, () async {
-      try {
-        final shouldRetry = _shouldRetryEncryptedDecrypt(data);
-        final decrypted = await _runWithDecryptSlot(
-          media: false,
-          action: () async {
-            final decryptInput = Map<String, dynamic>.from(data);
-            var resolved = await _e2eeService
-                .decryptTextMessage(
-                  decryptInput,
-                  allowRepair: false,
-                )
-                .timeout(
-                  const Duration(seconds: 8),
-                  onTimeout: () => legacyText.isNotEmpty
-                      ? legacyText
-                      : '[Encrypted message unavailable]',
-                );
-            if (_e2eeService.isUnavailablePlaceholder(resolved) &&
-                shouldRetry) {
-              await Future<void>.delayed(const Duration(milliseconds: 700));
-              resolved = await _e2eeService
-                  .decryptTextMessage(
-                    Map<String, dynamic>.from(data),
-                    allowRepair: true,
-                  )
-                  .timeout(
-                    const Duration(seconds: 6),
-                    onTimeout: () => legacyText.isNotEmpty
-                        ? legacyText
-                        : '[Encrypted message unavailable]',
-                  );
-            }
-            return resolved;
-          },
-        );
-        if (_e2eeService.isUnavailablePlaceholder(decrypted)) {
-          _decryptedTextFailureAt[cacheKey] = DateTime.now();
-          _decryptedTextFutures.remove(cacheKey);
-        } else {
-          _decryptedTextFailureAt.remove(cacheKey);
-        }
-        return decrypted;
-      } catch (_) {
-        _decryptedTextFailureAt[cacheKey] = DateTime.now();
-        _decryptedTextFutures.remove(cacheKey);
-        rethrow;
-      }
-    });
-  }
-
-  bool _shouldRetryEncryptedDecrypt(Map<String, dynamic> data) {
-    final timestamp = extractFirestoreTime(data['timestamp']);
-    final now = DateTime.now();
-    final age = now.isAfter(timestamp)
-        ? now.difference(timestamp)
-        : timestamp.difference(now);
-    return age <= const Duration(hours: 1);
   }
 
   DecryptedConversationMessage? _resolveConversationProjection(
@@ -3712,18 +3575,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required int version,
   }) {
     final normalized = algorithm.trim().toLowerCase();
-    if (normalized == 'signal-v2') {
-      return version > 0 ? 'Signal v$version' : 'Signal';
+    if (normalized.contains('rsa')) {
+      return 'RSA';
     }
-    if (normalized == 'x25519-aesgcm-v1') {
-      return version > 0
-          ? 'Legacy X25519/AES-GCM v$version'
-          : 'Legacy X25519/AES-GCM';
-    }
-    if (version > 0 && !normalized.endsWith('v$version')) {
-      return '$algorithm v$version';
-    }
-    return algorithm;
+    return 'E2EE';
   }
 
   Widget _buildDecryptingBubble({
@@ -3777,170 +3632,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       ],
-    );
-  }
-
-  Future<void> _openEncryptedImagePreviewBytes(Uint8List bytes) async {
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.black,
-          appBar: AppBar(
-            backgroundColor: Colors.black,
-            iconTheme: const IconThemeData(color: Colors.white),
-          ),
-          body: Center(
-            child: InteractiveViewer(
-              minScale: 0.8,
-              maxScale: 4,
-              child: Image.memory(bytes, fit: BoxFit.contain),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Future<void> _openEncryptedFile(
-    Uint8List bytes, {
-    required String fileName,
-  }) async {
-    final safeName = fileName.trim().isEmpty ? 'encrypted_file' : fileName;
-    final tempDir = await Directory.systemTemp.createTemp('smishing_file_');
-    final tempFile = File('${tempDir.path}${Platform.pathSeparator}$safeName');
-    await tempFile.writeAsBytes(bytes, flush: true);
-
-    final result = await OpenFilex.open(tempFile.path);
-    if (!mounted) return;
-    if (result.type != ResultType.done) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not open decrypted file.')),
-      );
-    }
-  }
-
-  Widget _buildEncryptedMediaContent({
-    required String messageId,
-    required Map<String, dynamic> data,
-    required bool isMe,
-    required bool suspicious,
-    required String type,
-    required String fileName,
-  }) {
-    return FutureBuilder<Uint8List>(
-      future: _loadEncryptedMediaBytes(messageId, data),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return Container(
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.72,
-              maxHeight: 180,
-            ),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: isMe ? const Color(0xFFDCF8C6) : Colors.white,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Center(
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          );
-        }
-
-        if (snapshot.hasError || !snapshot.hasData) {
-          return Container(
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.72,
-            ),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade100,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Text(
-              'Encrypted media unavailable',
-              style: TextStyle(color: Colors.grey),
-            ),
-          );
-        }
-
-        final bytes = snapshot.data!;
-        if (type == 'image' || type == 'gif') {
-          return GestureDetector(
-            onTap: suspicious
-                ? null
-                : () => _openEncryptedImagePreviewBytes(bytes),
-            child: Container(
-              constraints: BoxConstraints(
-                maxWidth: MediaQuery.of(context).size.width * 0.72,
-                maxHeight: 260,
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.memory(
-                  bytes,
-                  fit: BoxFit.cover,
-                  gaplessPlayback: true,
-                  errorBuilder: (_, __, ___) => Container(
-                    width: 200,
-                    height: 120,
-                    color: Colors.grey.shade200,
-                    child: const Icon(Icons.broken_image_outlined),
-                  ),
-                ),
-              ),
-            ),
-          );
-        }
-
-        return GestureDetector(
-          onTap: () => _openEncryptedFile(
-            bytes,
-            fileName: fileName,
-          ),
-          child: Container(
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.72,
-            ),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: isMe ? const Color(0xFFDCF8C6) : Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.grey.shade200),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(
-                  Icons.lock_outline,
-                  color: Color(0xFF075E54),
-                ),
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        fileName.isNotEmpty ? fileName : 'Encrypted file',
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w500,
-                          color: Color(0xFF075E54),
-                        ),
-                      ),
-                      const Text(
-                        'Tap to open decrypted file',
-                        style: TextStyle(fontSize: 11, color: Colors.grey),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
     );
   }
 
@@ -4032,8 +3723,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           data['isDeleted'] == true || type == 'deleted';
                       final isEncryptedText = !isDeleted &&
                           _looksEncryptedTextMessage(data, projection);
-                      final isEncryptedMedia =
-                          !isDeleted && _isEncryptedMediaMessage(data);
                       final resolvedText = isEncryptedText
                           ? _resolvedEncryptedThreadText(data, projection)
                           : text;
@@ -4051,35 +3740,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             isMe: isMe,
                             time: time,
                             e2eeIndicator: e2eeIndicator,
-                          ),
-                        );
-                      }
-
-                      if (isEncryptedMedia) {
-                        return RepaintBoundary(
-                          child: _buildOnlineMessageTile(
-                            data: data,
-                            doc: doc,
-                            projection: projection,
-                            isMe: isMe,
-                            resolvedText: resolvedText ?? '',
-                            suspicious: suspicious,
-                            type: type,
-                            isCallSummary: isCallSummary,
-                            time: time,
-                            fileName: fileName,
-                            editCount: editCount,
-                            isEdited: isEdited,
-                            isDeleted: isDeleted,
-                            hasPendingWrites: hasPendingWrites,
-                            customContent: _buildEncryptedMediaContent(
-                              messageId: doc.id,
-                              data: Map<String, dynamic>.from(data),
-                              isMe: isMe,
-                              suspicious: suspicious,
-                              type: type,
-                              fileName: fileName,
-                            ),
                           ),
                         );
                       }

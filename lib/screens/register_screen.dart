@@ -152,7 +152,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
       ]);
 
       // Navigate home immediately — E2EE bootstrap is expensive (PBKDF2 ×3 +
-      // ~100 Firestore prekey writes) and must NOT block the registration UI.
+      // RSA key generation + backup) and must NOT block the registration UI.
       // scheduleAutomaticAccountBootstrap runs it in the background; the first
       // chat open triggers ensureDeviceIdentity which waits for it to finish.
       if (!mounted) return;

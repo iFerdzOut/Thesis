@@ -41,48 +41,49 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions web = FirebaseOptions(
-    apiKey: 'AIzaSyBPM1-xpCrC9yWQCoemdWBh44cwAHI7Vd4',
-    appId: '1:556089083014:web:917d6874d8c4c104093d07',
-    messagingSenderId: '556089083014',
-    projectId: 'distilbert-based-smishing',
-    authDomain: 'distilbert-based-smishing.firebaseapp.com',
-    storageBucket: 'distilbert-based-smishing.firebasestorage.app',
-    measurementId: 'G-5XHRMHS7V4',
+    apiKey: 'AIzaSyBsg7y_3rKKigcAU3zjAB8l-Bcu_iKeFRo',
+    appId: '1:215021261043:web:528ef00f968dfe6333a786',
+    messagingSenderId: '215021261043',
+    projectId: 'shimishing-shield-ph',
+    authDomain: 'shimishing-shield-ph.firebaseapp.com',
+    storageBucket: 'shimishing-shield-ph.firebasestorage.app',
+    measurementId: 'G-PX2EVKC485',
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyCGEImJsmPKDulKbFhpnVZIQHWF4r6cMOs',
-    appId: '1:556089083014:android:66bf334129e24750093d07',
-    messagingSenderId: '556089083014',
-    projectId: 'distilbert-based-smishing',
-    storageBucket: 'distilbert-based-smishing.firebasestorage.app',
+    apiKey: 'AIzaSyCvgvWo1RTNXdBpgVHF817HCkUSq8sAwqQ',
+    appId: '1:215021261043:android:39ee115708c1ff2133a786',
+    messagingSenderId: '215021261043',
+    projectId: 'shimishing-shield-ph',
+    storageBucket: 'shimishing-shield-ph.firebasestorage.app',
   );
 
   static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyBWuddusA82lssetCCc3dVm02TgetxmQrU',
-    appId: '1:556089083014:ios:9e704c15f8bfd065093d07',
-    messagingSenderId: '556089083014',
-    projectId: 'distilbert-based-smishing',
-    storageBucket: 'distilbert-based-smishing.firebasestorage.app',
+    apiKey: 'AIzaSyBGnpUAoiCRtLuOYbiXROV8rfrJxntIz2M',
+    appId: '1:215021261043:ios:2f7144a117feff0633a786',
+    messagingSenderId: '215021261043',
+    projectId: 'shimishing-shield-ph',
+    storageBucket: 'shimishing-shield-ph.firebasestorage.app',
     iosBundleId: 'com.example.flutterApplication1',
   );
 
   static const FirebaseOptions macos = FirebaseOptions(
-    apiKey: 'AIzaSyBWuddusA82lssetCCc3dVm02TgetxmQrU',
-    appId: '1:556089083014:ios:9e704c15f8bfd065093d07',
-    messagingSenderId: '556089083014',
-    projectId: 'distilbert-based-smishing',
-    storageBucket: 'distilbert-based-smishing.firebasestorage.app',
+    apiKey: 'AIzaSyBGnpUAoiCRtLuOYbiXROV8rfrJxntIz2M',
+    appId: '1:215021261043:ios:2f7144a117feff0633a786',
+    messagingSenderId: '215021261043',
+    projectId: 'shimishing-shield-ph',
+    storageBucket: 'shimishing-shield-ph.firebasestorage.app',
     iosBundleId: 'com.example.flutterApplication1',
   );
 
   static const FirebaseOptions windows = FirebaseOptions(
-    apiKey: 'AIzaSyBPM1-xpCrC9yWQCoemdWBh44cwAHI7Vd4',
-    appId: '1:556089083014:web:d6e5f8fe2c9c0daa093d07',
-    messagingSenderId: '556089083014',
-    projectId: 'distilbert-based-smishing',
-    authDomain: 'distilbert-based-smishing.firebaseapp.com',
-    storageBucket: 'distilbert-based-smishing.firebasestorage.app',
-    measurementId: 'G-NDH3X2B7NT',
+    apiKey: 'AIzaSyBsg7y_3rKKigcAU3zjAB8l-Bcu_iKeFRo',
+    appId: '1:215021261043:web:13df51d2375f0e1833a786',
+    messagingSenderId: '215021261043',
+    projectId: 'shimishing-shield-ph',
+    authDomain: 'shimishing-shield-ph.firebaseapp.com',
+    storageBucket: 'shimishing-shield-ph.firebasestorage.app',
+    measurementId: 'G-0B683MWWTZ',
   );
+
 }

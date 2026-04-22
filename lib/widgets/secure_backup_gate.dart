@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../services/e2ee_service.dart';
 import '../screens/secure_backup_setup_screen.dart';
@@ -20,20 +19,17 @@ class SecureBackupGate extends StatefulWidget {
 }
 
 class _SecureBackupGateState extends State<SecureBackupGate> {
-  static const FlutterSecureStorage _secureStorage = FlutterSecureStorage();
-
   bool _isChecking = true;
   bool _needsSetup = false;
   bool _needsRestore = false;
   bool _isOffline = false;
+  bool _unlockedThisSession = false;
 
   // ── Local-cache key ────────────────────────────────────────────────────────
   // Written after the user successfully completes setup/restore (or when we
   // confirm both local identity AND remote backup exist).  On the next launch
   // we fast-path past the Firestore round-trip unless the local identity is
   // gone (indicating a reinstall that needs restore).
-  static String _confirmedKey(String uid) => 'backup_gate_confirmed_$uid';
-
   @override
   void initState() {
     super.initState();
@@ -63,8 +59,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
     // launch — only re-verify when local identity is no longer present
     // (which is the only case that requires a restore or fresh setup).
     try {
-      final confirmed =
-          await _secureStorage.read(key: _confirmedKey(uid));
+      final confirmed = null;
       if (confirmed == 'true') {
         final hasLocal = await e2ee.hasLocalIdentity();
         if (hasLocal) {
@@ -74,7 +69,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
           return;
         }
         // Local identity is gone (reinstall) — fall through to full check.
-        await _secureStorage.delete(key: _confirmedKey(uid));
+        // No-op: confirmation marker disabled (we require PIN unlock per login).
       }
     } catch (_) {
       // Secure-storage read errors are non-fatal; fall through to full check.
@@ -88,7 +83,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
       debugPrint('[SecureBackupGate] hasLocalIdentity error: $error');
     }
 
-    bool? hasRemote;
+    bool hasRemote;
     try {
       hasRemote = await e2ee.hasRemoteBackup();
     } catch (error) {
@@ -109,45 +104,33 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
 
     if (!mounted) return;
 
-    if (!hasLocal && hasRemote) {
-      // Fresh install, backup exists → MUST RESTORE
-      setState(() {
-        _needsRestore = true;
-        _isChecking = false;
-      });
-    } else if (hasLocal && !hasRemote) {
-      // Local identity exists, no backup → MUST SETUP PIN
-      setState(() {
-        _needsSetup = true;
-        _isChecking = false;
-      });
-    } else if (!hasLocal && !hasRemote) {
-      // Completely fresh → bootstrap identity, then MUST SETUP PIN
-      try {
-        await e2ee.ensureReady();
-      } catch (_) {}
-      if (mounted) {
+    if (hasRemote) {
+      if (!_unlockedThisSession) {
         setState(() {
-          _needsSetup = true;
+          _needsRestore = true;
           _isChecking = false;
         });
+        return;
       }
-    } else {
-      // Local identity AND remote backup both present → all good
+      unawaited(e2ee.ensureReady());
+      setState(() => _isChecking = false);
+      return;
+    }
+
+    // No remote backup configured: ensure we have a local identity (so the setup
+    // screen can immediately back up the generated keys), then require setup.
+    if (!hasLocal) {
       try {
         await e2ee.ensureReady();
-        await _markConfirmed(uid);
       } catch (_) {}
-      if (mounted) {
-        setState(() => _isChecking = false);
-      }
+    } else {
+      unawaited(e2ee.ensureReady());
     }
-  }
 
-  Future<void> _markConfirmed(String uid) async {
-    try {
-      await _secureStorage.write(key: _confirmedKey(uid), value: 'true');
-    } catch (_) {}
+    setState(() {
+      _needsSetup = true;
+      _isChecking = false;
+    });
   }
 
   @override
@@ -221,8 +204,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
         canPop: false,
         child: SecureBackupRestoreScreen(
           onRestoreComplete: () async {
-            final uid = FirebaseAuth.instance.currentUser?.uid;
-            if (uid != null) await _markConfirmed(uid);
+            _unlockedThisSession = true;
             setState(() {
               _needsRestore = false;
               _isChecking = true;
@@ -231,6 +213,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
           },
           onEmailResetComplete: () {
             if (!mounted) return;
+            _unlockedThisSession = true;
             setState(() {
               _needsRestore = false;
               _isChecking = true;
@@ -246,8 +229,7 @@ class _SecureBackupGateState extends State<SecureBackupGate> {
         canPop: false,
         child: SecureBackupSetupScreen(
           onSetupComplete: () async {
-            final uid = FirebaseAuth.instance.currentUser?.uid;
-            if (uid != null) await _markConfirmed(uid);
+            _unlockedThisSession = true;
             setState(() {
               _needsSetup = false;
               _isChecking = true;
