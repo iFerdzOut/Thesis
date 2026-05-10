@@ -1,8 +1,7 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+﻿import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import '../services/auth_service.dart';
-import '../services/e2ee_service.dart';
+import '../services/auth/auth_service.dart';
 import 'register_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -92,22 +91,6 @@ class _LoginScreenState extends State<LoginScreen> {
         }, SetOptions(merge: true));
       }
 
-      // FIX: await the full E2EE bootstrap so sessions and device keys are
-      // restored before the user opens a chat. The old code used
-      // scheduleAutomaticAccountBootstrap() which is fire-and-forget and
-      // races with chat open, causing decryption failures on login.
-      // bootstrapIfNeeded() is idempotent — safe to call on every login.
-      try {
-        await E2eeService().bootstrapIfNeeded(
-          accountPassword: password,
-          syncRemote: true,
-        );
-      } catch (e) {
-        // Non-fatal: if bootstrap fails here (e.g. offline), the app will
-        // retry automatically on next launch via
-        // scheduleAutomaticAccountBootstrapIfPossible(). Log for diagnostics.
-        debugPrint('[LoginScreen] E2EE bootstrap warning (non-fatal): $e');
-      }
 
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);

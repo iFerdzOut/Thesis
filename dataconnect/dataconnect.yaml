@@ -1,12 +1,12 @@
 specVersion: "v1"
-serviceId: "thesis"
+serviceId: "shimishing-shield-ph-service"
 location: "asia-southeast1"
 schemaValidation: "COMPATIBLE"
 schema:
   source: "./schema"
   datasource:
     postgresql:
-      database: "fdcdb"
+      database: "shimishing-shield-ph-database"
       cloudSql:
-        instanceId: "thesis-fdc"
+        instanceId: "shimishing-shield-ph-instance"
 connectorDirs: ["./connector"]

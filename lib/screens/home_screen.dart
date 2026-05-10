@@ -1,10 +1,10 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../services/chat_notification_service.dart';
-import '../services/friend_request_notification_service.dart';
-import '../services/online_chat_service.dart';
+import '../services/chat/chat_notification_service.dart';
+import '../services/notifications/friend_request_notification_service.dart';
+import '../services/chat/online_chat_service.dart';
 import 'dashboard_screen.dart';
 import 'online_auth_prompt_screen.dart';
 import 'online_chat_screen.dart';

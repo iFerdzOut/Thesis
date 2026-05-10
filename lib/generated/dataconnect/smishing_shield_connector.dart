@@ -27,7 +27,7 @@ class SmishingShieldConnectorConnector {
   static ConnectorConfig connectorConfig = ConnectorConfig(
     'asia-southeast1',
     'smishing-shield-connector',
-    'thesis',
+    'shimishing-shield-ph-service',
   );
 
   SmishingShieldConnectorConnector({required this.dataConnect});

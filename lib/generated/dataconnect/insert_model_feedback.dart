@@ -1,3 +1,4 @@
+// ignore_for_file: non_constant_identifier_names
 part of 'smishing_shield_connector.dart';
 
 class InsertModelFeedbackVariablesBuilder {

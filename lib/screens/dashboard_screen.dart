@@ -1,9 +1,8 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+﻿import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import '../services/sms_storage_service.dart';
-import '../services/sms_background_worker.dart';
-import '../feedback_local_db.dart';
+import '../services/sms/sms_storage_service.dart';
+import '../services/feedback/feedback_local_db.dart';
 import 'contribution_hub_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -29,8 +28,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _feedbackStatsFuture = FeedbackLocalDb.getFeedbackCounts();
     });
 
-    // TEMPORARY TEST: Force background worker to scan immediately
-    SmsBackgroundWorker.triggerImmediateScanTest();
   }
 
   @override
@@ -59,15 +56,32 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 .collection('quarantine')
                 .snapshots(),
         builder: (context, quarantineSnap) {
-          final int onlineQuarantined = quarantineSnap.hasData
-              ? quarantineSnap.data!.docs.length
-              : 0;
+          final remoteDocs = quarantineSnap.hasData
+              ? quarantineSnap.data!.docs
+              : const <QueryDocumentSnapshot>[];
+          final int onlineQuarantined = remoteDocs
+              .where((doc) {
+                final data = doc.data() as Map<String, dynamic>? ?? const {};
+                final source = data['source']?.toString() ?? '';
+                return source == 'online' || source == 'false_negative_online';
+              })
+              .length;
+          final int onlineModelFlagged = remoteDocs
+              .where((doc) {
+                final data = doc.data() as Map<String, dynamic>? ?? const {};
+                return data['source']?.toString() == 'online';
+              })
+              .length;
 
           return StreamBuilder<List<Map<String, dynamic>>>(
             stream: _smsStorageService.watchQuarantineMessages(),
             builder: (context, localQuarantineSnap) {
-              final int localQuarantined =
-                  localQuarantineSnap.data?.length ?? 0;
+              final localEntries =
+                  localQuarantineSnap.data ?? const <Map<String, dynamic>>[];
+              final int localQuarantined = localEntries.length;
+              final int localModelFlagged = localEntries
+                  .where((entry) => entry['source']?.toString() == 'sms')
+                  .length;
               final int quarantined = onlineQuarantined + localQuarantined;
 
               return FutureBuilder<Map<String, int>>(
@@ -76,7 +90,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               final stats = feedbackSnap.data ?? {};
               final falsePositives = stats['false_positive'] ?? 0;
               final falseNegatives = stats['false_negative'] ?? 0;
-              final confirmedSmishing = stats['confirmed_smishing'] ?? 0;
+              final confirmedSmishing = onlineModelFlagged + localModelFlagged;
               final totalFeedback =
                   falsePositives + falseNegatives + confirmedSmishing;
 
@@ -154,24 +168,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     value: confirmedSmishing.toString(),
                     icon: Icons.shield_outlined,
                     color: Colors.orange,
-                    subtitle: 'AI correctly flagged & user confirmed',
+                    subtitle: 'Threats flagged by the model',
                     fullWidth: true,
                   ),
 
                   const SizedBox(height: 24),
-
-                  if (totalFeedback > 0) ...[
-                    const Text('Detection Accuracy',
-                        style: TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 12),
-                    _AccuracyCard(
-                      confirmed: confirmedSmishing,
-                      falsePositives: falsePositives,
-                      falseNegatives: falseNegatives,
-                    ),
-                    const SizedBox(height: 24),
-                  ],
 
                   SizedBox(
                     width: double.infinity,
@@ -361,91 +362,6 @@ class _StatCard extends StatelessWidget {
                 ],
               ],
             ),
-    );
-  }
-}
-
-class _AccuracyCard extends StatelessWidget {
-  final int confirmed;
-  final int falsePositives;
-  final int falseNegatives;
-
-  const _AccuracyCard({
-    required this.confirmed,
-    required this.falsePositives,
-    required this.falseNegatives,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final total = confirmed + falsePositives + falseNegatives;
-    final accuracy = total == 0 ? 0.0 : confirmed / total;
-    final pct = (accuracy * 100).toStringAsFixed(1);
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        boxShadow: [
-          BoxShadow(
-            // FIX: withOpacity → withValues
-            color: Colors.black.withValues(alpha: 0.05),
-            blurRadius: 8,
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Text('$pct%',
-                  style: TextStyle(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: accuracy > 0.7
-                          ? const Color(0xFF075E54)
-                          : Colors.orange)),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Detection Accuracy',
-                        style: TextStyle(fontWeight: FontWeight.w600)),
-                    Text('Based on $total user feedback reports',
-                        style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade500)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: accuracy,
-              backgroundColor: Colors.grey.shade200,
-              valueColor: AlwaysStoppedAnimation<Color>(
-                accuracy > 0.7
-                    ? const Color(0xFF075E54)
-                    : Colors.orange,
-              ),
-              minHeight: 8,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'This data will be used to retrain the DistilBERT model '
-            'for improved Philippine smishing detection.',
-            style: TextStyle(
-                fontSize: 11, color: Colors.grey.shade500),
-          ),
-        ],
-      ),
     );
   }
 }

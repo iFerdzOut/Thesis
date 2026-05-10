@@ -1,8 +1,8 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+﻿import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 
-import '../services/contact_chat_service.dart';
-import '../services/online_chat_service.dart';
+import '../services/chat/contact_chat_service.dart';
+import '../services/chat/online_chat_service.dart';
 import '../widgets/user_avatar.dart';
 import 'chat_screen.dart';
 

@@ -1,10 +1,9 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+﻿import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
-import '../services/auth_service.dart';
-import '../services/device_contact_sync_service.dart';
-import '../services/e2ee_service.dart';
+import '../services/auth/auth_service.dart';
+import '../services/contacts/device_contact_sync_service.dart';
 import '../utils/password_validator.dart';
 import 'login_screen.dart';
 
@@ -151,13 +150,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
         }),
       ]);
 
-      // Navigate home immediately — E2EE bootstrap is expensive (PBKDF2 ×3 +
-      // RSA key generation + backup) and must NOT block the registration UI.
-      // scheduleAutomaticAccountBootstrap runs it in the background; the first
-      // chat open triggers ensureDeviceIdentity which waits for it to finish.
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);
-      E2eeService().scheduleAutomaticAccountBootstrap(accountPassword: password);
     } catch (e) {
       if (!mounted) return;
       final msg = _friendlyError(e);

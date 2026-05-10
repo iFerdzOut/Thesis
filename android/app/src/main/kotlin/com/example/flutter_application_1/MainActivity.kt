@@ -1333,12 +1333,25 @@ class MainActivity : FlutterActivity() {
         }
 
         try {
-            val targetType =
+            val requestedType =
                 if (speaker) AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
                 else AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-            val targetDevice = audioManager.availableCommunicationDevices.firstOrNull {
-                it.type == targetType
+
+            val availableDevices = audioManager.availableCommunicationDevices
+            var targetDevice = availableDevices.firstOrNull { it.type == requestedType }
+
+            // Some devices (tablets/emulators) have no earpiece. When the app tries
+            // to route to it, audio can appear "silent". Fall back to speaker.
+            if (targetDevice == null && !speaker) {
+                targetDevice =
+                    availableDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                try {
+                    @Suppress("DEPRECATION")
+                    audioManager.isSpeakerphoneOn = true
+                } catch (_: Exception) {
+                }
             }
+
             if (targetDevice != null) {
                 audioManager.setCommunicationDevice(targetDevice)
             }

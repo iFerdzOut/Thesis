@@ -1,8 +1,8 @@
-import 'dart:io';
+﻿import 'dart:io';
 
 import 'package:flutter/material.dart';
-import '../services/feedback_database_service.dart';
-import '../feedback_local_db.dart';
+import '../services/feedback/feedback_database_service.dart';
+import '../services/feedback/feedback_local_db.dart';
 
 class ContributionHubScreen extends StatefulWidget {
   const ContributionHubScreen({super.key});

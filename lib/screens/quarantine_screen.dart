@@ -1,15 +1,15 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
-import '../services/online_chat_service.dart';
-import '../services/feedback_service.dart';
-import '../services/quarantine_service.dart';
-import '../services/sms_storage_service.dart';
-import '../services/window_service.dart';
+import '../services/chat/online_chat_service.dart';
+import '../services/feedback/feedback_database_service.dart';
+import '../services/feedback/feedback_service.dart';
+import '../smishing_detection_pipeline/pipeline_service.dart';
+import '../services/sms/sms_storage_service.dart';
+import '../services/system/window_service.dart';
 import '../widgets/feedback_upload_consent_dialog.dart';
 
 class QuarantineScreen extends StatefulWidget {
@@ -20,12 +20,12 @@ class QuarantineScreen extends StatefulWidget {
 }
 
 class _QuarantineScreenState extends State<QuarantineScreen> {
-  static const Duration _holdToTrustDuration = Duration(seconds: 6);
+  static const Duration _trustCountdownDuration = Duration(seconds: 10);
 
   final OnlineChatService onlineChatService = OnlineChatService();
   final SmsStorageService smsStorageService = SmsStorageService();
   final FeedbackService feedbackService = FeedbackService();
-  final QuarantineService quarantineService = QuarantineService();
+  final UrlDefanger quarantineService = UrlDefanger();
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
   bool _selectionMode = false;
@@ -93,34 +93,66 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
     required List<Map<String, dynamic>> smsEntries,
     required List<QueryDocumentSnapshot<Map<String, dynamic>>> onlineDocs,
   }) {
-    final merged = <_VaultEntry>[
-      for (final entry in smsEntries)
-        _VaultEntry(
-          id: entry['id']?.toString() ?? '',
-          sender: entry['sender']?.toString() ?? 'Unknown',
-          message: entry['message']?.toString() ?? '',
-          source: entry['source']?.toString() ?? 'sms',
-          reportedAt: entry['reportedAt'] ?? entry['timestamp'],
-          isLocalSms: true,
-          raw: entry,
-        ),
-      for (final doc in onlineDocs)
-        _VaultEntry(
+    final mergedById = <String, _VaultEntry>{};
+
+    for (final entry in smsEntries) {
+      final id = entry['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      mergedById[id] = _VaultEntry(
+        id: id,
+        sender: entry['sender']?.toString() ?? 'Unknown',
+        message: entry['message']?.toString() ?? '',
+        source: entry['source']?.toString() ?? 'sms',
+        reportedAt: entry['reportedAt'] ?? entry['timestamp'],
+        isLocalSms: true,
+        raw: entry,
+      );
+    }
+
+    for (final doc in onlineDocs) {
+      final source = doc.data()['source']?.toString() ?? 'online';
+      mergedById.putIfAbsent(
+        doc.id,
+        () => _VaultEntry(
           id: doc.id,
           sender: doc.data()['sender']?.toString() ?? 'Unknown',
           message: doc.data()['message']?.toString() ?? '',
-          source: doc.data()['source']?.toString() ?? 'online',
-          reportedAt: doc.data()['reportedAt'],
-          isLocalSms: doc.data()['source']?.toString() == 'sms',
+          source: source,
+          reportedAt:
+              doc.data()['reportedAt'] ?? doc.data()['reportedAtClientMs'] ?? doc.data()['timestampMs'],
+          isLocalSms: _isSmsSource(source),
           raw: Map<String, dynamic>.from(doc.data()),
         ),
-    ]..sort((a, b) {
+      );
+    }
+
+    final merged = mergedById.values.toList(growable: false)
+      ..sort((a, b) {
         final aMs = _timestampMs(a.reportedAt);
         final bMs = _timestampMs(b.reportedAt);
         return bMs.compareTo(aMs);
       });
 
     return merged;
+  }
+
+  bool _isSmsSource(String source) {
+    return source == 'sms' || source == 'false_negative_sms';
+  }
+
+  bool _canMarkTrusted(_VaultEntry entry) {
+    return entry.source == 'sms' || entry.source == 'online';
+  }
+
+  String _feedbackStatusLabel(FeedbackUploadStatus status) {
+    switch (status) {
+      case FeedbackUploadStatus.uploaded:
+        return 'Uploaded to Firebase.';
+      case FeedbackUploadStatus.queued:
+        return 'Queued for Firebase retry.';
+      case FeedbackUploadStatus.disabled:
+        return 'Feedback upload is off in Settings.';
+    }
   }
 
   int _timestampMs(dynamic value) {
@@ -156,16 +188,23 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
 
   Future<void> _restoreEntry(_VaultEntry entry) async {
     await ensureFeedbackUploadPreference(context);
+    late final FeedbackUploadStatus uploadStatus;
     if (entry.isLocalSms) {
-      await feedbackService.markSmsFalsePositiveAndRestore(entry.id);
+      uploadStatus = await feedbackService.markSmsFalsePositiveAndRestore(
+        entry.id,
+      );
     } else {
-      await onlineChatService.removeFalsePositiveFromQuarantine(entry.id);
+      uploadStatus = await onlineChatService.removeFalsePositiveFromQuarantine(
+        entry.id,
+      );
     }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Message marked as trusted and restored.'),
-        backgroundColor: Color(0xFF075E54),
+      SnackBar(
+        content: Text(
+          'Message marked as trusted and restored. ${_feedbackStatusLabel(uploadStatus)}',
+        ),
+        backgroundColor: const Color(0xFF075E54),
       ),
     );
   }
@@ -173,6 +212,7 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
   Future<void> _deleteEntry(_VaultEntry entry) async {
     if (entry.isLocalSms) {
       await smsStorageService.deleteQuarantineMessage(entry.id);
+      await onlineChatService.removeSmsQuarantineMirror(entry.id);
     } else {
       await onlineChatService.deleteQuarantineMessage(entry.id);
     }
@@ -194,6 +234,9 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
 
     if (smsIds.isNotEmpty) {
       await smsStorageService.deleteQuarantineMessages(smsIds);
+      for (final id in smsIds) {
+        await onlineChatService.removeSmsQuarantineMirror(id);
+      }
     }
     for (final id in onlineIds) {
       await onlineChatService.deleteQuarantineMessage(id);
@@ -234,11 +277,12 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
     await onDelete();
   }
 
-  Future<void> _showFrictionDialog(_VaultEntry entry) async {
+  Future<void> _showTrustCountdownDialog(_VaultEntry entry) async {
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => _FrictionDialog(
+      builder: (_) => _TrustCountdownDialog(
+        countdown: _trustCountdownDuration,
         onConfirm: () => _restoreEntry(entry),
       ),
     );
@@ -271,6 +315,19 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
               ),
             ),
             const Divider(),
+            if (_canMarkTrusted(entry))
+              ListTile(
+                leading: const Icon(Icons.verified_user_outlined,
+                    color: Color(0xFF075E54)),
+                title: const Text('Mark as Trusted'),
+                subtitle: const Text(
+                  'Wait 10 seconds before restoring this message',
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showTrustCountdownDialog(entry);
+                },
+              ),
             ListTile(
               leading:
                   const Icon(Icons.delete_forever_outlined, color: Colors.red),
@@ -456,7 +513,6 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
           hasDefangedLinks: hasLink,
           selectionMode: _selectionMode,
           selected: selected,
-          holdDuration: _holdToTrustDuration,
           detectionReasons: detectionReasons,
           onTap: () {
             if (_selectionMode) {
@@ -465,7 +521,6 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
             }
             _showMessageOptions(entry);
           },
-          onHoldTrusted: () => _showFrictionDialog(entry),
         );
       },
     );
@@ -536,7 +591,7 @@ class _QuarantineScreenState extends State<QuarantineScreen> {
                 Expanded(
                   child: Text(
                     'Screenshots disabled • Links defanged • Copy disabled\n'
-                    'Tap for options. Hold 6 seconds only if you are sure the message is safe.\n'
+                    'Tap for options. Trusted restore is delayed by 10 seconds for safety.\n'
                     'Na-block ang screenshot at pag-copy para sa kaligtasan mo.',
                     style: TextStyle(
                       fontSize: 12,
@@ -583,10 +638,8 @@ class _QuarantineCard extends StatefulWidget {
   final bool hasDefangedLinks;
   final bool selectionMode;
   final bool selected;
-  final Duration holdDuration;
   final List<String> detectionReasons;
   final VoidCallback onTap;
-  final VoidCallback onHoldTrusted;
 
   const _QuarantineCard({
     super.key,
@@ -598,10 +651,8 @@ class _QuarantineCard extends StatefulWidget {
     required this.hasDefangedLinks,
     required this.selectionMode,
     required this.selected,
-    required this.holdDuration,
     required this.detectionReasons,
     required this.onTap,
-    required this.onHoldTrusted,
   });
 
   @override
@@ -609,46 +660,10 @@ class _QuarantineCard extends StatefulWidget {
 }
 
 class _QuarantineCardState extends State<_QuarantineCard> {
-  Timer? _holdTimer;
-  bool _holdTriggered = false;
-
-  void _startHold() {
-    if (widget.selectionMode) return;
-    _holdTriggered = false;
-    _holdTimer?.cancel();
-    _holdTimer = Timer(widget.holdDuration, () {
-      _holdTriggered = true;
-      HapticFeedback.mediumImpact();
-      widget.onHoldTrusted();
-    });
-  }
-
-  void _cancelHold() {
-    _holdTimer?.cancel();
-  }
-
-  void _handleRelease() {
-    final wasTriggered = _holdTriggered;
-    _cancelHold();
-    _holdTriggered = false;
-    if (!wasTriggered) {
-      widget.onTap();
-    }
-  }
-
-  @override
-  void dispose() {
-    _holdTimer?.cancel();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTapDown: (_) => _startHold(),
-      onTapUp: (_) => _handleRelease(),
-      onTapCancel: _cancelHold,
-      onVerticalDragStart: (_) => _cancelHold(),
+      onTap: widget.onTap,
       child: Card(
         margin: const EdgeInsets.symmetric(vertical: 6),
         shape: RoundedRectangleBorder(
@@ -796,7 +811,7 @@ class _QuarantineCardState extends State<_QuarantineCard> {
                   Text(
                     widget.selectionMode
                         ? 'Tap to select'
-                        : 'Tap for options • Hold 6s to trust',
+                        : 'Tap for options',
                     style: TextStyle(
                       fontSize: 10,
                       color: Colors.grey.shade400,
@@ -812,33 +827,42 @@ class _QuarantineCardState extends State<_QuarantineCard> {
   }
 }
 
-class _FrictionDialog extends StatefulWidget {
+class _TrustCountdownDialog extends StatefulWidget {
+  final Duration countdown;
   final Future<void> Function() onConfirm;
 
-  const _FrictionDialog({required this.onConfirm});
+  const _TrustCountdownDialog({
+    required this.countdown,
+    required this.onConfirm,
+  });
 
   @override
-  State<_FrictionDialog> createState() => _FrictionDialogState();
+  State<_TrustCountdownDialog> createState() => _TrustCountdownDialogState();
 }
 
-class _FrictionDialogState extends State<_FrictionDialog> {
-  final TextEditingController _textController = TextEditingController();
-  bool _typedCorrectly = false;
+class _TrustCountdownDialogState extends State<_TrustCountdownDialog> {
+  Timer? _timer;
+  late int _secondsRemaining;
   bool _submitting = false;
 
   @override
   void initState() {
     super.initState();
-    _textController.addListener(() {
-      setState(() {
-        _typedCorrectly = _textController.text.trim().toUpperCase() == 'TRUST';
-      });
+    _secondsRemaining = widget.countdown.inSeconds;
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      if (_secondsRemaining <= 1) {
+        timer.cancel();
+        setState(() => _secondsRemaining = 0);
+        return;
+      }
+      setState(() => _secondsRemaining--);
     });
   }
 
   @override
   void dispose() {
-    _textController.dispose();
+    _timer?.cancel();
     super.dispose();
   }
 
@@ -890,44 +914,31 @@ class _FrictionDialogState extends State<_FrictionDialog> {
               ),
             ),
             const SizedBox(height: 16),
-            const Text(
-              'Type TRUST below to confirm.\nI-type ang TRUST para magpatuloy.',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _textController,
-              textCapitalization: TextCapitalization.characters,
-              onSubmitted: (_) async {
-                if (_typedCorrectly && !_submitting) {
-                  setState(() => _submitting = true);
-                  Navigator.pop(context);
-                  await widget.onConfirm();
-                }
-              },
-              inputFormatters: [
-                TextInputFormatter.withFunction((oldValue, newValue) {
-                  if (newValue.text.length > oldValue.text.length + 1) {
-                    return oldValue;
-                  }
-                  return newValue;
-                }),
-              ],
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: _typedCorrectly
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: _secondsRemaining == 0
                     ? Colors.green.shade50
                     : Colors.grey.shade100,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(
-                    color:
-                        _typedCorrectly ? Colors.green : Colors.grey.shade300,
-                  ),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: _secondsRemaining == 0
+                      ? Colors.green
+                      : Colors.grey.shade300,
                 ),
-                suffixIcon: _typedCorrectly
-                    ? const Icon(Icons.check_circle, color: Colors.green)
-                    : null,
+              ),
+              child: Text(
+                _secondsRemaining == 0
+                    ? 'You can now mark this message as trusted.'
+                    : 'Please wait $_secondsRemaining second${_secondsRemaining == 1 ? '' : 's'} before restoring this message.',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: _secondsRemaining == 0
+                      ? Colors.green.shade800
+                      : Colors.grey.shade700,
+                ),
               ),
             ),
           ],
@@ -940,13 +951,13 @@ class _FrictionDialogState extends State<_FrictionDialog> {
         ),
         ElevatedButton(
           style: ElevatedButton.styleFrom(
-            backgroundColor: _typedCorrectly
+            backgroundColor: _secondsRemaining == 0
                 ? const Color(0xFF075E54)
                 : Colors.grey.shade300,
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           ),
-          onPressed: !_typedCorrectly || _submitting
+          onPressed: _secondsRemaining > 0 || _submitting
               ? null
               : () async {
                   setState(() => _submitting = true);
@@ -954,9 +965,12 @@ class _FrictionDialogState extends State<_FrictionDialog> {
                   await widget.onConfirm();
                 },
           child: Text(
-            _typedCorrectly ? 'Mark as Trusted' : 'Type TRUST',
+            _secondsRemaining == 0
+                ? 'Mark as Trusted'
+                : 'Wait ${_secondsRemaining}s',
             style: TextStyle(
-              color: _typedCorrectly ? Colors.white : Colors.grey.shade500,
+              color:
+                  _secondsRemaining == 0 ? Colors.white : Colors.grey.shade500,
               fontSize: 13,
             ),
           ),

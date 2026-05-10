@@ -4,8 +4,8 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:any_link_preview/any_link_preview.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
@@ -13,25 +13,23 @@ import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../models/message_model.dart';
+import '../models/ui_message_model.dart';
 import '../models/safety_status.dart';
-import '../models/decrypted_conversation_message.dart';
-import '../services/chat_encryption_repository.dart';
-import '../services/chat_notification_service.dart';
-import '../services/call_notification_service.dart';
-import '../services/cloudinary_service.dart';
-import '../services/device_contact_sync_service.dart';
-import '../services/e2ee_service.dart';
-import '../services/feedback_service.dart';
-import '../services/feedback_database_service.dart';
-import '../services/fcm_chat_service.dart';
-import '../services/media_service.dart';
-import '../services/online_chat_service.dart';
-import '../services/sms_service.dart';
-import '../services/sms_storage_service.dart';
-import '../services/trusted_domain_service.dart';
-import '../services/url_extraction_service.dart';
-import '../services/user_profile_service.dart';
+import '../services/chat/chat_notification_service.dart';
+import '../services/chat/contact_chat_service.dart';
+import '../services/call/call_notification_service.dart';
+import '../services/media/cloudinary_service.dart';
+import '../services/media/gif_search_service.dart';
+import '../services/contacts/device_contact_sync_service.dart';
+import '../services/feedback/feedback_database_service.dart';
+import '../services/feedback/feedback_service.dart';
+import '../services/chat/fcm_chat_service.dart';
+import '../services/media/media_service.dart';
+import '../services/chat/online_chat_service.dart';
+import '../services/sms/sms_service.dart';
+import '../services/sms/sms_storage_service.dart';
+import '../smishing_detection_pipeline/pipeline_service.dart';
+import '../services/auth/user_profile_service.dart';
 import '../widgets/feedback_upload_consent_dialog.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/user_avatar.dart';
@@ -75,25 +73,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final FocusNode _messageFocusNode = FocusNode();
   final MediaService mediaService = MediaService();
   final OnlineChatService onlineChatService = OnlineChatService();
+  final ContactChatService contactChatService = ContactChatService();
   final FcmChatService _fcmChatService = FcmChatService();
   final CloudinaryService _cloudinaryService = CloudinaryService();
+  final GifSearchService _gifSearchService = GifSearchService();
   final SmsStorageService _smsStorage = SmsStorageService();
   final FeedbackService _feedbackService = FeedbackService();
-  final E2eeService _e2eeService = E2eeService();
-  final ChatEncryptionRepository _chatEncryptionRepository =
-      ChatEncryptionRepository();
   final UserProfileService _userProfileService = UserProfileService();
-  final TrustedDomainService _trustedDomainService = TrustedDomainService();
-  final UrlExtractionService _urlExtractionService = UrlExtractionService();
+  final DomainAllowlist _trustedDomainService = DomainAllowlist();
+  final UrlExtractor _urlExtractionService = UrlExtractor();
   final Map<String, Future<_LinkMeta>> _linkPreviewCache =
       <String, Future<_LinkMeta>>{};
 
   static const int _maxFileSizeBytes = 25 * 1024 * 1024;
   static const Duration _externalLinkCountdown = Duration(seconds: 4);
+  static const Duration _typingDebounce = Duration(seconds: 2);
 
   Timer? _typingTimer;
+  Timer? _connectionBannerTimer;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   bool _isUploading = false;
   bool _isSendingMessage = false;
+  bool? _hasInternetConnection;
+  bool _showConnectedBanner = false;
+  bool _connectivityInitialized = false;
+  bool _hadConnectivityOutage = false;
   double _uploadProgress = 0.0;
   bool _initialBottomSnapDone = false;
   bool _autoScrollEnabled = true;
@@ -117,14 +121,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   String get currentUserId => FirebaseAuth.instance.currentUser?.uid ?? '';
   String get otherUserId => widget.receiverId ?? widget.phone;
   String? _lastRenderedMessageKey;
-  String? _lastConversationSnapshotSyncKey;
-  bool _didInitialConversationHistorySync = false;
   String? _cachedOnlineDocsKey;
   List<QueryDocumentSnapshot<Map<String, dynamic>>> _cachedOnlineDocs =
       const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
-  String? _cachedProjectionLookupKey;
-  _ConversationProjectionLookups _cachedProjectionLookups =
-      const _ConversationProjectionLookups.empty();
 
   String get _smsPeerPhone {
     final compact = widget.phone.trim().replaceAll(RegExp(r'[\s\-\(\)]'), '');
@@ -178,20 +177,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return 'This user is not accepting messages or calls from you right now.';
     }
     return '';
-  }
-
-  Future<void> _primeOnlineConversationSecurity() async {
-    if (widget.chatType != 'online' || otherUserId.isEmpty) {
-      return;
-    }
-    try {
-      await _e2eeService.ensureReady(syncRemote: false);
-      await _chatEncryptionRepository.prewarmConversation(otherUserId);
-    } catch (error) {
-      debugPrint(
-        '[ChatScreen] Failed to prewarm encrypted conversation for $otherUserId: $error',
-      );
-    }
   }
 
   Future<void> _refreshChatRelationship() async {
@@ -257,11 +242,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       unawaited(_loadSmsCapabilityState());
     } else {
       _onlineMessagesStream = onlineChatService.getMessages(otherUserId);
+      _startConnectivityMonitor();
       unawaited(_refreshChatRelationship());
-      unawaited(_primeOnlineConversationSecurity());
-      unawaited(
-        _chatEncryptionRepository.primeConversation(otherUserId: otherUserId),
-      );
       ChatNotificationService()
           .setActiveChat(onlineChatService.getChatId(otherUserId));
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -286,20 +268,108 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _messageFocusNode.dispose();
     _messageScrollController.dispose();
     _typingTimer?.cancel();
+    _connectionBannerTimer?.cancel();
+    _connectivitySubscription?.cancel();
     if (widget.chatType == 'online') {
       ChatNotificationService().setActiveChat(null);
-      onlineChatService.setTyping(otherUserId: otherUserId, isTyping: false);
+      unawaited(
+        onlineChatService.setTyping(otherUserId: otherUserId, isTyping: false),
+      );
     }
     super.dispose();
   }
 
+  void _startConnectivityMonitor() {
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen(_handleConnectivityChange);
+    unawaited(_checkInitialConnectivity());
+  }
+
+  Future<void> _checkInitialConnectivity() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      _setInitialConnectivityState(results);
+    } catch (error) {
+      debugPrint('[ChatScreen] Connectivity check failed: $error');
+    }
+  }
+
+  void _setInitialConnectivityState(List<ConnectivityResult> results) {
+    if (!mounted || widget.chatType != 'online') return;
+    final hasConnection = results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+    setState(() {
+      _hasInternetConnection = hasConnection;
+      _showConnectedBanner = false;
+      _connectivityInitialized = true;
+    });
+  }
+
+  void _handleConnectivityChange(List<ConnectivityResult> results) {
+    if (!mounted || widget.chatType != 'online') return;
+
+    final hasConnection = results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+    final previous = _hasInternetConnection;
+
+    if (!_connectivityInitialized) {
+      setState(() {
+        _hasInternetConnection = hasConnection;
+        _showConnectedBanner = false;
+        _connectivityInitialized = true;
+      });
+      return;
+    }
+
+    if (previous == hasConnection) {
+      return;
+    }
+
+    _connectionBannerTimer?.cancel();
+    setState(() {
+      _hasInternetConnection = hasConnection;
+      if (!hasConnection && previous == true) {
+        _hadConnectivityOutage = true;
+        _showConnectedBanner = false;
+      } else {
+        _showConnectedBanner = hasConnection && _hadConnectivityOutage;
+      }
+    });
+
+    if (!hasConnection) return;
+
+    _connectionBannerTimer = Timer(const Duration(milliseconds: 3500), () {
+      if (!mounted || _hasInternetConnection != true) return;
+      setState(() {
+        _showConnectedBanner = false;
+        _hadConnectivityOutage = false;
+      });
+    });
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && widget.chatType == 'sms') {
-      unawaited(_refreshSmsContactDisplayName());
-      unawaited(_loadSmsCapabilityState());
-      unawaited(SmsService.primeSmsThread(address: _smsPeerPhone, force: true));
-      unawaited(SmsService.scheduleInboxMaintenance());
+    if (widget.chatType == 'sms') {
+      if (state == AppLifecycleState.resumed) {
+        unawaited(_refreshSmsContactDisplayName());
+        unawaited(_loadSmsCapabilityState());
+        unawaited(
+            SmsService.primeSmsThread(address: _smsPeerPhone, force: true));
+        unawaited(SmsService.scheduleInboxMaintenance());
+      }
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.hidden) {
+      _typingTimer?.cancel();
+      unawaited(
+        onlineChatService.setTyping(otherUserId: otherUserId, isTyping: false),
+      );
     }
   }
 
@@ -466,7 +536,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ── Permissions ───────────────────────────────────────────────────────
+  // â”€â”€ Permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<bool> requestCallPermissions({required bool isVideo}) async {
     var micStatus = await Permission.microphone.status;
     if (!micStatus.isGranted) micStatus = await Permission.microphone.request();
@@ -506,7 +576,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return true;
   }
 
-  // ── Open URL ──────────────────────────────────────────────────────────
+  // â”€â”€ Open URL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<void> _openUrl(String url) async {
     final normalizedUrl = _normalizeUrl(url);
     final uri = Uri.parse(normalizedUrl);
@@ -691,6 +761,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               PopupMenuButton<_ChatMenuAction>(
                 icon: const Icon(Icons.more_vert, color: Colors.white),
                 color: const Color(0xFF122133),
+                iconColor: Colors.white,
                 onSelected: _handleChatMenuAction,
                 itemBuilder: (context) => <PopupMenuEntry<_ChatMenuAction>>[
                   PopupMenuItem<_ChatMenuAction>(
@@ -701,13 +772,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _notificationsMuted
                           ? 'Unmute notifications'
                           : 'Mute notifications',
+                      style: const TextStyle(color: Colors.white),
                     ),
                   ),
                   PopupMenuItem<_ChatMenuAction>(
                     value: _blockedByMe
                         ? _ChatMenuAction.unblockUser
                         : _ChatMenuAction.blockUser,
-                    child: Text(_blockedByMe ? 'Unblock user' : 'Block user'),
+                    child: Text(
+                      _blockedByMe ? 'Unblock user' : 'Block user',
+                      style: const TextStyle(color: Colors.white),
+                    ),
                   ),
                   PopupMenuItem<_ChatMenuAction>(
                     value: _manuallyUnread
@@ -715,6 +790,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         : _ChatMenuAction.markUnread,
                     child: Text(
                       _manuallyUnread ? 'Mark as read' : 'Mark as unread',
+                      style: const TextStyle(color: Colors.white),
                     ),
                   ),
                 ],
@@ -1030,71 +1106,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  String _buildConversationSnapshotSyncKey({
-    required List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-    required List<DocumentChange<Map<String, dynamic>>> docChanges,
-  }) {
-    final latestDoc = docs.isNotEmpty ? docs.first : null;
-    final latestTimestampMs = latestDoc == null
-        ? 0
-        : _extractBestMessageTime(latestDoc.data()).millisecondsSinceEpoch;
-    final changeSignature = docChanges.isEmpty
-        ? 'none'
-        : docChanges.map((change) {
-            final changedTimestampMs = _extractBestMessageTime(
-              change.doc.data() ?? const <String, dynamic>{},
-            ).millisecondsSinceEpoch;
-            return '${_documentChangeTypeKey(change.type)}:'
-                '${change.doc.id}:$changedTimestampMs';
-          }).join('|');
-    return '$otherUserId|${docs.length}|${latestDoc?.id ?? ''}|'
-        '$latestTimestampMs|$changeSignature';
-  }
-
-  void _scheduleConversationSnapshotSync({
-    required List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-    required List<DocumentChange<Map<String, dynamic>>> docChanges,
-  }) {
-    final syncKey = _buildConversationSnapshotSyncKey(
-      docs: docs,
-      docChanges: docChanges,
-    );
-    if (_lastConversationSnapshotSyncKey == syncKey) {
-      return;
-    }
-    _lastConversationSnapshotSyncKey = syncKey;
-
-    final incrementalChanges =
-        _didInitialConversationHistorySync ? docChanges : null;
-    _didInitialConversationHistorySync = true;
-
-    unawaited(
-      _syncConversationSnapshotGuarded(
-        docs: docs,
-        docChanges: incrementalChanges,
-      ),
-    );
-  }
-
-  Future<void> _syncConversationSnapshotGuarded({
-    required List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-    required List<DocumentChange<Map<String, dynamic>>>? docChanges,
-  }) async {
-    try {
-      await _e2eeService.ensureReady(syncRemote: false);
-      await _chatEncryptionRepository.syncConversationSnapshot(
-        otherUserId: otherUserId,
-        docs: docs,
-        docChanges: docChanges,
-      );
-    } catch (error) {
-      debugPrint(
-        '[ChatScreen] Deferred conversation snapshot sync failed for '
-        '$otherUserId: $error',
-      );
-    }
-  }
-
   String _buildOnlineDocsCacheKey(
     QuerySnapshot<Map<String, dynamic>> snapshot,
   ) {
@@ -1145,99 +1156,61 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return docs;
   }
 
-  _ConversationProjectionLookups _resolveProjectionLookups(
-    List<DecryptedConversationMessage> projections,
-  ) {
-    final cacheKey = projections.isEmpty
-        ? 'empty'
-        : Object.hashAll(
-            projections.map(
-              (projection) => '${projection.messageId ?? ''}|'
-                  '${projection.clientMessageId ?? ''}|'
-                  '${projection.messageKey}|'
-                  '${projection.decryptionStatus.value}|'
-                  '${projection.timestamp.millisecondsSinceEpoch}|'
-                  '${projection.isDeleted ? 1 : 0}',
-            ),
-          ).toString();
-    if (_cachedProjectionLookupKey == cacheKey) {
-      return _cachedProjectionLookups;
-    }
-
-    final byMessageId = <String, DecryptedConversationMessage>{
-      for (final projection in projections)
-        if ((projection.messageId ?? '').isNotEmpty)
-          projection.messageId!: projection,
-    };
-    final byClientMessageId = <String, DecryptedConversationMessage>{
-      for (final projection in projections)
-        if ((projection.clientMessageId ?? '').isNotEmpty)
-          projection.clientMessageId!: projection,
-    };
-    final byCacheKey = <String, DecryptedConversationMessage>{
-      for (final projection in projections)
-        if (projection.messageKey.trim().isNotEmpty)
-          projection.messageKey.trim(): projection,
-    };
-
-    _cachedProjectionLookupKey = cacheKey;
-    _cachedProjectionLookups = _ConversationProjectionLookups(
-      byMessageId: byMessageId,
-      byClientMessageId: byClientMessageId,
-      byCacheKey: byCacheKey,
-    );
-    return _cachedProjectionLookups;
-  }
-
-  bool _looksEncryptedTextMessage(
-    Map<String, dynamic> data,
-    DecryptedConversationMessage? projection,
-  ) {
-    final type = (data['type'] ?? data['messageType'] ?? '')
-        .toString()
-        .trim()
-        .toLowerCase();
-    final hasCipherText = <String>[
-      'cipherText',
-      'ciphertext',
-      'encryptedPayload',
-      'encryptedText',
-      'encrypted_payload',
-      'cipher',
-    ].any((key) => data[key]?.toString().trim().isNotEmpty ?? false);
-
-    if (projection != null &&
-        projection.messageType == 'text' &&
-        projection.cipherTextPresent &&
-        (hasCipherText ||
-            data['e2ee'] == true ||
-            (projection.algorithm?.trim().isNotEmpty ?? false))) {
-      return true;
-    }
-
-    final maybeTextType = type.isEmpty ||
-        type == 'text' ||
-        type == 'encrypted_text' ||
-        type == 'message';
-    return maybeTextType && data['e2ee'] == true && hasCipherText;
-  }
-
   void onTyping() {
     if (widget.chatType != 'online' || !_messageFocusNode.hasFocus) return;
-    onlineChatService.setTyping(otherUserId: otherUserId, isTyping: true);
+    final hasText = messageController.text.trim().isNotEmpty;
+    _typingTimer?.cancel();
+
+    unawaited(
+      onlineChatService.setTyping(
+        otherUserId: otherUserId,
+        isTyping: hasText,
+      ),
+    );
+
+    if (!hasText) {
+      return;
+    }
+
+    _typingTimer = Timer(_typingDebounce, () {
+      if (!mounted) return;
+      unawaited(
+        onlineChatService.setTyping(
+          otherUserId: otherUserId,
+          isTyping: false,
+        ),
+      );
+    });
   }
 
   void _handleComposerFocusChanged() {
     if (widget.chatType != 'online') {
       return;
     }
-    onlineChatService.setTyping(
-      otherUserId: otherUserId,
-      isTyping: _messageFocusNode.hasFocus,
+    if (!_messageFocusNode.hasFocus) {
+      _typingTimer?.cancel();
+    }
+    unawaited(
+      onlineChatService.setTyping(
+        otherUserId: otherUserId,
+        isTyping: _messageFocusNode.hasFocus &&
+            messageController.text.trim().isNotEmpty,
+      ),
     );
   }
 
-  // ── Send / Edit text message ──────────────────────────────────────────
+  String _feedbackStatusLabel(FeedbackUploadStatus status) {
+    switch (status) {
+      case FeedbackUploadStatus.uploaded:
+        return 'Uploaded to Firebase.';
+      case FeedbackUploadStatus.queued:
+        return 'Queued for Firebase retry.';
+      case FeedbackUploadStatus.disabled:
+        return 'Feedback upload is off in Settings.';
+    }
+  }
+
+  // â”€â”€ Send / Edit text message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
     if (text.isEmpty) {
@@ -1278,6 +1251,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     // --- Optimistic UI Updates ---
     messageController.clear();
+    _typingTimer?.cancel();
+    unawaited(
+      onlineChatService.setTyping(otherUserId: otherUserId, isTyping: false),
+    );
     _scrollToBottom(immediate: false);
 
     if (widget.chatType == 'sms') {
@@ -1345,7 +1322,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Camera ────────────────────────────────────────────────────────────
+  // â”€â”€ Camera â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<void> takePhoto() async {
     final file = await mediaService.takePhoto();
     if (file == null) return;
@@ -1377,7 +1354,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Send image from gallery ───────────────────────────────────────────
+  // â”€â”€ Send image from gallery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<void> sendImage() async {
     final file = await mediaService.pickImageFromGallery();
     if (file == null) return;
@@ -1422,18 +1399,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> sendGif() async {
-    if (!mounted) return;
-    FocusScope.of(context).requestFocus(_messageFocusNode);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Use your keyboard GIF button or paste a direct GIF link, then tap send.',
-        ),
+    if (widget.chatType != 'online') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('GIFs are available for online chat.')),
+      );
+      return;
+    }
+    if (_isConversationBlocked) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_blockedBannerText)),
+      );
+      return;
+    }
+
+    final selectedGif = await showModalBottomSheet<GifResult>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _surfaceColor,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
+      builder: (_) => _GifPickerSheet(gifSearchService: _gifSearchService),
     );
+    if (selectedGif == null) return;
+
+    try {
+      await _sendRemoteMediaUrlToFirestore(
+        mediaUrl: selectedGif.gifUrl,
+        type: 'gif',
+        fileName: 'giphy_${selectedGif.id}.gif',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Failed to send GIF: $e')));
+    }
   }
 
-  // ── Send file ─────────────────────────────────────────────────────────
+  // â”€â”€ Send file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Future<void> sendFile() async {
     final file = await mediaService.pickAnyFile();
     if (file == null) return;
@@ -1481,7 +1484,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Save media to Firestore ───────────────────────────────────────────
+  // â”€â”€ Save media to Firestore â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   bool _isImageFile(String path) {
     final lower = path.toLowerCase();
     return lower.endsWith('.jpg') ||
@@ -1544,8 +1547,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       'fileName': rawName,
       'fileSize': sizeLabel,
       'type': type,
-      'e2ee': false,
-      'e2eeMedia': false,
       'isSuspicious': false,
       'isReported': false,
       'isRead': false,
@@ -1563,7 +1564,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         'text': uploadResult.url,
         'type': type,
         'fileName': rawName,
-        'e2ee': false,
       },
       lastMessageId: clientMessageId,
       activityClientMs: activityClientMs,
@@ -1614,8 +1614,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       'text': mediaUrl,
       'fileName': fileName,
       'type': type,
-      'e2ee': false,
-      'e2eeMedia': false,
       'isSuspicious': false,
       'isReported': false,
       'isRead': false,
@@ -1633,7 +1631,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         'text': mediaUrl,
         'type': type,
         'fileName': fileName,
-        'e2ee': false,
       },
       lastMessageId: clientMessageId,
       activityClientMs: activityClientMs,
@@ -1684,9 +1681,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (path.endsWith('.gif') || path.endsWith('.gifv')) {
       return true;
     }
-    if (host == 'media.tenor.com' || host.endsWith('.media.tenor.com')) {
-      return true;
-    }
     if ((host == 'media.giphy.com' || host.endsWith('.giphy.com')) &&
         (path.contains('/media/') || path.contains('giphy.gif'))) {
       return true;
@@ -1704,7 +1698,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return 'keyboard.gif';
   }
 
-  // ── Show attachment picker ────────────────────────────────────────────
+  // â”€â”€ Show attachment picker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   void _showAttachmentPicker() {
     showModalBottomSheet(
       context: context,
@@ -1812,30 +1806,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         const SnackBar(content: Text('Message deleted for you.')));
   }
 
-  void ignoreWarning() {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Warning ignored.')));
-  }
-
   Future<void> reportLocalMessage(MessageModel msg) async {
     try {
       await ensureFeedbackUploadPreference(context);
 
-      // Buffer the anonymized report in SQLite (Confirmed Smishing)
-      final feedbackDbService = FeedbackDatabaseService();
-      await feedbackDbService.saveConfirmedSmishing(
-        message: msg.text,
-        source: 'sms',
-        sender: _smsPeerPhone,
-      );
-
-      await _feedbackService.reportSmsMessageAsSmishing(
+      final uploadStatus = await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
       );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Message reported to quarantine.')));
+        SnackBar(
+          content: Text(
+            'Message reported to quarantine. ${_feedbackStatusLabel(uploadStatus)}',
+          ),
+        ),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context)
@@ -1851,15 +1837,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     try {
       await ensureFeedbackUploadPreference(context);
 
-      // Buffer the anonymized report in SQLite (Confirmed Smishing)
-      final feedbackDbService = FeedbackDatabaseService();
-      await feedbackDbService.saveConfirmedSmishing(
-        message: messageText,
-        source: 'online',
-        sender: otherUserId,
-      );
-
-      await onlineChatService.reportMessageToQuarantine(
+      final uploadStatus = await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
         source: 'online',
@@ -1867,7 +1845,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Message reported to quarantine.')));
+        SnackBar(
+          content: Text(
+            'Message reported to quarantine. ${_feedbackStatusLabel(uploadStatus)}',
+          ),
+        ),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context)
@@ -1879,23 +1862,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     try {
       await ensureFeedbackUploadPreference(context);
 
-      // Rule 4: Buffer the anonymized report in SQLite (False Negative)
-      final feedbackDbService = FeedbackDatabaseService();
-      await feedbackDbService.saveFalseNegative(
-        message: msg.text,
-        source: 'sms',
-        sender: _smsPeerPhone,
-      );
-
-      await _feedbackService.reportSmsMessageAsSmishing(
+      final uploadStatus = await _feedbackService.reportSmsMessageAsSmishing(
         peer: _smsPeerPhone,
         message: msg,
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('Reported as smishing. Thank you!'),
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+          'Reported as smishing. ${_feedbackStatusLabel(uploadStatus)}',
+        ),
         backgroundColor: Colors.red,
-        duration: Duration(seconds: 3),
+        duration: const Duration(seconds: 3),
       ));
     } catch (e) {
       if (!mounted) return;
@@ -1912,25 +1889,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     try {
       await ensureFeedbackUploadPreference(context);
 
-      // Rule 4: Buffer the anonymized report in SQLite (False Negative)
-      final feedbackDbService = FeedbackDatabaseService();
-      await feedbackDbService.saveFalseNegative(
-        message: messageText,
-        source: 'online',
-        sender: otherUserId,
-      );
-
-      await onlineChatService.reportMessageToQuarantine(
+      final uploadStatus = await onlineChatService.reportMessageToQuarantine(
         sender: _displayName,
         message: messageText,
         source: 'false_negative_online',
         messageDocPath: docPath,
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('Reported as smishing. Thank you!'),
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+          'Reported as smishing. ${_feedbackStatusLabel(uploadStatus)}',
+        ),
         backgroundColor: Colors.red,
-        duration: Duration(seconds: 3),
+        duration: const Duration(seconds: 3),
       ));
     } catch (e) {
       if (!mounted) return;
@@ -1939,22 +1910,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Local message options (SMS) ───────────────────────────────────────
+  // â”€â”€ Local message options (SMS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   void showLocalMessageOptions(MessageModel msg) {
-    final bool flagged =
-        msg.safetyStatus == SafetyStatus.malicious || msg.isSuspicious;
     final bool scanning = msg.safetyStatus == SafetyStatus.scanning;
-    final urls = _urlExtractionService.extractUrls(msg.text);
     showModalBottomSheet(
       context: context,
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (_) => SafeArea(
         child: Wrap(children: [
-          if (!flagged && !scanning && msg.text.trim().isNotEmpty)
+          if (!scanning && msg.text.trim().isNotEmpty)
             ListTile(
               leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('Copy Message'),
+              title: const Text('Copy'),
               onTap: () async {
                 Navigator.pop(context);
                 await _copyText(
@@ -1963,76 +1931,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 );
               },
             ),
-          if (!flagged && !scanning && urls.isNotEmpty)
+          if (!scanning)
             ListTile(
-              leading: Icon(
-                _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? Icons.open_in_new
-                    : Icons.shield_outlined,
-                color: _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? const Color(0xFF075E54)
-                    : Colors.orange,
-              ),
-              title: Text(
-                _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? 'Open Link'
-                    : 'Security Check Before Opening',
-              ),
-              subtitle: Text(urls.first,
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
-              onTap: () async {
-                Navigator.pop(context);
-                await _openLegitLink(urls.first);
-              },
-            ),
-          if (flagged)
-            ListTile(
-              leading: const Icon(Icons.lock_outline, color: Colors.orange),
-              title: const Text('View in Quarantine Vault'),
+              leading: const Icon(Icons.delete_outline, color: Colors.red),
+              title: const Text('Delete'),
               onTap: () {
                 Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const QuarantineScreen()),
-                );
+                unawaited(deleteLocalMessage(msg));
               },
             ),
-          if (!flagged && msg.isSuspicious)
-            ListTile(
-              leading:
-                  const Icon(Icons.report_gmailerrorred, color: Colors.orange),
-              title: const Text('Report to Quarantine'),
-              onTap: () {
-                Navigator.pop(context);
-                reportLocalMessage(msg);
-              },
-            ),
-          if (!flagged && !scanning && !msg.isSuspicious)
+          if (!scanning)
             ListTile(
               leading:
                   const Icon(Icons.warning_amber_rounded, color: Colors.red),
-              title: const Text('Report as Smishing'),
+              title: const Text('Report as Smishing/Spam'),
               onTap: () {
                 Navigator.pop(context);
-                reportFalseNegativeLocal(msg);
+                if (msg.isSuspicious) {
+                  reportLocalMessage(msg);
+                } else {
+                  reportFalseNegativeLocal(msg);
+                }
               },
             ),
-          if (!flagged && !scanning)
-            ListTile(
-              leading: const Icon(Icons.visibility_off_outlined),
-              title: const Text('Ignore Warning'),
-              onTap: () {
-                Navigator.pop(context);
-                ignoreWarning();
-              },
-            ),
-          ListTile(
-            leading: const Icon(Icons.delete_outline, color: Colors.red),
-            title: const Text('Delete for Me'),
-            onTap: () {
-              Navigator.pop(context);
-              unawaited(deleteLocalMessage(msg));
-            },
-          ),
           ListTile(
             leading: const Icon(Icons.close),
             title: const Text('Cancel'),
@@ -2043,19 +1964,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ── Online message options ────────────────────────────────────────────
+  // â”€â”€ Online message options â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   void showOnlineMessageOptions(Map<String, dynamic> msg) {
     final isMe = msg['isMe'] == true;
     final msgId = msg['messageId'] ?? '';
     final msgText = msg['text'] ?? '';
-    final msgType = msg['type'] ?? 'text';
-    final editCount = msg['editCount'] as int? ?? 0;
     final isDeleted = msg['isDeleted'] == true;
     final bool flagged = msg['isSuspicious'] == true;
     final safetyStatus =
         SafetyStatus.fromValue(msg['safetyStatus']?.toString());
     final scanning = safetyStatus == SafetyStatus.scanning;
-    final urls = _urlExtractionService.extractUrls(msgText);
 
     showModalBottomSheet(
       context: context,
@@ -2063,21 +1981,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (_) => SafeArea(
         child: Wrap(children: [
-          if (flagged && !isDeleted)
+          if (!flagged &&
+              !scanning &&
+              !isDeleted &&
+              msgText.toString().trim().isNotEmpty)
             ListTile(
-              leading: const Icon(Icons.lock_outline, color: Colors.orange),
-              title: const Text('View in Quarantine Vault'),
+              leading: const Icon(Icons.forward_outlined),
+              title: const Text('Forward'),
               onTap: () {
                 Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const QuarantineScreen()),
-                );
+                unawaited(_showForwardMessageSheet(msg));
               },
             ),
           if (!flagged && !isDeleted && msgText.toString().trim().isNotEmpty)
             ListTile(
               leading: const Icon(Icons.copy_all_outlined),
-              title: const Text('Copy Message'),
+              title: const Text('Copy'),
               onTap: () async {
                 Navigator.pop(context);
                 await _copyText(
@@ -2086,52 +2005,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 );
               },
             ),
-          if (!flagged && !isDeleted && urls.isNotEmpty)
-            ListTile(
-              leading: Icon(
-                _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? Icons.open_in_new
-                    : Icons.shield_outlined,
-                color: _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? const Color(0xFF075E54)
-                    : Colors.orange,
-              ),
-              title: Text(
-                _trustedDomainService.isUrlTrustedCached(urls.first)
-                    ? 'Open Link'
-                    : 'Security Check Before Opening',
-              ),
-              subtitle: Text(urls.first,
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
-              onTap: () async {
-                Navigator.pop(context);
-                await _openLegitLink(urls.first);
-              },
-            ),
-          if (!flagged &&
-              !scanning &&
-              isMe &&
-              msgType == 'text' &&
-              !isDeleted &&
-              editCount < 3)
-            ListTile(
-              leading:
-                  const Icon(Icons.edit_outlined, color: Color(0xFF075E54)),
-              title: const Text('Edit Message'),
-              subtitle: Text(
-                  'Can edit ${3 - editCount} more time${3 - editCount == 1 ? '' : 's'}'),
-              onTap: () {
-                Navigator.pop(context);
-                _startEditing(msgId, msgText, editCount);
-              },
-            ),
           if (!isDeleted)
             ListTile(
               leading: const Icon(Icons.delete_outline, color: Colors.red),
-              title: Text(isMe ? 'Delete for Everyone' : 'Delete for Me'),
-              subtitle: Text(isMe
-                  ? 'Replaces the message with “Message deleted” for both users'
-                  : 'Only removes from your view'),
+              title: const Text('Delete'),
               onTap: () {
                 Navigator.pop(context);
                 _confirmDeleteOnline(msgId, isMe);
@@ -2145,8 +2022,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ListTile(
               leading:
                   const Icon(Icons.warning_amber_rounded, color: Colors.red),
-              title: const Text('Report as Smishing'),
-              subtitle: const Text('AI missed this'),
+              title: const Text('Report as Smishing/Spam'),
               onTap: () {
                 Navigator.pop(context);
                 reportFalseNegativeOnline(msg);
@@ -2162,13 +2038,243 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  void _startEditing(String messageId, String currentText, int editCount) {
-    setState(() {
-      _editingMessageId = messageId;
-      _editingCount = editCount;
-      messageController.text = currentText;
-    });
-    FocusScope.of(context).requestFocus(FocusNode());
+  Future<List<_ForwardRecipient>> _loadForwardRecipients() async {
+    final snapshot = await contactChatService.getMyContacts().first;
+    final recipients = <_ForwardRecipient>[];
+    for (final doc in snapshot.docs) {
+      final rawData = doc.data();
+      if (rawData is! Map) continue;
+      final data = Map<String, dynamic>.from(rawData);
+      final uid = (data['uid'] ?? doc.id).toString().trim();
+      if (uid.isEmpty || uid == currentUserId || uid == otherUserId) continue;
+      final name = (data['name'] ?? data['displayName'] ?? data['email'] ?? uid)
+          .toString()
+          .trim();
+      recipients.add(_ForwardRecipient(
+        uid: uid,
+        name: name.isEmpty ? uid : name,
+        email: data['email']?.toString(),
+      ));
+    }
+    recipients.sort((a, b) => a.name.toLowerCase().compareTo(
+          b.name.toLowerCase(),
+        ));
+    return recipients;
+  }
+
+  Future<void> _showForwardMessageSheet(Map<String, dynamic> msg) async {
+    final selected = <String, _ForwardRecipient>{};
+    final recipientsFuture = _loadForwardRecipients();
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _surfaceColor,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          return SafeArea(
+            child: DraggableScrollableSheet(
+              expand: false,
+              initialChildSize: 0.68,
+              minChildSize: 0.42,
+              maxChildSize: 0.88,
+              builder: (context, scrollController) {
+                return FutureBuilder<List<_ForwardRecipient>>(
+                  future: recipientsFuture,
+                  builder: (context, snapshot) {
+                    final recipients =
+                        snapshot.data ?? const <_ForwardRecipient>[];
+                    return Column(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 4,
+                          margin: const EdgeInsets.only(top: 10, bottom: 14),
+                          decoration: BoxDecoration(
+                            color: Colors.white24,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 18),
+                          child: Row(
+                            children: [
+                              const Expanded(
+                                child: Text(
+                                  'Forward to',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                              Text(
+                                '${selected.length}/5',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Expanded(
+                          child: Builder(
+                            builder: (context) {
+                              if (snapshot.connectionState ==
+                                  ConnectionState.waiting) {
+                                return const Center(
+                                  child: CircularProgressIndicator(
+                                    color: Color(0xFF25D366),
+                                  ),
+                                );
+                              }
+                              if (snapshot.hasError) {
+                                return const Center(
+                                  child: Text(
+                                    'Could not load contacts.',
+                                    style: TextStyle(color: Colors.white70),
+                                  ),
+                                );
+                              }
+                              if (recipients.isEmpty) {
+                                return const Center(
+                                  child: Text(
+                                    'No other online contacts available.',
+                                    style: TextStyle(color: Colors.white70),
+                                  ),
+                                );
+                              }
+                              return ListView.builder(
+                                controller: scrollController,
+                                itemCount: recipients.length,
+                                itemBuilder: (context, index) {
+                                  final recipient = recipients[index];
+                                  final checked =
+                                      selected.containsKey(recipient.uid);
+                                  final disabled =
+                                      !checked && selected.length >= 5;
+                                  return CheckboxListTile(
+                                    value: checked,
+                                    activeColor: const Color(0xFF25D366),
+                                    checkColor: Colors.white,
+                                    onChanged: disabled
+                                        ? null
+                                        : (value) {
+                                            setSheetState(() {
+                                              if (value == true) {
+                                                selected[recipient.uid] =
+                                                    recipient;
+                                              } else {
+                                                selected.remove(recipient.uid);
+                                              }
+                                            });
+                                          },
+                                    secondary: UserAvatar(
+                                      name: recipient.name,
+                                      radius: 18,
+                                      backgroundColor: const Color(0xFF1A2737),
+                                      foregroundColor: Colors.white,
+                                    ),
+                                    title: Text(
+                                      recipient.name,
+                                      style:
+                                          const TextStyle(color: Colors.white),
+                                    ),
+                                    subtitle:
+                                        recipient.email?.trim().isNotEmpty ==
+                                                true
+                                            ? Text(
+                                                recipient.email!,
+                                                style: const TextStyle(
+                                                  color: Colors.white54,
+                                                ),
+                                              )
+                                            : null,
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.icon(
+                              onPressed: selected.isEmpty
+                                  ? null
+                                  : () {
+                                      final targets = selected.values
+                                          .toList(growable: false);
+                                      Navigator.pop(sheetContext);
+                                      unawaited(_forwardOnlineMessage(
+                                        msg: msg,
+                                        recipients: targets,
+                                      ));
+                                    },
+                              icon: const Icon(Icons.forward_outlined),
+                              label: Text(
+                                selected.isEmpty
+                                    ? 'Select recipients'
+                                    : 'Forward to ${selected.length}',
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                );
+              },
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _forwardOnlineMessage({
+    required Map<String, dynamic> msg,
+    required List<_ForwardRecipient> recipients,
+  }) async {
+    final text = msg['text']?.toString().trim() ?? '';
+    if (text.isEmpty || recipients.isEmpty) return;
+    final limitedRecipients = recipients.take(5).toList(growable: false);
+    final type = msg['type']?.toString() ?? 'text';
+    final fileName = msg['fileName']?.toString();
+
+    var sent = 0;
+    for (final recipient in limitedRecipients) {
+      try {
+        await onlineChatService.forwardMessage(
+          receiverId: recipient.uid,
+          receiverName: recipient.name,
+          text: text,
+          type: type,
+          fileName: fileName,
+        );
+        sent++;
+      } catch (error) {
+        debugPrint('[ChatScreen] Forward failed for ${recipient.uid}: $error');
+      }
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          sent == limitedRecipients.length
+              ? 'Forwarded to $sent ${sent == 1 ? "person" : "people"}'
+              : 'Forwarded to $sent of ${limitedRecipients.length} people',
+        ),
+      ),
+    );
   }
 
   void _cancelEditing() {
@@ -2179,7 +2285,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
-  // ── Confirm delete online message ─────────────────────────────────────
+  // â”€â”€ Confirm delete online message â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   void _confirmDeleteOnline(String messageId, bool isMe) {
     showDialog(
       context: context,
@@ -2217,6 +2323,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  bool _isTrustedRestoreData(Map<String, dynamic> data) {
+    return data['detectionDecision']?.toString() == 'allow_trusted' ||
+        data['detectionSource']?.toString() == 'trusted_restore' ||
+        data['trustedByReceiverId']?.toString() == currentUserId;
+  }
+
   String _formatLastSeen(dynamic timestamp) {
     if (timestamp == null) return 'Last seen recently';
     DateTime dt;
@@ -2249,12 +2361,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Widget _buildModeBanner({required bool isSms}) {
     final icon = isSms ? Icons.shield_moon_outlined : Icons.lock_outline;
-    final title = isSms ? 'SMS protection is active' : 'Encrypted online chat';
+    final title = isSms ? 'SMS protection is active' : 'Online chat is active';
     final subtitle = isSms
         ? (_smsCanSendFromApp
             ? 'This SMS thread is synced from the Android SMS provider. Suspicious SMS may be flagged or moved into quarantine.'
             : 'Limited mode: you can review synced SMS here, but reliable send/receive requires Smishing Shield PH to be the default SMS app.')
-        : 'Messages are delivered in real time with end-to-end encryption.';
+        : 'Messages are delivered in real time with anti-smishing protection.';
 
     return Container(
       width: double.infinity,
@@ -2316,6 +2428,69 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildConnectionBanner() {
+    final bool? connected = _hasInternetConnection;
+    if (widget.chatType != 'online' ||
+        connected == null ||
+        (!connected && !_hadConnectivityOutage) ||
+        (connected && !_showConnectedBanner)) {
+      return const SizedBox.shrink();
+    }
+
+    final Color color =
+        connected ? const Color(0xFF1FAE5B) : const Color(0xFFE53935);
+    final String text = connected ? 'Connected' : 'No internet connection';
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      child: Container(
+        key: ValueKey<String>(text),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        color: color,
+        alignment: Alignment.center,
+        child: Text(
+          text,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildForwardedIndicator({required bool isMe}) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: isMe ? 0 : 12,
+        right: isMe ? 12 : 0,
+        bottom: 3,
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.forward_outlined,
+            size: 13,
+            color: Colors.white54,
+          ),
+          SizedBox(width: 4),
+          Text(
+            'Forwarded message',
+            style: TextStyle(
+              color: Colors.white54,
+              fontSize: 11,
+              fontStyle: FontStyle.italic,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget buildSuspiciousWarningCard({
     required bool isSuspicious,
     required bool isMe,
@@ -2326,14 +2501,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }) {
     final bool showScanning = safetyStatus == SafetyStatus.scanning;
     if (!isSuspicious && !showScanning) return const SizedBox.shrink();
-    final double? clampedScore = riskScore?.clamp(0.0, 1.0);
-    final bool isHighRisk =
-        clampedScore == null ? safetyStatus == SafetyStatus.malicious : clampedScore >= 0.60;
     final String label = showScanning
-        ? 'Scanning link in the background. The message stays disabled until the worker finishes.'
-        : '${isHighRisk ? 'Malicious message detected' : 'Suspicious message flagged'}'
-            '${clampedScore != null ? ' (${(clampedScore * 100).toStringAsFixed(0)}%)' : ''}. '
-            'Links and copy actions are disabled.';
+        ? 'Screening the incoming message before it is shown.'
+        : 'Malicious content detected. This message might steal your information.';
     return Container(
       margin: EdgeInsets.only(
           left: isMe ? 60 : 10, right: isMe ? 10 : 60, bottom: 6),
@@ -2382,7 +2552,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               child: TextButton(
                 onPressed: onDeleteForMe,
                 child: const Text(
-                  'Delete for Me',
+                  'Delete it for me',
                   style: TextStyle(color: Color(0xFFFFB6B6)),
                 ),
               ),
@@ -2395,7 +2565,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               child: TextButton(
                 onPressed: onViewQuarantine,
                 child: const Text(
-                  'View in Quarantine Vault',
+                  'View on Quarantine Vault',
                   style: TextStyle(color: Color(0xFFFFC266)),
                 ),
               ),
@@ -2406,7 +2576,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ── Message content builder ───────────────────────────────────────────
+  // â”€â”€ Message content builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Widget buildMessageContent(MessageModel msg) {
     if (msg.type == 'deleted') {
       return Container(
@@ -2470,8 +2640,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
-    final blocked =
-        msg.isSuspicious || msg.safetyStatus == SafetyStatus.malicious;
+    final trustedRestore = msg.detectionDecision == 'allow_trusted' ||
+        msg.detectionSource == 'trusted_restore';
+    final blocked = !trustedRestore &&
+        (msg.isSuspicious || msg.safetyStatus == SafetyStatus.malicious);
     if (blocked) {
       return Container(
         constraints: BoxConstraints(
@@ -2479,50 +2651,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         decoration: BoxDecoration(
-          color: const Color(0xFF3A1818),
+          color: const Color(0xFF26161A),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
-            color: const Color(0xFFFF7A7A).withValues(alpha: 0.7),
+            color: const Color(0xFFFF7A7A).withValues(alpha: 0.45),
           ),
         ),
-        child: Column(
+        child: const Row(
           mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
-              children: [
-                Icon(Icons.warning_amber_rounded,
-                    size: 18, color: Color(0xFFFF8A8A)),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'Suspicious message hidden',
-                    style: TextStyle(
-                      color: Color(0xFFFFD0D0),
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              'A malicious or suspicious message was detected.',
-              style: TextStyle(color: Color(0xFFFFD0D0), fontSize: 12),
-            ),
-            const SizedBox(height: 6),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const QuarantineScreen()),
-                  );
-                },
-                child: const Text(
-                  'Open Quarantine Vault',
-                  style: TextStyle(color: Color(0xFFFFC266)),
-                ),
+            Icon(Icons.shield_outlined, size: 18, color: Color(0xFFFFB6B6)),
+            SizedBox(width: 10),
+            Text(
+              'Message hidden for safety',
+              style: TextStyle(
+                color: Color(0xFFFFD0D0),
+                fontWeight: FontWeight.w700,
               ),
             ),
           ],
@@ -2664,8 +2808,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
-    final isSafe =
-        !msg.isSuspicious && msg.safetyStatus == SafetyStatus.safe;
+    final isSafe = !msg.isSuspicious && msg.safetyStatus == SafetyStatus.safe;
     // primaryUrl/extractedUrls are only populated for SMS messages.
     // For online chat messages fall back to scanning the text directly.
     final inlineUrlRegex = RegExp(r'https?://[^\s]+', caseSensitive: false);
@@ -2705,10 +2848,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return _LinkMeta(domain: url);
     }
     final domain = uri.host.replaceAll('www.', '');
-    const timeout = Duration(seconds: 6);
+    const timeout = Duration(seconds: 2);
 
     try {
-      // TikTok oEmbed — returns real thumbnail_url without JS rendering.
+      // TikTok oEmbed â€” returns real thumbnail_url without JS rendering.
       if (domain.contains('tiktok.com')) {
         final res = await http.get(
           Uri.parse(
@@ -2726,7 +2869,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
       }
 
-      // YouTube oEmbed — returns real thumbnail_url.
+      // YouTube oEmbed â€” returns real thumbnail_url.
       if (domain.contains('youtube.com') || domain.contains('youtu.be')) {
         final res = await http.get(
           Uri.parse(
@@ -2742,22 +2885,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             domain: domain,
           );
         }
-      }
-
-      // Generic: use any_link_preview's metadata extraction (OG/Twitter/JSON-LD).
-      final meta = await AnyLinkPreview.getMetadata(
-        link: url,
-        cache: const Duration(days: 2),
-        userAgent:
-            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
-      ).timeout(timeout);
-      if (meta != null && meta.hasData) {
-        return _LinkMeta(
-          title: meta.title?.toString(),
-          description: meta.desc?.toString(),
-          imageUrl: meta.image?.toString(),
-          domain: domain,
-        );
       }
 
       // Generic: fetch HTML and parse og: meta tags.
@@ -2805,8 +2932,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           onTap: () => _openLegitLink(url),
           child: Container(
             constraints: BoxConstraints(maxWidth: maxWidth),
-            padding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
               color: const Color(0xFF1A2332),
               borderRadius: BorderRadius.circular(12),
@@ -2844,8 +2970,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (snap.connectionState != ConnectionState.done) {
             return Container(
               constraints: BoxConstraints(maxWidth: maxWidth),
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               decoration: BoxDecoration(
                 color: const Color(0xFF1A2332),
                 borderRadius: BorderRadius.circular(12),
@@ -2862,9 +2987,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                   ),
                   SizedBox(width: 8),
-                  Text('Loading preview…',
-                      style:
-                          TextStyle(color: Colors.white54, fontSize: 12)),
+                  Text('Loading previewâ€¦',
+                      style: TextStyle(color: Colors.white54, fontSize: 12)),
                 ],
               ),
             );
@@ -2942,7 +3066,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // ── Real SMS message list from Firestore ──────────────────────────────
+  // â”€â”€ Real SMS message list from Firestore â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   Widget buildSmsMessageList() {
     return StreamBuilder<List<Map<String, dynamic>>>(
       stream: _smsMessagesStream,
@@ -3008,9 +3132,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               final isOutgoing =
                   data['isOutgoing'] == true || data['sender'] == 'Me';
               final body = data['body'] ?? data['text'] ?? '';
-              final isSuspicious = data['isSuspicious'] ?? false;
-              final safetyStatus =
-                  SafetyStatus.fromValue(data['safetyStatus']?.toString());
+              final trustedRestore = _isTrustedRestoreData(data);
+              final isSuspicious =
+                  trustedRestore ? false : (data['isSuspicious'] ?? false);
+
+              final rawSafetyStatusStr = data['safetyStatus']?.toString();
+
+              // Protect UI rendering: if an incoming SMS hasn't been scanned by the pipeline
+              // yet (safetyStatus is null), force it into the 'scanning' state to hide the payload.
+              final bool isUnscannedIncoming = !isOutgoing &&
+                  !trustedRestore &&
+                  (rawSafetyStatusStr == null || rawSafetyStatusStr.isEmpty);
+
+              final safetyStatus = trustedRestore
+                  ? SafetyStatus.safe
+                  : (isUnscannedIncoming
+                      ? SafetyStatus.scanning
+                      : SafetyStatus.fromValue(rawSafetyStatusStr));
               final status = data['status']?.toString() ?? '';
 
               DateTime time = DateTime.now();
@@ -3052,7 +3190,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     .toList(),
                 primaryUrl: data['primaryUrl']?.toString(),
                 primaryDomain: data['primaryDomain']?.toString(),
-                needsRescan: data['needsRescan'] == true,
+                needsRescan:
+                    trustedRestore ? false : data['needsRescan'] == true,
                 safetyStatus: safetyStatus,
               );
 
@@ -3135,7 +3274,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget _buildOnlineMessageTile({
     required Map<String, dynamic> data,
     required DocumentSnapshot doc,
-    DecryptedConversationMessage? projection,
     required bool isMe,
     required String resolvedText,
     required bool suspicious,
@@ -3147,21 +3285,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required bool isEdited,
     required bool isDeleted,
     required bool hasPendingWrites,
+    required SafetyStatus safetyStatus,
     Widget? customContent,
   }) {
     final docPath = doc.reference.path;
-    final SafetyStatus safetyStatus =
-        projection?.safetyStatus ??
-        (suspicious ? SafetyStatus.malicious : SafetyStatus.safe);
-    final double? riskScore =
-        projection?.riskScore ?? (data['riskScore'] as num?)?.toDouble();
-    final bool effectiveSuspicious =
-        riskScore != null ? riskScore >= 0.60 : suspicious;
-    final e2eeIndicator = _buildE2eeIndicatorText(
-      data,
-      projection,
-      isMe: isMe,
-    );
+    final double? riskScore = (data['riskScore'] as num?)?.toDouble();
+    final bool trustedRestore = _isTrustedRestoreData(data);
+    final bool isForwarded = data['isForwarded'] == true;
+    final bool effectiveSuspicious = !isMe &&
+        !trustedRestore &&
+        (suspicious ||
+            safetyStatus == SafetyStatus.malicious ||
+            (riskScore != null && riskScore >= 0.60));
 
     final MessageModel tempMessage;
     if (isDeleted) {
@@ -3182,6 +3317,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         safetyStatus:
             effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
         filePath: null,
+        detectionDecision: data['detectionDecision']?.toString(),
+        detectionSource: data['detectionSource']?.toString(),
+        isForwarded: isForwarded,
       );
     } else if (type == 'file') {
       tempMessage = MessageModel(
@@ -3193,6 +3331,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         safetyStatus:
             effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
         filePath: resolvedText,
+        detectionDecision: data['detectionDecision']?.toString(),
+        detectionSource: data['detectionSource']?.toString(),
+        isForwarded: isForwarded,
       );
     } else {
       tempMessage = MessageModel(
@@ -3203,23 +3344,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         type: type,
         safetyStatus:
             effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
+        detectionDecision: data['detectionDecision']?.toString(),
+        detectionSource: data['detectionSource']?.toString(),
+        isForwarded: isForwarded,
       );
     }
 
     final onlineMsgMap = {
-      'text': type == 'text' ? resolvedText : '',
+      'text': resolvedText,
       'isMe': isMe,
       'time': formatTime(time),
       'isSuspicious': effectiveSuspicious,
       'type': type,
+      'fileName': fileName,
       'docPath': docPath,
       'messageId': doc.id,
       'editCount': editCount,
       'isDeleted': isDeleted,
       'riskScore': riskScore,
-      'safetyStatus': (effectiveSuspicious ? SafetyStatus.malicious : safetyStatus)
-          .value,
+      'isForwarded': isForwarded,
+      'safetyStatus':
+          (effectiveSuspicious ? SafetyStatus.malicious : safetyStatus).value,
     };
+    final messageContent = customContent ?? buildMessageContent(tempMessage);
 
     return RepaintBoundary(
       child: Column(
@@ -3229,10 +3376,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           GestureDetector(
             onLongPress: isDeleted ||
                     isCallSummary ||
-                    safetyStatus == SafetyStatus.scanning
+                    safetyStatus == SafetyStatus.scanning ||
+                    effectiveSuspicious
                 ? null
                 : () => showOnlineMessageOptions(onlineMsgMap),
-            child: customContent ?? buildMessageContent(tempMessage),
+            child: Column(
+              crossAxisAlignment:
+                  isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isForwarded && !isDeleted && !isCallSummary)
+                  _buildForwardedIndicator(isMe: isMe),
+                messageContent,
+              ],
+            ),
           ),
           if (!isDeleted && !isCallSummary)
             buildSuspiciousWarningCard(
@@ -3253,9 +3410,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _confirmDeleteOnline(doc.id, isMe);
                     }
                   : null,
-              safetyStatus: effectiveSuspicious
-                  ? SafetyStatus.malicious
-                  : safetyStatus,
+              safetyStatus:
+                  effectiveSuspicious ? SafetyStatus.malicious : safetyStatus,
             ),
           Padding(
             padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
@@ -3263,20 +3419,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               crossAxisAlignment:
                   isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               children: [
-                if (e2eeIndicator != null &&
-                    e2eeIndicator.trim().isNotEmpty &&
-                    !isCallSummary)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 2),
-                    child: Text(
-                      e2eeIndicator,
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: isMe ? Colors.white60 : Colors.grey.shade500,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
                 Row(
                   mainAxisAlignment:
                       isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
@@ -3297,7 +3439,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       formatTime(time),
                       style: const TextStyle(fontSize: 11, color: Colors.grey),
                     ),
-                    if (effectiveSuspicious && !isDeleted && !isCallSummary) ...[
+                    if (effectiveSuspicious &&
+                        !isDeleted &&
+                        !isCallSummary) ...[
                       const SizedBox(width: 6),
                       const Icon(
                         Icons.warning_amber_rounded,
@@ -3338,434 +3482,105 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildCachedProjectionList(
-    List<DecryptedConversationMessage> projections,
-  ) {
-    return NotificationListener<ScrollNotification>(
-      onNotification: _handleMessageScrollNotification,
-      child: ListView.builder(
-        key: PageStorageKey<String>('online_cached_thread_$otherUserId'),
-        controller: _messageScrollController,
-        reverse: true,
-        physics: const ClampingScrollPhysics(
-          parent: AlwaysScrollableScrollPhysics(),
-        ),
-        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-        cacheExtent: 460,
-        padding: const EdgeInsets.all(10),
-        itemCount: projections.length,
-        itemBuilder: (context, index) {
-          final projection = projections[index];
-          return RepaintBoundary(
-            child: _buildCachedProjectionTile(projection),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildCachedProjectionTile(DecryptedConversationMessage projection) {
-    final rawText = projection.decryptedText?.trim().isNotEmpty == true
-        ? projection.decryptedText!.trim()
-        : projection.previewText.trim();
-    final displayText = rawText.isNotEmpty
-        ? rawText
-        : _cachedProjectionFallbackLabel(projection.messageType);
-    final displayType = switch (projection.messageType) {
-      'deleted' => 'deleted',
-      'call_summary' => 'call_summary',
-      _ => 'text',
-    };
-    final message = MessageModel(
-      text: displayText,
-      isMe: projection.isOutgoing,
-      time: projection.timestamp,
-      isSuspicious: projection.isSuspicious,
-      type: displayType,
-      safetyStatus: projection.safetyStatus,
-      riskScore: projection.riskScore,
-    );
-    final e2eeIndicator = _buildE2eeIndicatorText(
-      <String, dynamic>{
-        'e2ee': projection.cipherTextPresent,
-        'cipherText': projection.cipherTextPresent ? 'cached' : '',
-        'e2eeAlgorithm': projection.algorithm,
-      },
-      projection,
-      isMe: projection.isOutgoing,
-    );
-
-    return Column(
-      crossAxisAlignment: projection.isOutgoing
-          ? CrossAxisAlignment.end
-          : CrossAxisAlignment.start,
-      children: [
-        buildMessageContent(message),
-        if (!projection.isDeleted && projection.messageType != 'call_summary')
-          buildSuspiciousWarningCard(
-            isSuspicious: projection.isSuspicious,
-            isMe: projection.isOutgoing,
-            riskScore: projection.riskScore,
-            onViewQuarantine: projection.isSuspicious
-                ? () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => const QuarantineScreen(),
-                      ),
-                    );
-                  }
-                : null,
-            safetyStatus: projection.safetyStatus,
-          ),
-        Padding(
-          padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
-          child: Column(
-            crossAxisAlignment: projection.isOutgoing
-                ? CrossAxisAlignment.end
-                : CrossAxisAlignment.start,
-            children: [
-              if (e2eeIndicator != null && e2eeIndicator.trim().isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 2),
-                  child: Text(
-                    e2eeIndicator,
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: projection.isOutgoing
-                          ? Colors.white60
-                          : Colors.grey.shade500,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    formatTime(projection.timestamp),
-                    style: const TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                  if (projection.isSuspicious &&
-                      !projection.isDeleted &&
-                      projection.messageType != 'call_summary') ...[
-                    const SizedBox(width: 6),
-                    const Icon(
-                      Icons.warning_amber_rounded,
-                      size: 14,
-                      color: Colors.orange,
-                    ),
-                  ],
-                ],
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  String _cachedProjectionFallbackLabel(String messageType) {
-    switch (messageType) {
-      case 'image':
-        return 'Photo';
-      case 'gif':
-        return 'GIF';
-      case 'file':
-        return 'File';
-      case 'call_summary':
-        return 'Call';
-      case 'deleted':
-        return 'Message deleted';
-      default:
-        return 'Encrypted message';
-    }
-  }
-
-  DecryptedConversationMessage? _resolveConversationProjection(
-    String messageId,
-    Map<String, dynamic> data,
-    Map<String, DecryptedConversationMessage> projectionsByMessageId,
-    Map<String, DecryptedConversationMessage> projectionsByClientMessageId,
-    Map<String, DecryptedConversationMessage> projectionsByCacheKey,
-  ) {
-    final byMessageId = projectionsByMessageId[messageId];
-    if (byMessageId != null) return byMessageId;
-
-    final clientMessageId = data['clientMessageId']?.toString().trim() ?? '';
-    if (clientMessageId.isNotEmpty) {
-      final byClientMessageId = projectionsByClientMessageId[clientMessageId];
-      if (byClientMessageId != null) return byClientMessageId;
-    }
-
-    final cacheKey = data['e2eeCacheKey']?.toString().trim() ?? '';
-    if (cacheKey.isNotEmpty) {
-      return projectionsByCacheKey[cacheKey];
-    }
-
-    return null;
-  }
-
-  String? _resolvedEncryptedThreadText(
-    Map<String, dynamic> data,
-    DecryptedConversationMessage? projection,
-  ) {
-    if (projection != null) {
-      switch (projection.decryptionStatus) {
-        case ConversationDecryptionStatus.success:
-          final text = projection.decryptedText?.trim() ?? '';
-          if (text.isNotEmpty) {
-            return text;
-          }
-          break;
-        case ConversationDecryptionStatus.failed:
-          return projection.failureReason?.trim().isNotEmpty == true
-              ? projection.failureReason!.trim()
-              : 'Unable to decrypt message';
-        case ConversationDecryptionStatus.pending:
-          return null;
-      }
-    }
-
-    final seededText = _e2eeService.getSeededDecryptedText(data);
-    if (seededText != null && seededText.trim().isNotEmpty) {
-      return seededText;
-    }
-
-    return null;
-  }
-
-  String? _buildE2eeIndicatorText(
-    Map<String, dynamic> data,
-    DecryptedConversationMessage? projection, {
-    required bool isMe,
-  }) {
-    final looksEncrypted = data['e2ee'] == true ||
-        data['e2eeMedia'] == true ||
-        projection?.cipherTextPresent == true ||
-        (data['cipherText']?.toString().trim().isNotEmpty ?? false);
-    if (!looksEncrypted) {
-      return null;
-    }
-
-    final projectionAlgorithm = projection?.algorithm?.trim() ?? '';
-    final dataAlgorithm = data['e2eeAlgorithm']?.toString().trim() ?? '';
-    final algorithm =
-        projectionAlgorithm.isNotEmpty ? projectionAlgorithm : dataAlgorithm;
-    if (algorithm.isEmpty) {
-      return isMe ? 'Sent: E2EE' : 'Received: E2EE';
-    }
-
-    final version = (data['e2eeProtocolVersion'] as num?)?.toInt() ??
-        (data['e2eeVersion'] as num?)?.toInt() ??
-        _extractVersionFromAlgorithm(algorithm);
-    final label = _friendlyE2eeLabel(algorithm: algorithm, version: version);
-    return isMe ? 'Sent: $label' : 'Received: $label';
-  }
-
-  int _extractVersionFromAlgorithm(String algorithm) {
-    final match = RegExp(r'v(\d+)$').firstMatch(algorithm.trim());
-    if (match == null) {
-      return 0;
-    }
-    return int.tryParse(match.group(1) ?? '') ?? 0;
-  }
-
-  String _friendlyE2eeLabel({
-    required String algorithm,
-    required int version,
-  }) {
-    final normalized = algorithm.trim().toLowerCase();
-    if (normalized.contains('rsa')) {
-      return 'RSA';
-    }
-    return 'E2EE';
-  }
-
-  Widget _buildDecryptingBubble({
-    required bool isMe,
-    required DateTime time,
-    String? e2eeIndicator,
-  }) {
-    return Column(
-      crossAxisAlignment:
-          isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: _surfaceElevatedColor,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: _outlineColor),
-          ),
-          child: const SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(
-              strokeWidth: 1.5,
-              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF25D366)),
-            ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.only(left: 10, right: 10, bottom: 6),
-          child: Column(
-            crossAxisAlignment:
-                isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-            children: [
-              if (e2eeIndicator != null && e2eeIndicator.trim().isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 2),
-                  child: Text(
-                    e2eeIndicator,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      color: Colors.white54,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-              Text(
-                formatTime(time),
-                style: const TextStyle(fontSize: 11, color: Colors.white38),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
   Widget buildOnlineMessageList() {
-    return StreamBuilder<List<DecryptedConversationMessage>>(
-      stream: _chatEncryptionRepository.watchConversation(
-        otherUserId: otherUserId,
-      ),
-      initialData: const <DecryptedConversationMessage>[],
-      builder: (context, projectionSnapshot) {
-        final projections =
-            projectionSnapshot.data ?? const <DecryptedConversationMessage>[];
-        final projectionLookups = _resolveProjectionLookups(projections);
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: _onlineMessagesStream,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return const Center(child: Text('Failed to load messages'));
+        }
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
 
-        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: _onlineMessagesStream,
-          builder: (context, snapshot) {
-            if (snapshot.hasError) {
-              if (projections.isNotEmpty) {
-                return _buildCachedProjectionList(projections);
-              }
-              return const Center(child: Text('Failed to load messages'));
-            }
-            if (!snapshot.hasData) {
-              if (projections.isNotEmpty) {
-                return _buildCachedProjectionList(projections);
-              }
-              return const Center(child: CircularProgressIndicator());
-            }
+        final docs = _resolveOnlineDocs(snapshot.data!);
+        if (docs.isNotEmpty) {
+          _scheduleScrollToLatest(docs.first.id, messageCount: docs.length);
+        }
 
-            final docs = _resolveOnlineDocs(snapshot.data!);
-            if (docs.isEmpty && projections.isNotEmpty) {
-              return _buildCachedProjectionList(projections);
-            }
+        return StreamBuilder<bool>(
+          stream: onlineChatService.getIsTyping(otherUserId: otherUserId),
+          builder: (context, typingSnap) {
+            final isTyping = typingSnap.data ?? false;
+            return NotificationListener<ScrollNotification>(
+              onNotification: _handleMessageScrollNotification,
+              child: ListView.builder(
+                key: PageStorageKey<String>('online_thread_$otherUserId'),
+                controller: _messageScrollController,
+                reverse: true,
+                physics: const ClampingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
+                cacheExtent: 460,
+                padding: const EdgeInsets.all(10),
+                itemCount: docs.length + (isTyping ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (isTyping && index == 0) {
+                    return const _TypingIndicatorBubble();
+                  }
+                  final doc = docs[isTyping ? index - 1 : index];
+                  final data = doc.data();
+                  final isMe = data['senderId'] == currentUserId;
+                  final text = data['text']?.toString() ?? '';
+                  final suspicious = data['isSuspicious'] ?? false;
+                  final rawType =
+                      (data['type'] ?? data['messageType'] ?? 'text')
+                          .toString();
+                  final type = rawType;
+                  final isCallSummary = type == 'call_summary';
+                  final time = _extractBestMessageTime(data);
+                  final fileName = data['fileName'] as String? ?? '';
+                  final editCount = data['editCount'] as int? ?? 0;
+                  final hasPendingWrites = doc.metadata.hasPendingWrites;
+                  final isEdited = editCount > 0;
+                  final isDeleted =
+                      data['isDeleted'] == true || type == 'deleted';
+                  final rawSafetyStatus =
+                      SafetyStatus.fromValue(data['safetyStatus']?.toString());
+                  final trustedRestore = _isTrustedRestoreData(data);
+                  final screenedForReceiverId =
+                      data['screenedForReceiverId']?.toString() ?? '';
+                  final safetyStatus = isMe
+                      ? SafetyStatus.safe
+                      : (!isDeleted &&
+                              type != 'call_summary' &&
+                              !trustedRestore &&
+                              screenedForReceiverId != currentUserId &&
+                              rawSafetyStatus != SafetyStatus.malicious
+                          ? SafetyStatus.scanning
+                          : (trustedRestore
+                              ? SafetyStatus.safe
+                              : rawSafetyStatus));
 
-            if (docs.isNotEmpty) {
-              _scheduleScrollToLatest(docs.first.id, messageCount: docs.length);
-            }
+                  var resolvedText = text;
+                  if (!isDeleted &&
+                      type == 'text' &&
+                      resolvedText.trim().isEmpty) {
+                    resolvedText = 'Message unavailable';
+                  }
 
-            _scheduleConversationSnapshotSync(
-              docs: docs,
-              docChanges: snapshot.data!.docChanges,
-            );
-
-            return StreamBuilder<bool>(
-              stream: onlineChatService.getIsTyping(otherUserId: otherUserId),
-              builder: (context, typingSnap) {
-                final isTyping = typingSnap.data ?? false;
-                return NotificationListener<ScrollNotification>(
-                  onNotification: _handleMessageScrollNotification,
-                  child: ListView.builder(
-                    key: PageStorageKey<String>('online_thread_$otherUserId'),
-                    controller: _messageScrollController,
-                    reverse: true,
-                    physics: const ClampingScrollPhysics(
-                      parent: AlwaysScrollableScrollPhysics(),
+                  return RepaintBoundary(
+                    child: _buildOnlineMessageTile(
+                      data: data,
+                      doc: doc,
+                      isMe: isMe,
+                      resolvedText: resolvedText,
+                      suspicious: suspicious,
+                      type: type,
+                      isCallSummary: isCallSummary,
+                      time: time,
+                      fileName: fileName,
+                      editCount: editCount,
+                      isEdited: isEdited,
+                      isDeleted: isDeleted,
+                      hasPendingWrites: hasPendingWrites,
+                      safetyStatus: safetyStatus,
                     ),
-                    keyboardDismissBehavior:
-                        ScrollViewKeyboardDismissBehavior.onDrag,
-                    cacheExtent: 460,
-                    padding: const EdgeInsets.all(10),
-                    itemCount: docs.length + (isTyping ? 1 : 0),
-                    itemBuilder: (context, index) {
-                      if (isTyping && index == 0) {
-                        return const _TypingIndicatorBubble();
-                      }
-                      final doc = docs[isTyping ? index - 1 : index];
-                      final data = doc.data();
-                      final projection = _resolveConversationProjection(
-                        doc.id,
-                        data,
-                        projectionLookups.byMessageId,
-                        projectionLookups.byClientMessageId,
-                        projectionLookups.byCacheKey,
-                      );
-                      final isMe = data['senderId'] == currentUserId;
-                      final text = data['text']?.toString() ?? '';
-                      final suspicious = data['isSuspicious'] ?? false;
-                      final type =
-                          (data['type'] ?? data['messageType'] ?? 'text')
-                              .toString();
-                      final isCallSummary = type == 'call_summary';
-                      final time = _extractBestMessageTime(data);
-                      final fileName = data['fileName'] as String? ?? '';
-                      final editCount = data['editCount'] as int? ?? 0;
-                      final hasPendingWrites = doc.metadata.hasPendingWrites;
-                      final isEdited = editCount > 0;
-                      final isDeleted =
-                          data['isDeleted'] == true || type == 'deleted';
-                      final isEncryptedText = !isDeleted &&
-                          _looksEncryptedTextMessage(data, projection);
-                      final resolvedText = isEncryptedText
-                          ? _resolvedEncryptedThreadText(data, projection)
-                          : text;
-                      final isDecrypting =
-                          isEncryptedText && resolvedText == null;
-
-                      if (isDecrypting) {
-                        final e2eeIndicator = _buildE2eeIndicatorText(
-                          data,
-                          projection,
-                          isMe: isMe,
-                        );
-                        return RepaintBoundary(
-                          child: _buildDecryptingBubble(
-                            isMe: isMe,
-                            time: time,
-                            e2eeIndicator: e2eeIndicator,
-                          ),
-                        );
-                      }
-
-                      return RepaintBoundary(
-                        child: _buildOnlineMessageTile(
-                          data: data,
-                          doc: doc,
-                          projection: projection,
-                          isMe: isMe,
-                          resolvedText: resolvedText ?? '',
-                          suspicious: suspicious,
-                          type: type,
-                          isCallSummary: isCallSummary,
-                          time: time,
-                          fileName: fileName,
-                          editCount: editCount,
-                          isEdited: isEdited,
-                          isDeleted: isDeleted,
-                          hasPendingWrites: hasPendingWrites,
-                        ),
-                      );
-                    },
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             );
           },
         );
@@ -3922,7 +3737,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
         child: Column(
           children: [
-            _buildModeBanner(isSms: isSms),
+            if (isSms) _buildModeBanner(isSms: isSms),
+            if (!isSms) _buildConnectionBanner(),
             Expanded(
               child: isSms ? buildLocalMessageList() : buildOnlineMessageList(),
             ),
@@ -4164,23 +3980,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 }
 
-class _ConversationProjectionLookups {
-  final Map<String, DecryptedConversationMessage> byMessageId;
-  final Map<String, DecryptedConversationMessage> byClientMessageId;
-  final Map<String, DecryptedConversationMessage> byCacheKey;
-
-  const _ConversationProjectionLookups({
-    required this.byMessageId,
-    required this.byClientMessageId,
-    required this.byCacheKey,
-  });
-
-  const _ConversationProjectionLookups.empty()
-      : byMessageId = const <String, DecryptedConversationMessage>{},
-        byClientMessageId = const <String, DecryptedConversationMessage>{},
-        byCacheKey = const <String, DecryptedConversationMessage>{};
-}
-
 class _RiskyLinkDialog extends StatefulWidget {
   final String defangedUrl;
   final Duration countdown;
@@ -4321,6 +4120,287 @@ class _LinkMeta {
   bool get hasContent => title != null || description != null;
 }
 
+class _ForwardRecipient {
+  const _ForwardRecipient({
+    required this.uid,
+    required this.name,
+    this.email,
+  });
+
+  final String uid;
+  final String name;
+  final String? email;
+}
+
+class _GifPickerSheet extends StatefulWidget {
+  const _GifPickerSheet({required this.gifSearchService});
+
+  final GifSearchService gifSearchService;
+
+  @override
+  State<_GifPickerSheet> createState() => _GifPickerSheetState();
+}
+
+class _GifPickerSheetState extends State<_GifPickerSheet> {
+  final TextEditingController _searchController = TextEditingController();
+  Future<List<GifResult>>? _resultsFuture;
+  Timer? _debounceTimer;
+
+  static const Color _inputFillColor = Color(0xFF1A2737);
+  static const Color _accentColor = Color(0xFF25D366);
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController.addListener(_handleSearchChanged);
+    _loadResults();
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _searchController.removeListener(_handleSearchChanged);
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _handleSearchChanged() {
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 350), _loadResults);
+  }
+
+  void _loadResults() {
+    setState(() {
+      _resultsFuture = widget.gifSearchService.fetch(
+        query: _searchController.text,
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.78,
+        minChildSize: 0.48,
+        maxChildSize: 0.94,
+        builder: (context, scrollController) {
+          return Column(
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(top: 10, bottom: 14),
+                decoration: const BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.all(Radius.circular(2)),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'GIF',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      'Powered by GIPHY',
+                      style: TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: TextField(
+                  controller: _searchController,
+                  style: const TextStyle(color: Colors.white),
+                  cursorColor: _accentColor,
+                  decoration: InputDecoration(
+                    hintText: 'Search GIFs',
+                    hintStyle: const TextStyle(color: Colors.white54),
+                    prefixIcon: const Icon(Icons.search, color: Colors.white70),
+                    suffixIcon: _searchController.text.trim().isNotEmpty
+                        ? IconButton(
+                            onPressed: () {
+                              _searchController.clear();
+                              _loadResults();
+                            },
+                            icon: const Icon(
+                              Icons.close,
+                              color: Colors.white54,
+                              size: 18,
+                            ),
+                          )
+                        : null,
+                    filled: true,
+                    fillColor: _inputFillColor,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(18),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 0),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: !widget.gifSearchService.isConfigured
+                    ? const _GifConfigEmptyState()
+                    : FutureBuilder<List<GifResult>>(
+                        future: _resultsFuture,
+                        builder: (context, snapshot) {
+                          if (snapshot.connectionState ==
+                              ConnectionState.waiting) {
+                            return const Center(
+                              child: CircularProgressIndicator(
+                                color: _accentColor,
+                              ),
+                            );
+                          }
+                          if (snapshot.hasError) {
+                            return Center(
+                              child: Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 28),
+                                child: Text(
+                                  snapshot.error.toString(),
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            );
+                          }
+                          final gifs = snapshot.data ?? const <GifResult>[];
+                          if (gifs.isEmpty) {
+                            return const Center(
+                              child: Text(
+                                'No GIFs found.',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            );
+                          }
+                          return GridView.builder(
+                            controller: scrollController,
+                            padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              mainAxisSpacing: 8,
+                              crossAxisSpacing: 8,
+                              childAspectRatio: 1,
+                            ),
+                            itemCount: gifs.length,
+                            itemBuilder: (context, index) {
+                              final gif = gifs[index];
+                              return _GifTile(
+                                gif: gif,
+                                onTap: () => Navigator.pop(context, gif),
+                              );
+                            },
+                          );
+                        },
+                      ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _GifTile extends StatelessWidget {
+  const _GifTile({
+    required this.gif,
+    required this.onTap,
+  });
+
+  final GifResult gif;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF1A2737),
+      borderRadius: BorderRadius.circular(8),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Image.network(
+          gif.previewUrl,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => const Center(
+            child: Icon(
+              Icons.broken_image_outlined,
+              color: Colors.white54,
+            ),
+          ),
+          loadingBuilder: (_, child, progress) {
+            if (progress == null) return child;
+            return const Center(
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Color(0xFF25D366),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _GifConfigEmptyState extends StatelessWidget {
+  const _GifConfigEmptyState();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Padding(
+        padding: EdgeInsets.symmetric(horizontal: 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.key_off_outlined, color: Colors.white54, size: 32),
+            SizedBox(height: 12),
+            Text(
+              'GIPHY API key missing',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
+                fontSize: 16,
+              ),
+            ),
+            SizedBox(height: 6),
+            Text(
+              'Run the app with --dart-define=GIPHY_API_KEY=your_key to override the default key.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white60, height: 1.35),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _TypingIndicatorBubbleState extends State<_TypingIndicatorBubble>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
@@ -4366,7 +4446,7 @@ class _TypingIndicatorBubbleState extends State<_TypingIndicatorBubble>
                   child: Opacity(
                     opacity: opacity,
                     child: const Text(
-                      '•',
+                      'â€¢',
                       style: TextStyle(
                         fontSize: 20,
                         color: Color(0xFF25D366),

@@ -64,7 +64,7 @@ class OnlineAuthPromptScreen extends StatelessWidget {
                 ),
                 SizedBox(height: 4),
                 Text(
-                  'Sign in to unlock online encrypted messaging and friend requests.',
+                  'Sign in to unlock online chat and friend requests.',
                   style: TextStyle(
                     color: Colors.white70,
                     fontSize: 13,
@@ -125,7 +125,7 @@ class OnlineAuthPromptScreen extends StatelessWidget {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Your Phone and SMS tabs stay available in guest mode. Sign in only when you want online chat, encrypted messaging, and contact requests.',
+                          'Your Phone and SMS tabs stay available in guest mode. Sign in only when you want online chat, calls, and contact requests.',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: _textMuted,
@@ -152,7 +152,7 @@ class OnlineAuthPromptScreen extends StatelessWidget {
                               SizedBox(height: 10),
                               _PromptBullet(
                                 icon: Icons.chat_bubble_outline,
-                                text: 'Online chat, E2EE, calls, and friend requests need an account.',
+                                text: 'Online chat, calls, and friend requests need an account.',
                               ),
                             ],
                           ),

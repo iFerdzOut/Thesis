@@ -2,13 +2,12 @@ import 'dart:async';
 import 'dart:collection';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 
-import '../models/conversation_preview_model.dart';
-import '../services/chat_encryption_repository.dart';
-import '../services/contact_chat_service.dart';
-import '../services/online_chat_service.dart';
-import '../services/user_profile_service.dart';
+import '../services/chat/contact_chat_service.dart';
+import '../services/chat/online_chat_service.dart';
+import '../services/auth/user_profile_service.dart';
 import '../widgets/user_avatar.dart';
 import 'chat_screen.dart';
 import 'friends_management_screen.dart';
@@ -25,9 +24,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   final TextEditingController searchController = TextEditingController();
   final OnlineChatService onlineChatService = OnlineChatService();
   final ContactChatService contactChatService = ContactChatService();
-  final ChatEncryptionRepository _chatEncryptionRepository =
-      ChatEncryptionRepository();
-  final Map<String, String> _previewRefreshKeys = <String, String>{};
   final LinkedHashMap<String, StreamSubscription<DocumentSnapshot>>
       _presenceSubscriptions =
       LinkedHashMap<String, StreamSubscription<DocumentSnapshot>>();
@@ -50,6 +46,12 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   String? _legacyConversationRepairKey;
   List<_ConversationEntry> _mergedEntriesCache = const <_ConversationEntry>[];
   Timer? _searchDebounceTimer;
+  Timer? _connectionBannerTimer;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  bool? _hasInternetConnection;
+  bool _showConnectedBanner = false;
+  bool _connectivityInitialized = false;
+  bool _hadConnectivityOutage = false;
 
   String searchText = '';
   static const Duration _searchDebounceDuration = Duration(milliseconds: 120);
@@ -69,6 +71,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     searchController.addListener(_handleSearchChanged);
     unawaited(onlineChatService.scheduleConversationActivityBackfillIfNeeded());
     _startInboxSubscriptions();
+    _startConnectivityMonitor();
   }
 
   Color _presenceColor(String mode, bool isOnline) {
@@ -89,6 +92,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   void dispose() {
     searchController.removeListener(_handleSearchChanged);
     _searchDebounceTimer?.cancel();
+    _connectionBannerTimer?.cancel();
+    _connectivitySubscription?.cancel();
     _chatSubscription?.cancel();
     _friendsSubscription?.cancel();
     _settingsSubscription?.cancel();
@@ -100,6 +105,76 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
     }
     searchController.dispose();
     super.dispose();
+  }
+
+  void _startConnectivityMonitor() {
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen(_handleConnectivityChange);
+    unawaited(_checkInitialConnectivity());
+  }
+
+  Future<void> _checkInitialConnectivity() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      _setInitialConnectivityState(results);
+    } catch (error) {
+      debugPrint('[OnlineChatScreen] Connectivity check failed: $error');
+    }
+  }
+
+  void _setInitialConnectivityState(List<ConnectivityResult> results) {
+    if (!mounted) return;
+    final hasConnection = results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+    setState(() {
+      _hasInternetConnection = hasConnection;
+      _showConnectedBanner = false;
+      _connectivityInitialized = true;
+    });
+  }
+
+  void _handleConnectivityChange(List<ConnectivityResult> results) {
+    if (!mounted) return;
+
+    final hasConnection = results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+    final previous = _hasInternetConnection;
+
+    if (!_connectivityInitialized) {
+      setState(() {
+        _hasInternetConnection = hasConnection;
+        _showConnectedBanner = false;
+        _connectivityInitialized = true;
+      });
+      return;
+    }
+
+    if (previous == hasConnection) {
+      return;
+    }
+
+    _connectionBannerTimer?.cancel();
+    setState(() {
+      _hasInternetConnection = hasConnection;
+      if (!hasConnection && previous == true) {
+        _hadConnectivityOutage = true;
+        _showConnectedBanner = false;
+      } else {
+        _showConnectedBanner = hasConnection && _hadConnectivityOutage;
+      }
+    });
+
+    if (!hasConnection) return;
+
+    _connectionBannerTimer = Timer(const Duration(milliseconds: 3500), () {
+      if (!mounted || _hasInternetConnection != true) return;
+      setState(() {
+        _showConnectedBanner = false;
+        _hadConnectivityOutage = false;
+      });
+    });
   }
 
   void _handleSearchChanged() {
@@ -269,7 +344,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           context: context,
           builder: (_) => AlertDialog(
             title: const Text('Delete Conversation?'),
-            content: Text('Delete your chat with $name? The messages will be removed from your device, but the other person can still see them.'),
+            content: Text(
+                'Delete your chat with $name? The messages will be removed from your device, but the other person can still see them.'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),
@@ -277,7 +353,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
               ),
               ElevatedButton(
                 onPressed: () => Navigator.pop(context, true),
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                style:
+                    ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
                 child: const Text('Delete'),
               ),
             ],
@@ -289,9 +366,10 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
 
     try {
       final chatId = onlineChatService.getChatId(uid);
-      final chatRef = FirebaseFirestore.instance.collection('chats').doc(chatId);
+      final chatRef =
+          FirebaseFirestore.instance.collection('chats').doc(chatId);
       final currentUserId = onlineChatService.currentUserId;
-      
+
       // 1. Hide conversation from the active list
       await onlineChatService.hideConversation(uid);
 
@@ -302,7 +380,9 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
         for (final doc in messages.docs) {
           batch.set(
             doc.reference,
-            {'deletedFor': FieldValue.arrayUnion([currentUserId])},
+            {
+              'deletedFor': FieldValue.arrayUnion([currentUserId])
+            },
             SetOptions(merge: true),
           );
         }
@@ -493,7 +573,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                     style: TextStyle(color: Colors.white),
                   ),
                   subtitle: const Text(
-            'Delete this conversation from your end only',
+                    'Delete this conversation from your end only',
                     style: TextStyle(color: Colors.white54),
                   ),
                   onTap: () {
@@ -676,7 +756,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
             data['lastMessageSenderId']?.toString() ?? '';
         final lastMessageIsRead = data['lastMessageIsRead'] == true;
         final lastMessageType = data['lastMessageType']?.toString() ?? 'text';
-        final lastMessageE2ee = data['lastMessageE2ee'] == true;
         final updatedAt = _parseDateTime(data['updatedAt']);
         final lastMessageAt = _effectiveActivityAt(
           lastMessageAt: _parseDateTime(data['lastMessageAt']),
@@ -702,20 +781,9 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           name: otherName,
           lastMessage: lastMessage,
           lastMessageType: lastMessageType,
-          lastMessageE2ee: lastMessageE2ee,
-          lastMessageCipherText: data['lastMessageCipherText']?.toString(),
-          lastMessageEncryptedAesKey:
-              data['lastMessageEncryptedAesKey']?.toString(),
-          lastMessageIv: data['lastMessageIv']?.toString(),
-          lastMessageCacheKey: data['lastMessageCacheKey']?.toString(),
-          lastMessageAlgorithm: data['lastMessageAlgorithm']?.toString(),
           lastMessageClientMessageId:
               data['lastMessageClientMessageId']?.toString(),
           lastMessageSenderId: lastMessageSenderId,
-          lastMessageSenderPublicKey:
-              data['lastMessageSenderPublicKey']?.toString(),
-          lastMessageReceiverPublicKey:
-              data['lastMessageReceiverPublicKey']?.toString(),
           lastMessageAt: lastMessageAt,
           lastMessageAtClientMs: lastMessageAtClientMs,
           updatedAt: updatedAt,
@@ -733,7 +801,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
         final uid = _docUid(doc);
         if (uid.isEmpty) continue;
         if (activeEntries.containsKey(uid)) continue;
-            if (hiddenUids.contains(uid)) continue;
+        if (hiddenUids.contains(uid)) continue;
 
         final name = (data['name']?.toString().trim().isNotEmpty == true)
             ? data['name'].toString().trim()
@@ -749,16 +817,8 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
           name: name,
           lastMessage: '',
           lastMessageType: 'text',
-          lastMessageE2ee: false,
-          lastMessageCipherText: null,
-          lastMessageEncryptedAesKey: null,
-          lastMessageIv: null,
-          lastMessageCacheKey: null,
-          lastMessageAlgorithm: null,
           lastMessageClientMessageId: null,
           lastMessageSenderId: '',
-          lastMessageSenderPublicKey: null,
-          lastMessageReceiverPublicKey: null,
           lastMessageAt: null,
           lastMessageAtClientMs: null,
           updatedAt: null,
@@ -803,81 +863,15 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
   }
 
   Widget _buildPreviewWidget(_ConversationEntry entry, {required bool unread}) {
-    final conversationId = entry.chatId;
-    final refreshKey = [
-      conversationId,
-      entry.lastMessageClientMessageId ?? '',
-      entry.lastMessageAt?.millisecondsSinceEpoch ?? 0,
-      entry.lastMessageAtClientMs ?? 0,
-      entry.updatedAt?.millisecondsSinceEpoch ?? 0,
-    ].join('|');
-    if (_previewRefreshKeys[conversationId] != refreshKey) {
-      _previewRefreshKeys[conversationId] = refreshKey;
-      unawaited(
-        _chatEncryptionRepository.primeConversationPreview(
-          conversationId: conversationId,
-        ),
-      );
-      unawaited(
-        _chatEncryptionRepository.refreshConversationPreview(
-          conversationId: conversationId,
-          chatData: <String, dynamic>{
-            'participants': <String>[
-              onlineChatService.currentUserId,
-              entry.uid,
-            ],
-            'lastMessage': entry.lastMessage,
-            'lastMessageType': entry.lastMessageType,
-            'lastMessageE2ee': entry.lastMessageE2ee,
-            'lastMessageCipherText': entry.lastMessageCipherText,
-            'lastMessageEncryptedAesKey': entry.lastMessageEncryptedAesKey,
-            'lastMessageIv': entry.lastMessageIv,
-            'lastMessageCacheKey': entry.lastMessageCacheKey,
-            'lastMessageAlgorithm': entry.lastMessageAlgorithm,
-            'lastMessageClientMessageId': entry.lastMessageClientMessageId,
-            'lastMessageSenderId': entry.lastMessageSenderId,
-            'lastMessageReceiverId':
-                entry.lastMessageSenderId == onlineChatService.currentUserId
-                    ? entry.uid
-                    : onlineChatService.currentUserId,
-            'lastMessageSenderPublicKey': entry.lastMessageSenderPublicKey,
-            'lastMessageReceiverPublicKey': entry.lastMessageReceiverPublicKey,
-            'lastMessageAt': entry.lastMessageAt,
-            'updatedAt': entry.updatedAt,
-            'lastMessageIsSuspicious': false,
-          },
-        ),
-      );
-    }
-
-    return StreamBuilder<ConversationPreviewModel?>(
-      stream: _chatEncryptionRepository.watchConversationPreview(
-        conversationId: conversationId,
+    return Text(
+      _fallbackPreviewText(entry),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        color: unread ? _textPrimary : _textMuted,
+        fontSize: 13,
+        fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
       ),
-      builder: (context, snapshot) {
-        final expectedLastMessageId =
-            entry.lastMessageClientMessageId?.trim() ?? '';
-        final cachedPreviewModel = snapshot.data;
-        final cachedLastMessageId =
-            cachedPreviewModel?.lastMessageId?.trim() ?? '';
-        final cachedPreview = cachedPreviewModel?.previewText.trim() ?? '';
-        final preview = cachedPreview.isNotEmpty &&
-                (expectedLastMessageId.isEmpty ||
-                    cachedLastMessageId.isEmpty ||
-                    cachedLastMessageId == expectedLastMessageId)
-            ? cachedPreview
-            : _fallbackPreviewText(entry);
-        return Text(
-          preview,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: unread ? _textPrimary : _textMuted,
-            fontSize: 13,
-            fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
-          ),
-        );
-      },
     );
   }
 
@@ -892,10 +886,6 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
       case 'call_summary':
         return entry.lastMessage.isNotEmpty ? entry.lastMessage : 'Call';
       default:
-        if (entry.lastMessageE2ee &&
-            entry.lastMessageType == 'encrypted_text') {
-          return 'Encrypted message';
-        }
         if (entry.lastMessage.isNotEmpty) {
           return entry.lastMessage;
         }
@@ -948,43 +938,44 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                 ),
               ),
               const SizedBox(width: 12),
-          Material(
-            color: Colors.transparent,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(999),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const FriendsManagementScreen(),
-                  ),
-                );
-              },
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                decoration: BoxDecoration(
-                  color: _surfaceElevatedColor,
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
                   borderRadius: BorderRadius.circular(999),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.people_alt_outlined, color: Colors.white, size: 16),
-                    SizedBox(width: 6),
-                    Text(
-                      'Friends',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 13,
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const FriendsManagementScreen(),
                       ),
+                    );
+                  },
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: _surfaceElevatedColor,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: Colors.white10),
                     ),
-                  ],
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.people_alt_outlined,
+                            color: Colors.white, size: 16),
+                        SizedBox(width: 6),
+                        Text(
+                          'Friends',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
-            ),
               ),
             ],
           ),
@@ -1058,6 +1049,38 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionBanner() {
+    final bool? connected = _hasInternetConnection;
+    if (connected == null ||
+        (!connected && !_hadConnectivityOutage) ||
+        (connected && !_showConnectedBanner)) {
+      return const SizedBox.shrink();
+    }
+
+    final Color color =
+        connected ? const Color(0xFF1FAE5B) : const Color(0xFFE53935);
+    final String text = connected ? 'Connected' : 'No internet connection';
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      child: Container(
+        key: ValueKey<String>(text),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        color: color,
+        alignment: Alignment.center,
+        child: Text(
+          text,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
       ),
     );
   }
@@ -1337,19 +1360,9 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
                       name: resolvedName,
                       lastMessage: entry.lastMessage,
                       lastMessageType: entry.lastMessageType,
-                      lastMessageE2ee: entry.lastMessageE2ee,
-                      lastMessageCipherText: entry.lastMessageCipherText,
-                      lastMessageEncryptedAesKey: entry.lastMessageEncryptedAesKey,
-                      lastMessageIv: entry.lastMessageIv,
-                      lastMessageCacheKey: entry.lastMessageCacheKey,
-                      lastMessageAlgorithm: entry.lastMessageAlgorithm,
                       lastMessageClientMessageId:
                           entry.lastMessageClientMessageId,
                       lastMessageSenderId: entry.lastMessageSenderId,
-                      lastMessageSenderPublicKey:
-                          entry.lastMessageSenderPublicKey,
-                      lastMessageReceiverPublicKey:
-                          entry.lastMessageReceiverPublicKey,
                       lastMessageAt: entry.lastMessageAt,
                       lastMessageAtClientMs: entry.lastMessageAtClientMs,
                       updatedAt: entry.updatedAt,
@@ -1588,6 +1601,7 @@ class _OnlineChatScreenState extends State<OnlineChatScreen> {
       body: Column(
         children: [
           _buildHeader(),
+          _buildConnectionBanner(),
           Expanded(
             child: _buildConversationListBody(),
           ),
@@ -1603,16 +1617,8 @@ class _ConversationEntry {
   final String name;
   final String lastMessage;
   final String lastMessageType;
-  final bool lastMessageE2ee;
-  final String? lastMessageCipherText;
-  final String? lastMessageEncryptedAesKey;
-  final String? lastMessageIv;
-  final String? lastMessageCacheKey;
-  final String? lastMessageAlgorithm;
   final String? lastMessageClientMessageId;
   final String lastMessageSenderId;
-  final String? lastMessageSenderPublicKey;
-  final String? lastMessageReceiverPublicKey;
   final DateTime? lastMessageAt;
   final int? lastMessageAtClientMs;
   final DateTime? updatedAt;
@@ -1625,16 +1631,8 @@ class _ConversationEntry {
     required this.name,
     required this.lastMessage,
     required this.lastMessageType,
-    required this.lastMessageE2ee,
-    required this.lastMessageCipherText,
-    required this.lastMessageEncryptedAesKey,
-    required this.lastMessageIv,
-    required this.lastMessageCacheKey,
-    required this.lastMessageAlgorithm,
     this.lastMessageClientMessageId,
     this.lastMessageSenderId = '',
-    this.lastMessageSenderPublicKey,
-    this.lastMessageReceiverPublicKey,
     required this.lastMessageAt,
     required this.lastMessageAtClientMs,
     required this.updatedAt,

@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
@@ -7,10 +7,10 @@ import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../services/contacts_service.dart';
-import '../services/device_contact_sync_service.dart';
-import '../services/sms_service.dart';
-import '../services/sms_storage_service.dart';
+import '../services/contacts/contacts_service.dart';
+import '../services/contacts/device_contact_sync_service.dart';
+import '../services/sms/sms_service.dart';
+import '../services/sms/sms_storage_service.dart';
 import 'chat_screen.dart';
 import 'quarantine_screen.dart';
 
@@ -37,6 +37,10 @@ class _PhoneScreenState extends State<PhoneScreen>
   bool _isDefaultSmsApp = true;
   bool _isEditingSms = false;
   bool _isRefreshingSms = false;
+  bool _wasDefaultSmsApp = false;
+  bool _isInitialScanRunning = false;
+  int _initialScanDone = 0;
+  int _initialScanTotal = 0;
   bool _isSyncingContacts = false;
   bool _isBootstrappingSmsContactNames = false;
   String _contactSearch = '';
@@ -148,13 +152,50 @@ class _PhoneScreenState extends State<PhoneScreen>
     final capability = await SmsService.getCapabilityState();
     final isDefault = capability.isDefault;
     if (!mounted) return;
+    final wasDefault = _wasDefaultSmsApp;
     setState(() {
       _isDefaultSmsApp = isDefault;
+      _wasDefaultSmsApp = isDefault;
       _checkingDefaultSms = false;
     });
     if (isDefault && refreshIfDefault) {
       await _refreshSmsThreads(force: true);
     }
+    if (!wasDefault && isDefault && !_isInitialScanRunning) {
+      final alreadyScanned = await SmsService.hasCompletedInitialScan();
+      if (!alreadyScanned && mounted) {
+        _startInitialScan();
+      }
+    }
+  }
+
+  void _startInitialScan() {
+    setState(() {
+      _isInitialScanRunning = true;
+      _initialScanDone = 0;
+      _initialScanTotal = 0;
+    });
+    SmsService.scanAllImportedSmsOnce(
+      onProgress: (done, total) {
+        if (!mounted) return;
+        setState(() {
+          _initialScanDone = done;
+          _initialScanTotal = total;
+        });
+      },
+    ).then((summary) {
+      if (!mounted) return;
+      setState(() => _isInitialScanRunning = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Inbox scan complete — ${summary.movedToQuarantine} suspicious message(s) quarantined.',
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      SmsService.primeInboxThreads(force: true);
+    });
   }
 
   Future<void> _primeSmsInboxAfterFirstFrame() async {
@@ -1142,6 +1183,48 @@ class _PhoneScreenState extends State<PhoneScreen>
     );
   }
 
+  Widget _buildInitialScanBanner() {
+    if (!_isInitialScanRunning) return const SizedBox.shrink();
+    final label = _initialScanTotal > 0
+        ? 'Scanning inbox... $_initialScanDone / $_initialScanTotal messages'
+        : 'Preparing inbox scan...';
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: _surfaceColor,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: Colors.white10),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x22000000),
+            blurRadius: 14,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(
+              strokeWidth: 2.5,
+              color: Color(0xFF8E5BFF),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(color: _textPrimary, fontSize: 12.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildDefaultSmsBanner() {
     if (_checkingDefaultSms || _isDefaultSmsApp) {
       return const SizedBox.shrink();
@@ -1841,6 +1924,7 @@ class _PhoneScreenState extends State<PhoneScreen>
           child: Column(
             children: [
               _buildTopSection(),
+              _buildInitialScanBanner(),
               _buildDefaultSmsBanner(),
               TabBar(
                 controller: _tabController,

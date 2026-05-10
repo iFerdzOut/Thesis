@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -7,11 +7,11 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
-import '../services/call_notification_service.dart';
-import '../services/fcm_call_service.dart';
-import '../services/native_channel_router.dart';
-import '../services/online_chat_service.dart';
-import '../services/webrtc_call_service.dart';
+import '../services/call/call_notification_service.dart';
+import '../services/call/fcm_call_service.dart';
+import '../services/system/native_channel_router.dart';
+import '../services/chat/online_chat_service.dart';
+import '../services/call/webrtc_call_service.dart';
 import 'chat_screen.dart';
 
 class CallScreen extends StatefulWidget {
@@ -92,6 +92,20 @@ class _CallScreenState extends State<CallScreen>
   late Animation<double> _pulseAnimation;
 
   String get _outgoingLockKey => '${widget.receiverId}_${widget.isVideo}';
+
+  Future<void> _ensureCallPermissions({required bool isVideo}) async {
+    final micStatus = await Permission.microphone.request();
+    if (!micStatus.isGranted) {
+      throw Exception('Microphone permission is required for calls.');
+    }
+
+    if (!isVideo) return;
+
+    final cameraStatus = await Permission.camera.request();
+    if (!cameraStatus.isGranted) {
+      throw Exception('Camera permission is required for video calls.');
+    }
+  }
 
   @override
   void initState() {
@@ -750,6 +764,7 @@ class _CallScreenState extends State<CallScreen>
     _acquireOutgoingLock();
 
     try {
+      await _ensureCallPermissions(isVideo: isVideoEnabled);
       await callService.initRenderers();
 
       if (mounted && !_isDisposed) {
@@ -860,6 +875,7 @@ class _CallScreenState extends State<CallScreen>
         throw Exception('Offer not ready yet');
       }
 
+      await _ensureCallPermissions(isVideo: isVideoEnabled);
       await _prepareCallAudio(speaker: isVideoEnabled);
       await Future<void>.delayed(const Duration(milliseconds: 120));
       await callService.initRenderers();

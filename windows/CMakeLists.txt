@@ -81,6 +81,13 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
+# TensorFlow Lite C API used by tflite_flutter on Windows. The plugin loads it
+# from a blobs/ directory next to the executable.
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../blobs/libtensorflowlite_c-win.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}/blobs"
+  COMPONENT Runtime)
+
 if(PLUGIN_BUNDLED_LIBRARIES)
   install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"

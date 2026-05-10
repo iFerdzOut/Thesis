@@ -1,19 +1,18 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+﻿import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
-import '../services/device_contact_sync_service.dart';
-import '../services/call_notification_service.dart';
-import '../services/chat_notification_service.dart';
-import '../services/cloudinary_service.dart';
-import '../services/e2ee_service.dart';
-import '../services/auth_service.dart';
-import '../services/feedback_consent_service.dart';
-import '../services/local_message_cache_service.dart';
-import '../services/media_service.dart';
-import '../services/online_chat_service.dart';
-import '../services/user_profile_service.dart';
-import '../services/webrtc_call_service.dart';
+import '../services/contacts/device_contact_sync_service.dart';
+import '../services/call/call_notification_service.dart';
+import '../services/chat/chat_notification_service.dart';
+import '../services/media/cloudinary_service.dart';
+import '../services/auth/auth_service.dart';
+import '../services/feedback/feedback_consent_service.dart';
+import '../services/chat/local_message_cache_service.dart';
+import '../services/media/media_service.dart';
+import '../services/chat/online_chat_service.dart';
+import '../services/auth/user_profile_service.dart';
+import '../services/call/webrtc_call_service.dart';
 import '../widgets/user_avatar.dart';
 import 'login_screen.dart';
 import 'quarantine_screen.dart';
@@ -105,14 +104,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       try {
         await _localMessageCacheService.clearDecryptedMediaCacheForUser(uid);
-      } catch (_) {}
-
-      try {
-        await E2eeService().deactivateCurrentDevice(uid);
-      } catch (_) {}
-
-      try {
-        await E2eeService().clearAutomaticAccountBackupSecret(uid);
       } catch (_) {}
     }
 
@@ -513,7 +504,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                       SizedBox(height: 6),
                       Text(
-                        'SMS and quarantine still work. Login when you want synced account settings, online chat, and encrypted messaging.',
+                        'SMS and quarantine still work. Login when you want synced account settings, online chat, and calls.',
                         style: TextStyle(
                           color: Colors.white70,
                           height: 1.35,
@@ -781,14 +772,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           : 'Add your mobile number for contact matching',
                     ),
                     onTap: () => _editPhoneNumber(context, phone),
-                  ),
-                  const Divider(height: 1),
-                  const ListTile(
-                    leading: Icon(Icons.lock_outline, color: Colors.deepPurple),
-                    title: Text('Encrypted Chats'),
-                    subtitle: Text(
-                      'End-to-end encryption is handled automatically in the background on this device. No manual key setup is needed for normal use.',
-                    ),
                   ),
                   const Divider(height: 1),
                   SwitchListTile.adaptive(

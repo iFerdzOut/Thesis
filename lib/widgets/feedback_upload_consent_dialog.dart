@@ -1,7 +1,7 @@
-import 'package:firebase_auth/firebase_auth.dart';
+﻿import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
-import '../services/feedback_consent_service.dart';
+import '../services/feedback/feedback_consent_service.dart';
 
 Future<void> ensureFeedbackUploadPreference(BuildContext context) async {
   final user = FirebaseAuth.instance.currentUser;

@@ -5,23 +5,21 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:workmanager/workmanager.dart';
 import 'firebase_options.dart';
 import 'screens/call_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/friends_management_screen.dart';
 import 'screens/home_screen.dart';
-import 'services/auth_service.dart';
-import 'services/call_notification_service.dart';
-import 'services/chat_notification_service.dart';
-import 'services/fcm_call_service.dart';
-import 'services/fcm_chat_service.dart';
-import 'services/message_screening_service.dart';
-import 'services/security_service.dart';
-import 'services/friend_request_notification_service.dart';
-import 'services/session_identity_service.dart';
-import 'services/sms_service.dart';
-import 'services/sms_background_worker.dart';
-import 'widgets/secure_backup_gate.dart';
+import 'services/auth/auth_service.dart';
+import 'services/call/call_notification_service.dart';
+import 'services/chat/chat_notification_service.dart';
+import 'services/call/fcm_call_service.dart';
+import 'services/chat/fcm_chat_service.dart';
+import 'smishing_detection_pipeline/pipeline_service.dart';
+import 'services/notifications/friend_request_notification_service.dart';
+import 'services/auth/session_identity_service.dart';
+import 'services/sms/sms_service.dart';
 
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -35,6 +33,10 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     '[FCM Background] Received message: type=${message.data['type']} '
     'callId=${message.data['callId']}',
   );
+
+  if (message.data['type'] == 'chat') {
+    await FcmChatService().screenReceivedChatPush(message.data);
+  }
 }
 
 Future<void> main() async {
@@ -47,6 +49,15 @@ Future<void> main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
+  // Clear any stale WorkManager jobs left over from removed background workers
+  // (e.g. SmsBackgroundWorker). Without this, the OS keeps trying to launch
+  // entrypoints whose Dart libraries no longer exist.
+  try {
+    await Workmanager().cancelAll();
+  } catch (_) {
+    // No-op if WorkManager isn't initialized — nothing to cancel.
+  }
+
   // Activate App Check with Play Integrity as per the Master Blueprint
   // TEMPORARILY DISABLED FOR EMULATOR TESTING
   // await FirebaseAppCheck.instance.activate(
@@ -54,12 +65,6 @@ Future<void> main() async {
   // );
 
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-
-  // Rule 3: Initialize SMS background batching
-  SmsBackgroundWorker.initialize();
-
-  // TEMPORARY: Run the local crypto pipeline test on app launch
-  SecurityService().testCryptoPipeline();
 
   runApp(const SmishingShieldApp());
 }
@@ -143,7 +148,7 @@ class _SplashScreen extends StatelessWidget {
               Padding(
                 padding: EdgeInsets.symmetric(horizontal: 40),
                 child: Text(
-                  'Secure SMS and encrypted messaging with anti-smishing protection.',
+                  'Secure SMS and online chat with anti-smishing protection.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: Colors.white70,
@@ -355,7 +360,6 @@ class _AuthGateState extends State<AuthGate> {
         unawaited(AuthService.persistSessionMarker(user));
       }
       _startCallServicesOnce();
-      SecurityService().ensureKeysUploaded();
       return;
     }
 
@@ -655,7 +659,6 @@ class _AuthGateState extends State<AuthGate> {
         debugPrint('$stackTrace');
       }
 
-  
       await Future<void>.delayed(const Duration(milliseconds: 600));
       if (!mounted || !_callServicesStarted) return;
 
@@ -679,7 +682,7 @@ class _AuthGateState extends State<AuthGate> {
 
       // Phase 3 (background): pre-warm the DistilBERT model so the first
       // incoming message doesn't pay the load cost during rendering.
-      unawaited(MessageScreeningService().warmUp());
+      unawaited(SmishingPipelineService().initialize());
     });
   }
 
@@ -699,9 +702,6 @@ class _AuthGateState extends State<AuthGate> {
     }
 
     SmsService.init();
-
-    // Rule 3: Start scanning the SMS inbox silently in batches of 10
-    SmsBackgroundWorker.registerPeriodicScan();
 
     try {
       await CallNotificationService.configure();
@@ -745,12 +745,9 @@ class _AuthGateState extends State<AuthGate> {
       _stopCallServices();
     }
 
-    return SecureBackupGate(
-      key: ValueKey(user?.uid), // Forces the gate to re-check when the user logs in
-      child: HomeScreen(
-        hasSession: hasSession,
-        hasOnlineAccess: hasOnlineAccess,
-      ),
+    return HomeScreen(
+      hasSession: hasSession,
+      hasOnlineAccess: hasOnlineAccess,
     );
   }
 }
